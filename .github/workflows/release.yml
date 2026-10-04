@@ -1,7 +1,6 @@
 name: release
 
-# Publishing a GitHub release tagged v<version> builds the package and uploads it to
-# PyPI through Trusted Publishing: no API token is stored anywhere.
+# Runs when a GitHub release is published. Uploads to PyPI with Trusted Publishing.
 
 on:
   release:
@@ -50,7 +49,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/mnestiq
     permissions:
-      id-token: write  # lets PyPI verify this workflow; no other write access
+      id-token: write  # for Trusted Publishing
     steps:
       - uses: actions/download-artifact@v8
         with:
