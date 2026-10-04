@@ -16,6 +16,8 @@ mnestiq:  agent=support-bot run=c7831ff7 step=6 sandbox=container:7f3a9c operato
           authorized by policy:email-auto-approve (policy): recipient not checked against customer domain
 ```
 
+![Mnestiq dashboard showing a prompt-injection incident step by step](docs/dashboard.png)
+
 ## What it does
 
 - **Attribution:** every event carries `run_id`, `step_id`, `parent_run_id`,
@@ -67,6 +69,19 @@ recorder.close()                      # writes the final signed checkpoint
 mnestiq verify evidence.jsonl --trusted-key keys/signing.pub
 mnestiq inspect evidence.jsonl
 mnestiq redact evidence.jsonl evidence.redacted.jsonl
+```
+
+### Or try a demo first (no API key)
+
+A scripted support agent reads a poisoned web page and emails customer data out. You then
+investigate the evidence it left behind.
+
+```bash
+git clone https://github.com/mnestiq/mnestiq && cd mnestiq
+python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e python httpx
+python examples/injection_incident.py --out evidence
+mnestiq dashboard evidence --trusted-key evidence/incident.pub
 ```
 
 ### Dashboard
