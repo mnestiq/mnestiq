@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mnestiq.com/spec/0.1/record.schema.json",
+  "title": "Mnestiq Evidence Record v0.1",
+  "description": "One line of an agent evidence chain (JSON Lines). A record is either an event or a signed checkpoint.",
+  "oneOf": [
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/checkpoint" }
+  ],
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "safeInt": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991
+    },
+    "timestamp": {
+      "type": "object",
+      "required": ["wall", "mono_us"],
+      "additionalProperties": false,
+      "properties": {
+        "wall": {
+          "description": "UTC wall clock, RFC 3339, microsecond precision.",
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{6}Z$"
+        },
+        "mono_us": {
+          "description": "Monotonic clock of the recording process, microseconds. Orders events even if the wall clock jumps.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "source": {
+      "description": "Provenance of a piece of model context. Anything other than system/user/model is untrusted input for taint analysis.",
+      "enum": ["system", "user", "internal", "model", "tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"]
+    },
+    "chainFields": {
+      "type": "object",
+      "required": ["spec_version", "kind", "chain_id", "seq", "ts", "prev_hash", "record_hash"],
+      "properties": {
+        "spec_version": { "const": "0.1" },
+        "chain_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "ts": { "$ref": "#/$defs/timestamp" },
+        "prev_hash": { "$ref": "#/$defs/hash" },
+        "record_hash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "contextSegment": {
+      "type": "object",
+      "required": ["source", "content_hash"],
+      "properties": {
+        "source": { "$ref": "#/$defs/source" },
+        "role": { "type": "string" },
+        "name": { "description": "Tool name, document id, URL, or agent id the segment came from.", "type": "string" },
+        "content": { "description": "Redactable. Any JSON value." },
+        "content_hash": { "$ref": "#/$defs/hash" }
+      },
+      "additionalProperties": false
+    },
+    "toolCall": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "arguments": { "description": "Redactable." },
+        "arguments_hash": { "$ref": "#/$defs/hash" },
+        "result": { "description": "Redactable." },
+        "result_hash": { "$ref": "#/$defs/hash" },
+        "result_source": { "$ref": "#/$defs/source" },
+        "error": { "type": ["string", "null"] },
+        "latency_ms": { "$ref": "#/$defs/safeInt" }
+      },
+      "dependentRequired": {
+        "arguments": ["arguments_hash"],
+        "result": ["result_hash"]
+      },
+      "additionalProperties": false
+    },
+    "approval": {
+      "type": "object",
+      "required": ["action", "decision", "approver"],
+      "properties": {
+        "action": { "type": "string" },
+        "decision": { "enum": ["approved", "denied"] },
+        "approver": { "type": "string" },
+        "approver_type": { "enum": ["human", "policy", "agent"] },
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "egress": {
+      "description": "One outbound request or connection. source_ip/source_port + dest_ip/dest_port + time is the join key to flow and firewall logs.",
+      "type": "object",
+      "required": ["egress_id", "protocol"],
+      "properties": {
+        "egress_id": { "description": "Unique id; also sent as X-Mnestiq-Egress-Id when stamped.", "type": "string" },
+        "protocol": { "enum": ["http", "tcp"] },
+        "method": { "type": "string" },
+        "url": { "description": "Credentials and fragment removed; secret-looking query values masked.", "type": "string" },
+        "host": { "type": "string" },
+        "run_id_header": { "description": "True if the run id was stamped into the outbound request.", "type": "boolean" },
+        "source_ip": { "description": "Local address of the connection, before NAT.", "type": "string" },
+        "source_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "dest_ip": { "type": "string" },
+        "dest_port": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "public_ip": { "description": "NAT / gateway address the destination sees, if configured.", "type": "string" },
+        "status": { "$ref": "#/$defs/safeInt" },
+        "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "allOf": [{ "$ref": "#/$defs/chainFields" }],
+      "type": "object",
+      "required": ["kind", "event_type", "run_id", "agent_id"],
+      "properties": {
+        "spec_version": true,
+        "kind": { "const": "event" },
+        "chain_id": true,
+        "seq": true,
+        "ts": true,
+        "prev_hash": true,
+        "record_hash": true,
+        "event_type": { "enum": ["run_start", "run_end", "llm_call", "tool_call", "approval", "egress", "note"] },
+        "run_id": { "type": "string", "minLength": 1 },
+        "parent_run_id": { "type": ["string", "null"] },
+        "step_id": { "type": "integer", "minimum": 0 },
+        "agent_id": { "type": "string", "minLength": 1 },
+        "operator_id": { "type": ["string", "null"] },
+        "sandbox_id": { "type": ["string", "null"] },
+        "model": {
+          "type": "object",
+          "properties": {
+            "provider": { "type": "string" },
+            "name": { "description": "Model requested.", "type": "string" },
+            "version": { "description": "Model identifier reported by the provider in the response.", "type": ["string", "null"] },
+            "params": { "description": "Sampling parameters (temperature, max_tokens, ...).", "type": "object" }
+          },
+          "additionalProperties": false
+        },
+        "system_prompt_hash": { "$ref": "#/$defs/hash" },
+        "context": { "type": "array", "items": { "$ref": "#/$defs/contextSegment" } },
+        "output": {
+          "type": "object",
+          "required": ["content_hash"],
+          "properties": {
+            "content": { "description": "Redactable." },
+            "content_hash": { "$ref": "#/$defs/hash" },
+            "stop_reason": { "type": ["string", "null"] },
+            "response_id": { "type": ["string", "null"] }
+          },
+          "additionalProperties": false
+        },
+        "tool_calls": { "type": "array", "items": { "$ref": "#/$defs/toolCall" } },
+        "approvals": { "type": "array", "items": { "$ref": "#/$defs/approval" } },
+        "effective_permissions": { "type": "object" },
+        "egress": { "type": "array", "items": { "$ref": "#/$defs/egress" } },
+        "usage": {
+          "type": "object",
+          "properties": {
+            "input_tokens": { "$ref": "#/$defs/safeInt" },
+            "output_tokens": { "$ref": "#/$defs/safeInt" }
+          },
+          "additionalProperties": { "$ref": "#/$defs/safeInt" }
+        },
+        "latency_ms": { "$ref": "#/$defs/safeInt" },
+        "status": { "enum": ["ok", "error"] },
+        "error": { "type": ["string", "null"] },
+        "attributes": { "description": "Free-form producer metadata.", "type": "object" }
+      },
+      "patternProperties": { "^x-": true },
+      "additionalProperties": false
+    },
+    "checkpoint": {
+      "allOf": [{ "$ref": "#/$defs/chainFields" }],
+      "type": "object",
+      "required": ["kind", "covers", "merkle_root", "sig_alg", "key_id", "public_key", "signature"],
+      "properties": {
+        "spec_version": true,
+        "kind": { "const": "checkpoint" },
+        "chain_id": true,
+        "seq": true,
+        "ts": true,
+        "prev_hash": true,
+        "record_hash": true,
+        "covers": {
+          "description": "Inclusive seq range of the records this checkpoint commits to: everything after the previous checkpoint up to the record before this one.",
+          "type": "object",
+          "required": ["from_seq", "to_seq"],
+          "properties": {
+            "from_seq": { "type": "integer", "minimum": 0 },
+            "to_seq": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "merkle_root": { "$ref": "#/$defs/hash" },
+        "sig_alg": { "const": "ed25519" },
+        "key_id": { "type": "string", "pattern": "^ed25519:[0-9a-f]{16}$" },
+        "public_key": { "type": "string", "contentEncoding": "base64" },
+        "signature": { "type": "string", "contentEncoding": "base64" },
+        "timestamp_token": {
+          "description": "Optional RFC 3161 TimeStampToken (DER, base64) over the signature bytes.",
+          "type": ["string", "null"],
+          "contentEncoding": "base64"
+        }
+      },
+      "patternProperties": { "^x-": true },
+      "additionalProperties": false
+    }
+  }
+}

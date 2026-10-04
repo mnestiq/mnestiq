@@ -1,0 +1,818 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mnestiq Dashboard</title>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --sunken: #f7f8fa; --hover: #f0f2f5; --select: #e8eefb;
+  --line: #dfe2e7; --line-strong: #c9ced6;
+  --text: #1b1f24; --muted: #59626e; --faint: #8a929d;
+  --accent: #1f5fd1;
+  --ok: #18794e; --ok-bg: #e6f4ec; --bad: #c4321f; --bad-bg: #fcebe8; --warn: #9a5b00; --warn-bg: #fdf4e3;
+  --t-llm: #6e56cf; --t-tool: #0c7a6b; --t-egress: #1f5fd1; --t-approval: #18794e; --t-run: #8a929d;
+  --s-system: #6b7280; --s-user: #1f5fd1; --s-internal: #8a6d1f; --s-model: #6e56cf; --s-tool_output: #0c7a6b; --s-retrieved_doc: #0b6e8a;
+  --s-web: #c2410c; --s-agent_msg: #b4236c; --s-memory: #8a5a12; --s-unknown: #6b7280;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Cascadia Code", Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d0f12; --panel: #14171b; --sunken: #101317; --hover: #1a1e24; --select: #1a2638;
+    --line: #262b33; --line-strong: #343a44;
+    --text: #e3e6ea; --muted: #9aa3ae; --faint: #6c7480;
+    --accent: #5b9bff;
+    --ok: #4cc38a; --ok-bg: #11291d; --bad: #ff6b57; --bad-bg: #331512; --warn: #f0b13c; --warn-bg: #2e2210;
+    --t-llm: #a594f9; --t-tool: #3fc9b0; --t-egress: #5b9bff; --t-approval: #4cc38a; --t-run: #6c7480;
+    --s-system: #9aa3ae; --s-user: #5b9bff; --s-internal: #d6b45a; --s-model: #a594f9; --s-tool_output: #3fc9b0; --s-retrieved_doc: #38bdf8;
+    --s-web: #fb923c; --s-agent_msg: #f472b6; --s-memory: #d6a35c; --s-unknown: #9aa3ae;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d0f12; --panel: #14171b; --sunken: #101317; --hover: #1a1e24; --select: #1a2638;
+  --line: #262b33; --line-strong: #343a44;
+  --text: #e3e6ea; --muted: #9aa3ae; --faint: #6c7480;
+  --accent: #5b9bff;
+  --ok: #4cc38a; --ok-bg: #11291d; --bad: #ff6b57; --bad-bg: #331512; --warn: #f0b13c; --warn-bg: #2e2210;
+  --t-llm: #a594f9; --t-tool: #3fc9b0; --t-egress: #5b9bff; --t-approval: #4cc38a; --t-run: #6c7480;
+  --s-system: #9aa3ae; --s-user: #5b9bff; --s-internal: #d6b45a; --s-model: #a594f9; --s-tool_output: #3fc9b0; --s-retrieved_doc: #38bdf8;
+  --s-web: #fb923c; --s-agent_msg: #f472b6; --s-memory: #d6a35c; --s-unknown: #9aa3ae;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans);
+  display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100vh; overflow: hidden;
+}
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.label { font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+
+/* header */
+.bar {
+  display: flex; align-items: center; gap: 14px; height: 42px; padding: 0 14px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 7px; font-weight: 700; font-size: 12px; letter-spacing: .14em; }
+.brand svg { color: var(--text); }
+.sep { width: 1px; align-self: stretch; margin: 10px 0; background: var(--line); }
+select.file {
+  height: 26px; min-width: 0; max-width: 320px; padding: 0 8px; border-radius: 3px;
+  border: 1px solid var(--line-strong); background: var(--panel); font-family: var(--mono); font-size: 12px;
+}
+.status {
+  display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 3px;
+  font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
+  border: 1px solid transparent;
+}
+.status.ok { color: var(--ok); background: var(--ok-bg); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.status.bad { color: var(--bad); background: var(--bad-bg); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+.status.warn { color: var(--warn); background: var(--warn-bg); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.verify-meta { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.spacer { flex: 1; }
+
+/* stat strip */
+.stats { display: flex; gap: 0; background: var(--panel); border-bottom: 1px solid var(--line); overflow-x: auto; }
+.stat { padding: 7px 18px 7px 14px; border-right: 1px solid var(--line); white-space: nowrap; }
+.stat .v { font-family: var(--mono); font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.stat.alert .v { color: var(--warn); }
+.stat.danger .v { color: var(--bad); }
+
+/* banners */
+.banners:empty { display: none; }
+.banner { display: grid; gap: 3px; padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: 12.5px; }
+.banner.bad { background: var(--bad-bg); color: var(--bad); }
+.banner.warn { background: var(--warn-bg); color: var(--warn); }
+.banner summary { cursor: pointer; font-weight: 600; }
+.banner ul { margin: 4px 0 2px; padding-left: 18px; }
+.banner li { margin: 1px 0; }
+.linkish { background: none; border: 0; padding: 0; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; }
+
+/* layout */
+.main { display: grid; grid-template-columns: 330px minmax(0, 1fr); min-height: 0; }
+.side { border-right: 1px solid var(--line); background: var(--panel); display: grid; grid-template-rows: auto 1fr auto; min-height: 0; }
+.section-head { padding: 10px 12px 8px; border-bottom: 1px solid var(--line); }
+.search {
+  width: 100%; height: 28px; margin-top: 6px; padding: 0 8px; border-radius: 3px; border: 1px solid var(--line-strong);
+  background: var(--sunken); font-family: var(--mono); font-size: 12px;
+}
+.hits { margin-top: 6px; display: grid; gap: 4px; }
+.hit {
+  text-align: left; padding: 6px 8px; border-radius: 3px; border: 1px solid var(--line); background: var(--sunken);
+  cursor: pointer; display: grid; gap: 1px;
+}
+.hit:hover { border-color: var(--line-strong); }
+.scroll { overflow: auto; min-height: 0; }
+
+/* runs table */
+table { border-collapse: collapse; width: 100%; }
+.runs th, .tl th {
+  position: sticky; top: 0; z-index: 1; background: var(--panel); text-align: left;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint);
+  padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.runs td { padding: 6px 7px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.runs { table-layout: auto; }
+.runs tr.row { cursor: pointer; }
+.runs tr.row:hover td { background: var(--hover); }
+.runs tr.sel td { background: var(--select); }
+.runs tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+.runs .agent { font-weight: 600; max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+.num { text-align: right; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); vertical-align: 1px; }
+.dot.ok { background: var(--ok); } .dot.error { background: var(--bad); } .dot.running { background: var(--accent); }
+.flagcount { color: var(--warn); font-weight: 700; }
+.errcount { color: var(--bad); font-weight: 700; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend i { width: 8px; height: 8px; border-radius: 1px; display: inline-block; }
+
+/* run detail */
+.detail { display: grid; grid-template-rows: auto auto 1fr; min-height: 0; background: var(--panel); }
+.run-head { padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.run-title { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.run-title h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.facts { display: flex; flex-wrap: wrap; gap: 4px 20px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.facts b { color: var(--text); font-weight: 500; font-family: var(--mono); font-size: 12px; }
+.link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font-family: var(--mono); font-size: 12px; }
+.perms { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
+.perm { font-family: var(--mono); font-size: 11.5px; padding: 1px 6px; border: 1px solid var(--line-strong); border-radius: 2px; background: var(--sunken); }
+.findings { border-bottom: 1px solid var(--line); background: var(--sunken); padding: 8px 14px 6px; }
+.findings:empty { display: none; }
+.findings-title { color: var(--warn); margin-bottom: 4px; }
+.ftable { width: auto; min-width: 60%; }
+.ftable th { text-align: left; font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); padding: 3px 18px 3px 0; }
+.ftable td { padding: 3px 18px 3px 0; font-size: 12px; white-space: nowrap; }
+.ftable tbody tr { cursor: pointer; }
+.ftable tbody tr:hover td { color: var(--accent); }
+.ftable .rule { font-family: var(--mono); font-weight: 700; color: var(--warn); }
+.rname { margin-left: 8px; font-family: var(--mono); font-weight: 400; color: var(--muted); }
+
+/* timeline table */
+.tl td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tl tr.ev { cursor: pointer; }
+.tl tr.ev:hover td { background: var(--hover); }
+.tl tr.ev td:first-child { box-shadow: inset 3px 0 0 var(--tc, var(--t-run)); }
+.tl tr.open td { background: var(--sunken); }
+.tl tr.flagged td.detailcell { box-shadow: inset 0 0 0 0 transparent; }
+.tl tr.tampered td { background: var(--bad-bg) !important; }
+.tl tr.focus td { animation: focus 1.8s ease-out; }
+@keyframes focus { 0% { background: var(--select); } 100% { background: transparent; } }
+.tl .seq, .tl .time, .tl .step { font-family: var(--mono); font-size: 12px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tl .type { font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; color: var(--tc, var(--t-run)); }
+.tl .detailcell { width: 100%; min-width: 0; }
+.headline { font-weight: 550; overflow-wrap: anywhere; }
+.sub { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: center; color: var(--muted); font-size: 12px; }
+.tag {
+  --c: var(--s-unknown);
+  display: inline-flex; align-items: center; gap: 5px; height: 19px; padding: 0 6px; border-radius: 2px;
+  border: 1px solid color-mix(in srgb, var(--c) 40%, var(--line)); color: var(--c); background: var(--panel);
+  font-family: var(--mono); font-size: 11px; cursor: default; white-space: nowrap;
+}
+button.tag { cursor: pointer; }
+.tag::before { content: ""; width: 6px; height: 6px; background: var(--c); border-radius: 1px; }
+.tag.untrusted { background: color-mix(in srgb, var(--c) 12%, var(--panel)); font-weight: 700; }
+.tag[aria-expanded="true"] { outline: 1px solid var(--c); }
+.call { font-family: var(--mono); font-size: 11.5px; color: var(--text); }
+.flag { display: flex; align-items: center; gap: 0; margin-top: 4px; font-size: 11.5px; color: var(--warn); }
+.flag .rname { margin: 0 10px 0 6px; }
+.rule-badge { font-family: var(--mono); font-weight: 700; font-size: 11px; padding: 0 5px; border: 1px solid color-mix(in srgb, var(--warn) 50%, transparent); border-radius: 2px; background: var(--warn-bg); }
+.err { color: var(--bad); font-weight: 600; font-size: 12px; margin-top: 3px; }
+.net { font-family: var(--mono); font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
+.seal { font-family: var(--mono); font-size: 11px; white-space: nowrap; color: var(--faint); }
+.seal.sealed { color: var(--ok); }
+.seal.broken { color: var(--bad); font-weight: 700; }
+.expand { margin-top: 8px; display: grid; gap: 8px; }
+.kv { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 4px 10px; font-size: 12px; }
+.kv > .k { color: var(--faint); font-size: 10.5px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; padding-top: 2px; }
+pre.content {
+  margin: 0; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 2px;
+  font-family: var(--mono); font-size: 11.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 300px; overflow: auto;
+}
+.redacted { font-style: italic; color: var(--faint); font-size: 12px; }
+.empty { padding: 48px 20px; text-align: center; color: var(--muted); }
+
+/* footer status bar */
+.footer {
+  display: flex; align-items: center; gap: 14px; height: 24px; padding: 0 12px; border-top: 1px solid var(--line);
+  background: var(--panel); color: var(--faint); font-size: 11px; font-family: var(--mono);
+}
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); display: inline-block; margin-right: 6px; vertical-align: 0; }
+.live-dot.on { background: var(--ok); }
+
+@media (max-width: 900px) {
+  body { height: auto; overflow: auto; }
+  .main { grid-template-columns: minmax(0, 1fr); }
+  .side { border-right: 0; border-bottom: 1px solid var(--line); }
+  .scroll { max-height: 320px; }
+  .verify-meta { display: none; }
+  .bar { flex-wrap: wrap; height: auto; padding: 8px 12px; }
+  .tl .time, .tl th.time-h { display: none; }
+}
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" d="M2 13V3l6 6 6-6v10"/></svg>
+    MNESTIQ
+  </div>
+  <div class="sep"></div>
+  <select class="file" id="file" aria-label="Evidence file"></select>
+  <span id="verify-badge"></span>
+  <span class="verify-meta" id="verify-meta"></span>
+  <div class="spacer"></div>
+</header>
+<section class="stats" id="stats" aria-label="Summary"></section>
+<div class="banners" id="banners"></div>
+<main class="main">
+  <aside class="side">
+    <div class="section-head">
+      <div class="label">Trace a connection</div>
+      <input class="search" id="finder" placeholder="ip:port from a firewall or flow log" autocomplete="off" spellcheck="false" aria-label="Trace a connection">
+      <div class="hits" id="hits"></div>
+    </div>
+    <div class="scroll" id="runs"></div>
+    <div class="legend" id="legend"></div>
+  </aside>
+  <section class="detail" id="detail" aria-live="polite"></section>
+</main>
+<footer class="footer">
+  <span><span class="live-dot" id="live-dot"></span><span id="live-text">connecting</span></span>
+  <span id="foot-file"></span>
+  <span class="spacer" style="flex:1"></span>
+  <span>127.0.0.1 · local only</span>
+</footer>
+
+<script>
+"use strict";
+// Everything from evidence files is attacker-influenced (web pages, tool output),
+// so it is only ever inserted as text, never as HTML.
+const UNTRUSTED = new Set(["tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"]);
+const SOURCES = ["system", "user", "internal", "model", "tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"];
+const TRUSTED = new Set(["system", "user", "internal"]);  // values from these are not "introduced by untrusted content"
+const TYPE_COLOR = { llm_call: "--t-llm", tool_call: "--t-tool", egress: "--t-egress", approval: "--t-approval" };
+// Detection rules. Each names what was observed, not a conclusion: an address taken from a
+// web page is consistent with prompt injection, but also with an agent legitimately acting
+// on that page. The investigator decides which.
+const RULES = {
+  "MNQ-001": { name: "untrusted argument", explain: "A tool call's arguments carry an address, URL or account number that appears in untrusted content and not in the user's or system's words." },
+  "MNQ-002": { name: "auto-approval", explain: "An action was approved without a human after untrusted content reached the model in this run." },
+  "MNQ-003": { name: "egress after taint", explain: "Outbound network connection (not to loopback) after untrusted content reached the model in this run." },
+  "MNQ-004": { name: "untrusted sensitive action", explain: "A sensitive action (credentials, permissions, deletion, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words." },
+};
+// follow: while the newest file/run is selected, move to newer ones as agents write them.
+// MNQ-001: tool-call arguments carrying a destination or identifier (email, URL or host, account
+// or long number) that untrusted content introduced. Mirrors mnestiq/findings.py.
+const IND_RX = [
+  /[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g,
+  /(?:https?:\/\/|www\.)[^\s"'<>)\]]+|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|org|net|io|co|ai|dev|app|info|biz|xyz|me|us|uk|de|eu|ly|gl|link|site|online)\b(?:\/[^\s"'<>)\]]*)?/gi,
+  /\b[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}\b/g,
+];
+const LONG_NUM = /\+?[0-9][0-9 -]{7,}[0-9]/g;
+const DATE = /[0-9]{4}-[0-9]{2}-[0-9]{2}/;  // 2024-03-07 is not a number to trace
+const SEP = /[ -]/g;
+function indicators(text) {
+  const found = new Set();
+  for (const rx of [IND_RX[0], IND_RX[2]]) for (const m of text.matchAll(rx)) found.add(m[0].toLowerCase().replace(/[.,;:/]+$/, ""));
+  // A model may add or drop the scheme or "www." when it copies a link.
+  for (const m of text.matchAll(IND_RX[1])) found.add(m[0].toLowerCase().replace(/^(?:https?:\/\/)?(?:www\.)?/, "").replace(/[.,;:/]+$/, ""));
+  for (const m of text.matchAll(LONG_NUM)) if (!DATE.test(m[0])) found.add(m[0].replace(SEP, ""));
+  // Keep the longest form: an email's domain or an IBAN's digits are not separate indicators.
+  const all = [...found].filter((f) => f.length >= 6);
+  return all.filter((f) => !all.some((g) => g !== f && g.includes(f))).sort();
+}
+const strings = (v) => (v == null ? [] : Array.isArray(v) ? v.flatMap(strings)
+  : typeof v === "object" ? Object.values(v).flatMap(strings) : [String(v)]);
+function corpus(segs) {
+  const text = segs.flatMap((s) => strings(s.content)).join("\n").toLowerCase();
+  return { text, compact: text.replace(SEP, "") };
+}
+const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Whole matches only: "billing@acme.exam" must not count as present in "billing@acme.example".
+const inCorpus = (c, ind) => new RegExp(`(?<![a-z0-9_-])${escapeRx(ind)}(?![a-z0-9])`)
+  .test(/^[0-9]+$/.test(ind) || ind.startsWith("+") ? c.compact : c.text);
+// Loopback traffic never leaves the machine (a local model server, a sidecar): not egress.
+function isLoopback(e) {
+  const host = String(e.dest_ip || e.host || "").replace(/^\[|\]$/g, "").split("%")[0].toLowerCase();
+  return host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
+// MNQ-004: a sensitive action whose argument values came from untrusted content. Mirrors
+// mnestiq/findings.py. Sensitive = marked by the recorder, else guessed from the tool's name.
+const SENSITIVE_NAME = /password|passwd|credential|secret|token|api_?key|permission|role|grant|revoke|delete|remove|erase|reset|disable|transfer|refund|payment|send_money|pay_|schedule_transaction|update_scheduled|update_user|update_email|update_account|create_user|reserve|book_/i;
+const DESTRUCTIVE_NAME = /delete|remove|erase|revoke|disable/i;  // a bare id is the whole payload
+const NUMBER = /^[+-]?[0-9]+(?:\.[0-9]+)?$/;
+const DATE_ONLY = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
+function isSensitive(ev, name) {
+  const marked = (ev.attributes || {}).sensitive;
+  return typeof marked === "boolean" ? marked : SENSITIVE_NAME.test(name || "");
+}
+function untrustedValues(tool, args, context) {
+  const segs = context.filter((s) => UNTRUSTED.has(s.source));
+  const untrusted = corpus(segs);
+  const trusted = corpus(context.filter((s) => TRUSTED.has(s.source)));
+  const destructive = DESTRUCTIVE_NAME.test(tool || "");
+  const hits = [];
+  for (const value of strings(args)) {
+    const v = value.trim().toLowerCase();
+    if (!v || v.length > 200 || ["true", "false", "none", "null"].includes(v) || DATE_ONLY.test(v)) continue;
+    if (NUMBER.test(v) && !destructive) continue;
+    const token = new RegExp(`(?<![a-z0-9])${escapeRx(v)}(?![a-z0-9])`);
+    if (token.test(untrusted.text) && !token.test(trusted.text))
+      hits.push({ value: value.trim(),
+        sources: [...new Set(segs.filter((s) => token.test(corpus([s]).text)).map((s) => s.source))].sort() });
+  }
+  return hits;
+}
+function untrustedArguments(ev, untrustedSegs) {
+  const untrusted = corpus(untrustedSegs);
+  const trusted = corpus((ev.context || []).filter((s) => TRUSTED.has(s.source)));
+  const hits = [];
+  for (const call of ev.tool_calls || [])
+    for (const value of strings(call.arguments))
+      for (const ind of indicators(value))
+        if (inCorpus(untrusted, ind) && !inCorpus(trusted, ind))
+          hits.push({ tool: call.name, indicator: ind,
+            sources: [...new Set(untrustedSegs.filter((s) => inCorpus(corpus([s]), ind)).map((s) => s.source))].sort() });
+  return hits;
+}
+const state = { files: [], name: null, etag: null, data: null, runId: null, focusSeq: null, open: new Set(), lastOk: 0,
+  follow: { file: true, run: true } };
+
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "style") el.setAttribute("style", v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid == null || kid === false) continue;
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+const short = (id) => (id || "").slice(0, 8);
+const clock = (ts) => (ts && ts.wall ? ts.wall.slice(11, 23) : "");
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+const fmt = (v) => (typeof v === "string" ? v : JSON.stringify(v, null, 2));
+const addr = (ip, port) => (ip ? `${ip}:${port ?? "?"}` : port != null ? `?:${port}` : "?");
+
+// ---------- deep links: #file=…&run=…&seq=…&q=…&theme=… ----------
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  if (p.get("theme")) document.documentElement.dataset.theme = p.get("theme");
+  if (p.get("file")) { state.name = p.get("file"); state.follow.file = false; }
+  if (p.get("run")) { state.runId = p.get("run"); state.follow.run = false; }
+  if (p.get("seq")) { state.follow.run = false; state.focusSeq = Number(p.get("seq")); state.open.add(`${p.get("seq")}`); }
+  if (p.get("q")) document.getElementById("finder").value = p.get("q");
+  for (const key of (p.get("open") || "").split(",").filter(Boolean)) state.open.add(key);
+}
+function writeHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  state.name ? p.set("file", state.name) : p.delete("file");
+  state.runId ? p.set("run", state.runId) : p.delete("run");
+  const q = document.getElementById("finder").value.trim();
+  q ? p.set("q", q) : p.delete("q");
+  history.replaceState(null, "", "#" + p.toString());
+}
+
+// ---------- data ----------
+async function loadFiles() {
+  const res = await fetch("/api/files", { cache: "no-store" });
+  const body = await res.json();
+  state.files = body.files;
+  const newest = state.files[0]?.name;
+  if (state.follow.file && newest && newest !== state.name) state.name = null;
+  if (!state.name || !state.files.some((f) => f.name === state.name)) {
+    state.name = state.files.length ? state.files[0].name : null;
+    state.etag = null; state.runId = null;
+  }
+  renderFileSelect(body.root);
+}
+
+async function loadFile() {
+  if (!state.name) { state.data = null; render(); return; }
+  const headers = state.etag ? { "If-None-Match": state.etag } : {};
+  const res = await fetch(`/api/file?name=${encodeURIComponent(state.name)}`, { headers, cache: "no-store" });
+  if (res.status === 304) return;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  state.etag = res.headers.get("ETag");
+  state.data = derive(await res.json());
+  if (state.focusSeq != null) {  // a deep link to a step selects the run that contains it
+    const rec = state.data.records.find((r) => r.seq === state.focusSeq);
+    if (rec?.run_id) state.runId = rec.run_id;
+  }
+  if (state.follow.run && state.focusSeq == null) state.runId = state.data.order[0]?.id ?? null;
+  if (!state.runId || !state.data.runs.has(state.runId)) state.runId = state.data.order[0]?.id ?? null;
+  render();
+}
+
+// Poll every 2 s while connected, back off to 30 s while the server is unreachable.
+let pollDelay = 2000;
+let pollTimer = null;
+async function tick() {
+  clearTimeout(pollTimer);
+  try {
+    await loadFiles();
+    await loadFile();
+    state.lastOk = Date.now();
+    pollDelay = 2000;
+    setLive(true);
+  } catch (e) {
+    pollDelay = Math.min(pollDelay * 2, 30000);
+    setLive(false, e.message);
+  }
+  pollTimer = setTimeout(tick, pollDelay);
+}
+
+function derive(payload) {
+  const { records, report } = payload;
+  const errBySeq = new Map();
+  for (const e of report.errors) if (e.seq != null) (errBySeq.get(e.seq) || errBySeq.set(e.seq, []).get(e.seq)).push(e);
+  const checkpoints = records.filter((r) => r.kind === "checkpoint" && r.covers);
+  const sealed = (seq) => checkpoints.some((c) => seq >= c.covers.from_seq && seq <= c.covers.to_seq);
+
+  const runs = new Map();
+  const totals = { llm: 0, tool: 0, egress: 0, flags: 0, failed: 0 };
+  for (const r of records) {
+    if (r.kind !== "event" || !r.run_id) continue;
+    let run = runs.get(r.run_id);
+    if (!run) {
+      run = { id: r.run_id, parent: r.parent_run_id || null, agent: r.agent_id, operator: r.operator_id,
+              sandbox: r.sandbox_id, events: [], status: "running", start: r.ts, end: null, error: null,
+              perms: null, flags: [], children: [], firstSeq: r.seq, tampered: 0 };
+      runs.set(r.run_id, run);
+    }
+    run.events.push(r);
+    if (errBySeq.has(r.seq)) run.tampered++;
+    if (r.event_type === "run_start") run.perms = r.effective_permissions || null;
+    if (r.event_type === "run_end") { run.status = r.status || "ok"; run.end = r.ts; run.error = r.error; }
+    if (r.event_type === "llm_call") totals.llm++;
+    if (r.event_type === "tool_call") totals.tool++;
+    if (r.event_type === "egress") totals.egress++;
+    if (r.status === "error" && r.event_type !== "run_end") totals.failed++;
+  }
+
+  // Provenance flags: what happened after untrusted content reached the model.
+  for (const run of runs.values()) {
+    let taint = null;
+    let lastContext = [];
+    for (const ev of run.events) {
+      ev._flags = [];
+      if (ev.event_type === "llm_call") {
+        lastContext = ev.context || [];
+        const bad = lastContext.filter((s) => UNTRUSTED.has(s.source));
+        if (bad.length) {
+          taint = taint || { step: ev.step_id, sources: [...new Set(bad.map((s) => s.source))] };
+          for (const hit of untrustedArguments(ev, bad))
+            ev._flags.push({ rule: "MNQ-001", finding: `${hit.tool} ← ${hit.indicator} (from ${hit.sources.join(",")})`, taint: ev.step_id });
+        }
+      } else if (taint && ev.event_type === "egress" && !isLoopback((ev.egress || [])[0] || {})) {
+        const e = (ev.egress || [])[0] || {};
+        ev._flags.push({ rule: "MNQ-003", finding: `${addr(e.source_ip, e.source_port)} → ${addr(e.dest_ip, e.dest_port)}`, taint: taint.step });
+      } else if (taint && ev.event_type === "approval") {
+        const a = (ev.approvals || [])[0] || {};
+        if (a.decision === "approved" && a.approver_type !== "human")
+          ev._flags.push({ rule: "MNQ-002", finding: `${a.action} by ${a.approver}`, taint: taint.step });
+      } else if (taint && ev.event_type === "tool_call") {
+        for (const call of ev.tool_calls || [])
+          if (isSensitive(ev, call.name))
+            for (const hit of untrustedValues(call.name, call.arguments, lastContext))
+              ev._flags.push({ rule: "MNQ-004", finding: `${call.name} ← "${hit.value}" (from ${hit.sources.join(",")})`, taint: taint.step });
+      }
+      for (const f of ev._flags) run.flags.push({ seq: ev.seq, step: ev.step_id, ...f });
+    }
+    totals.flags += run.flags.length;
+  }
+
+  for (const run of runs.values()) if (run.parent && runs.has(run.parent)) runs.get(run.parent).children.push(run);
+  const roots = [...runs.values()].filter((r) => !r.parent || !runs.has(r.parent)).sort((a, b) => b.firstSeq - a.firstSeq);
+  const order = [];
+  const walk = (run, depth) => { order.push({ ...run, depth }); run.children.sort((a, b) => a.firstSeq - b.firstSeq).forEach((c) => walk(c, depth + 1)); };
+  roots.forEach((r) => walk(r, 0));
+  const egress = records.filter((r) => r.event_type === "egress");
+  return { payload, report, records, runs, order, totals, errBySeq, sealed, egress, checkpoints };
+}
+
+// ---------- rendering ----------
+function setLive(ok, msg) {
+  document.getElementById("live-dot").className = "live-dot" + (ok ? " on" : "");
+  document.getElementById("live-text").textContent = ok
+    ? `live · updated ${new Date(state.lastOk).toLocaleTimeString()}`
+    : `disconnected${msg ? ": " + msg : ""} · retrying`;
+}
+
+function renderFileSelect(root) {
+  const sel = document.getElementById("file");
+  const current = [...sel.options].map((o) => o.value).join("|");
+  const next = state.files.map((f) => f.name).join("|");
+  if (current !== next) {
+    sel.replaceChildren(...state.files.map((f) => h("option", { value: f.name }, `${f.ok ? "" : "[!] "}${f.name}`)));
+    if (!state.files.length) sel.append(h("option", { value: "" }, "no evidence files"));
+  }
+  sel.value = state.name || "";
+  sel.title = root;
+}
+
+function render() {
+  const d = state.data;
+  renderBadge(d);
+  renderBanners(d);
+  renderStats(d);
+  renderRuns(d);
+  renderDetail(d);
+  renderFinder();
+  writeHash();
+}
+
+function renderBadge(d) {
+  const badge = document.getElementById("verify-badge");
+  const meta = document.getElementById("verify-meta");
+  const foot = document.getElementById("foot-file");
+  if (!d) { badge.replaceChildren(); meta.textContent = ""; foot.textContent = ""; return; }
+  const r = d.report;
+  const errors = r.errors_total ?? r.errors.length;
+  const cls = !r.ok ? "bad" : r.warnings.length ? "warn" : "ok";
+  const label = !r.ok ? `Integrity failed · ${plural(errors, "error")}` : r.warnings.length ? "Verified · warnings" : "Verified";
+  badge.replaceChildren(h("span", { class: `status ${cls}` }, label));
+  const signer = r.signer_keys.length ? r.signer_keys.join(", ") : "unsigned";
+  meta.textContent = `${r.checkpoints} checkpoints · signer ${signer} · key ${d.payload.pinned ? "pinned" : "NOT pinned"}`;
+  foot.textContent = `${state.name} · ${plural(r.records, "record")} · chain ${short(r.chain_id)}`;
+}
+
+function renderBanners(d) {
+  const box = document.getElementById("banners");
+  box.replaceChildren();
+  if (!d) return;
+  const item = (e) => h("li", {}, e.seq != null
+    ? h("button", { class: "linkish", onclick: () => focusSeq(e.seq) }, `seq ${e.seq}`) : `line ${e.line ?? "?"}`,
+    ` ${e.code}: ${e.message}`);
+  if (d.payload.records_shown_from > 0) {
+    box.append(h("div", { class: "banner warn" },
+      `Large file: showing the most recent ${d.records.length.toLocaleString()} of ${d.payload.records_total.toLocaleString()} records. Verification covered the whole file.`));
+  }
+  if (d.report.errors.length) {
+    const total = d.report.errors_total ?? d.report.errors.length;
+    box.append(h("details", { class: "banner bad", open: true },
+      h("summary", {}, `Integrity check failed: ${plural(total, "problem")}. Records were altered after they were written.`
+        + (total > d.report.errors.length ? ` Showing the first ${d.report.errors.length}.` : "")),
+      h("ul", {}, d.report.errors.slice(0, 50).map(item))));
+  }
+  if (d.report.warnings.length) {
+    box.append(h("details", { class: "banner warn" },
+      h("summary", {}, plural(d.report.warnings.length, "verification warning")),
+      h("ul", {}, d.report.warnings.map(item))));
+  }
+}
+
+function renderStats(d) {
+  const t = d ? d.totals : {};
+  const errors = d ? (d.report.errors_total ?? d.report.errors.length) : null;
+  const stat = (label, value, cls) => h("div", { class: `stat ${cls || ""}` }, h("div", { class: "label" }, label), h("div", { class: "v" }, value ?? "-"));
+  document.getElementById("stats").replaceChildren(
+    stat("Runs", d ? d.runs.size : null),
+    stat("LLM calls", t.llm),
+    stat("Tool calls", t.tool),
+    stat("Egress", t.egress),
+    stat("Findings", t.flags, t.flags ? "alert" : ""),
+    stat("Integrity errors", errors, errors ? "danger" : ""),
+    stat("Checkpoints", d ? d.report.checkpoints : null),
+    stat("Unsealed", d ? d.report.unsigned_tail : null, d && d.report.unsigned_tail ? "alert" : ""),
+  );
+}
+
+function renderRuns(d) {
+  const box = document.getElementById("runs");
+  if (!d || !d.order.length) {
+    box.replaceChildren(h("div", { class: "empty" }, state.name ? "No runs in this file yet." : "No evidence files found. Point the dashboard at a folder of evidence .jsonl files."));
+    return;
+  }
+  const count = (run, type) => run.events.filter((e) => e.event_type === type).length;
+  const rows = d.order.map((run) => h("tr", {
+      class: `row${run.id === state.runId ? " sel" : ""}`,
+      onclick: () => { state.runId = run.id; state.follow.run = run.id === d.order[0].id; state.focusSeq = null; render(); document.getElementById("timeline").scrollTop = 0; },
+    },
+    h("td", {}, h("span", { class: `dot ${run.status}`, title: run.status })),
+    h("td", { class: "agent", style: `padding-left:${8 + run.depth * 14}px`, title: `${run.agent} · started ${run.start?.wall || "?"}` },
+      run.depth ? "└ " : "", run.agent),
+    h("td", { class: "mono faint" }, short(run.id)),
+    h("td", { class: "num" }, count(run, "llm_call")),
+    h("td", { class: "num" }, count(run, "egress")),
+    h("td", { class: "num" }, run.tampered ? h("span", { class: "errcount", title: "altered records" }, `✕${run.tampered}`)
+      : run.flags.length ? h("span", { class: "flagcount" }, run.flags.length) : h("span", { class: "faint" }, "0"))));
+  box.replaceChildren(h("table", { class: "runs" },
+    h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "Agent"), h("th", {}, "Run"),
+      h("th", { class: "num", title: "LLM calls" }, "LLM"), h("th", { class: "num", title: "network egress" }, "Net"),
+      h("th", { class: "num", title: "findings" }, "Find."))),
+    h("tbody", {}, rows)));
+  const legend = document.getElementById("legend");
+  if (!legend.childElementCount)
+    legend.replaceChildren(h("span", { class: "label" }, "Input source"),
+      ...SOURCES.map((s) => h("span", {}, h("i", { style: `background:var(--s-${s})` }), s + (UNTRUSTED.has(s) ? "*" : ""))),
+      h("span", { class: "faint" }, "* untrusted"));
+}
+
+function renderDetail(d) {
+  const pane = document.getElementById("detail");
+  const prev = document.getElementById("timeline");
+  const scroll = prev ? prev.scrollTop : 0;
+  const run = d && state.runId ? d.runs.get(state.runId) : null;
+  if (!run) { pane.replaceChildren(h("div", { class: "empty" }, d ? "Select a run." : "Waiting for evidence…")); return; }
+  const parent = run.parent && d.runs.get(run.parent);
+  const goto = (id) => () => { state.runId = id; state.follow.run = false; render(); };
+  const head = h("div", { class: "run-head" },
+    h("div", { class: "run-title" },
+      h("span", { class: `dot ${run.status}` }),
+      h("h2", {}, run.agent),
+      h("span", { class: "mono muted" }, run.id),
+      run.status === "error" ? h("span", { class: "status bad" }, run.error || "error") : null),
+    h("div", { class: "facts" },
+      h("span", {}, "operator ", h("b", {}, run.operator || "-")),
+      h("span", {}, "sandbox ", h("b", {}, run.sandbox || "-")),
+      h("span", {}, "started ", h("b", {}, run.start?.wall || "-")),
+      h("span", {}, "status ", h("b", {}, run.status)),
+      parent ? h("span", {}, "parent ", h("button", { class: "link", onclick: goto(parent.id) }, `${parent.agent} ${short(parent.id)}`)) : null,
+      run.children.length ? h("span", {}, "sub-runs ", ...run.children.map((c) => h("button", { class: "link", onclick: goto(c.id) }, `${c.agent} ${short(c.id)} `))) : null),
+    run.perms ? h("div", { class: "perms" }, h("span", { class: "label" }, "Permissions"),
+      ...Object.entries(run.perms).map(([k, v]) => h("span", { class: "perm" }, `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`))) : null);
+  const findings = h("div", { class: "findings" }, run.flags.length ? [
+    h("div", { class: "label findings-title" }, `Findings · ${run.flags.length}`),
+    h("table", { class: "ftable" },
+      h("thead", {}, h("tr", {}, h("th", {}, "Rule"), h("th", {}, "Step"), h("th", {}, "Finding"), h("th", {}, "Taint"))),
+      h("tbody", {}, run.flags.map((f) => h("tr", { title: RULES[f.rule].explain, onclick: () => focusSeq(f.seq) },
+        h("td", { class: "rule" }, f.rule, h("span", { class: "rname" }, RULES[f.rule].name)),
+        h("td", { class: "mono" }, f.step),
+        h("td", { class: "mono" }, f.finding),
+        h("td", { class: "mono faint" }, f.rule === "MNQ-001" ? "-" : `step ${f.taint}`)))))] : []);
+  const table = h("table", { class: "tl" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Seq"), h("th", { class: "time-h" }, "Time (UTC)"), h("th", {}, "Step"),
+      h("th", {}, "Type"), h("th", {}, "Detail"), h("th", {}, "Seal"))),
+    h("tbody", {}, run.events.map((ev) => renderEvent(ev, d))));
+  pane.replaceChildren(head, findings, h("div", { class: "scroll", id: "timeline" }, table));
+  const tl = document.getElementById("timeline");
+  if (state.focusSeq != null) {
+    const el = document.getElementById(`ev-${state.focusSeq}`);
+    if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("focus"); }
+    state.focusSeq = null;
+  } else {
+    tl.scrollTop = scroll;
+  }
+}
+
+function renderEvent(ev, d) {
+  const errors = d.errBySeq.get(ev.seq) || [];
+  const sealed = d.sealed(ev.seq);
+  const key = String(ev.seq);
+  const open = state.open.has(key);
+  const t = ev.event_type;
+  let headline = "";
+  const sub = [];
+  const more = [];
+
+  if (t === "llm_call") {
+    const m = ev.model || {};
+    headline = m.version || m.name || "model";
+    sub.push(...(ev.context || []).map((seg, i) => segTag(ev, seg, i)));
+    if (ev.tool_calls?.length) sub.push(h("span", {}, "→"), ...ev.tool_calls.map((tc) => h("span", { class: "call" }, `${tc.name}(${argsPreview(tc.arguments)})`)));
+    (ev.context || []).forEach((seg, i) => { if (state.open.has(`${ev.seq}:c${i}`)) more.push(kv(`${seg.source}${seg.name ? " · " + seg.name : ""}`, content(seg.content, seg.content_hash, "content"))); });
+    if (open) {
+      if (ev.output) more.push(kv("Model output", content(ev.output.content, ev.output.content_hash, "content")));
+      if (ev.usage) more.push(kv("Usage", `${ev.usage.input_tokens ?? "?"} in · ${ev.usage.output_tokens ?? "?"} out tokens${ev.latency_ms != null ? ` · ${ev.latency_ms} ms` : ""}`));
+    }
+  } else if (t === "tool_call") {
+    const tc = (ev.tool_calls || [])[0] || {};
+    const src = tc.result_source || "tool_output";
+    headline = tc.name || "tool";
+    sub.push(h("span", { class: "call" }, `${tc.name}(${argsPreview(tc.arguments)})`), h("span", {}, "→ result"),
+      h("span", { class: `tag${UNTRUSTED.has(src) ? " untrusted" : ""}`, style: `--c:var(--s-${src})` }, src),
+      tc.latency_ms != null ? h("span", { class: "faint mono" }, `${tc.latency_ms} ms`) : null);
+    if (tc.error) sub.push(h("span", { class: "err" }, tc.error));
+    if (open) {
+      more.push(kv("Arguments", content(tc.arguments, tc.arguments_hash, "arguments")));
+      if ("result" in tc || tc.result_hash) more.push(kv("Result", content(tc.result, tc.result_hash, "result")));
+    }
+  } else if (t === "egress") {
+    const e = (ev.egress || [])[0] || {};
+    headline = e.protocol === "http" ? `${e.method} ${e.host || ""}${e.status ? " " + e.status : ""}` : `TCP ${e.host || e.dest_ip || ""}:${e.dest_port ?? ""}`;
+    sub.push(h("span", { class: "net" }, `${addr(e.source_ip, e.source_port)} → ${addr(e.dest_ip, e.dest_port)}`));
+    if (e.url) sub.push(h("span", { class: "net" }, e.url));
+    if (e.error) sub.push(h("span", { class: "err" }, e.error));
+    if (open) more.push(kv("Egress id", h("span", { class: "mono" }, e.egress_id || "-")),
+      kv("Run id header", e.run_id_header ? "sent" : "not sent"), kv("Public ip", e.public_ip || "-"));
+  } else if (t === "approval") {
+    const a = (ev.approvals || [])[0] || {};
+    headline = `${a.action}: ${a.decision}`;
+    sub.push(h("span", {}, `by ${a.approver} (${a.approver_type || "?"})`), a.reason ? h("span", { class: "faint" }, a.reason) : null);
+  } else if (t === "run_start") {
+    headline = ev.parent_run_id ? "sub-run started" : "run started";
+  } else if (t === "run_end") {
+    headline = `run ended · ${ev.status}`;
+    if (ev.error) sub.push(h("span", { class: "err" }, ev.error));
+  } else {
+    headline = ev.attributes?.message || t;
+  }
+  if (ev.error && t !== "run_end" && t !== "tool_call") sub.push(h("span", { class: "err" }, ev.error));
+  if (open) for (const f of ev._flags) more.push(kv(f.rule, `${RULES[f.rule].explain}${f.rule === "MNQ-001" ? "" : ` Untrusted content first reached the model at step ${f.taint}.`}`));
+  if (open) more.push(h("details", {}, h("summary", { class: "label", style: "cursor:pointer" }, "Raw record"),
+    h("pre", { class: "content" }, JSON.stringify(ev, (k, v) => (k.startsWith("_") ? undefined : v), 2))));
+
+  const seal = errors.length ? h("span", { class: "seal broken", title: "record no longer matches what was signed" }, "BROKEN")
+    : h("span", { class: `seal${sealed ? " sealed" : ""}`, title: sealed ? "covered by a signed checkpoint" : "not yet covered by a signed checkpoint" }, sealed ? "sealed" : "pending");
+  return h("tr", {
+      class: `ev${open ? " open" : ""}${errors.length ? " tampered" : ""}${ev._flags.length ? " flagged" : ""}`,
+      id: `ev-${ev.seq}`, style: `--tc:var(${TYPE_COLOR[t] || "--t-run"})`,
+      onclick: (e) => { if (e.target.closest("button, a, pre, details")) return; toggle(key); },
+    },
+    h("td", { class: "seq" }, ev.seq),
+    h("td", { class: "time" }, clock(ev.ts)),
+    h("td", { class: "step" }, ev.step_id ?? "-"),
+    h("td", { class: "type" }, t.replace("_", " ")),
+    h("td", { class: "detailcell" },
+      h("div", { class: "headline" }, headline),
+      sub.length ? h("div", { class: "sub" }, sub) : null,
+      ...ev._flags.map((f) => h("div", { class: "flag", title: RULES[f.rule].explain },
+        h("span", { class: "rule-badge" }, f.rule), h("span", { class: "rname" }, RULES[f.rule].name), h("span", { class: "mono" }, f.finding))),
+      ...errors.map((e) => h("div", { class: "err" }, `ALTERED ${e.code}: ${e.message}`)),
+      more.length ? h("div", { class: "expand" }, more) : null),
+    h("td", {}, seal));
+}
+
+function kv(k, v) { return h("div", { class: "kv" }, h("div", { class: "k" }, k), h("div", {}, v)); }
+
+function segTag(ev, seg, i) {
+  const key = `${ev.seq}:c${i}`;
+  const open = state.open.has(key);
+  const label = seg.name ? `${seg.source}·${seg.name}` : seg.source;
+  return h("button", {
+    class: `tag${UNTRUSTED.has(seg.source) ? " untrusted" : ""}`, style: `--c:var(--s-${SOURCES.includes(seg.source) ? seg.source : "unknown"})`,
+    "aria-expanded": String(open), title: UNTRUSTED.has(seg.source) ? "untrusted input: click to view" : "click to view",
+    onclick: () => toggle(key),
+  }, label);
+}
+
+function toggle(key) {
+  state.open.has(key) ? state.open.delete(key) : state.open.add(key);
+  renderDetail(state.data);
+}
+
+function content(value, hash, field) {
+  if (value === undefined) return h("div", { class: "redacted" }, `${field} not present (redacted or omitted); committed hash ${hash || "?"}`);
+  return h("pre", { class: "content" }, fmt(value));
+}
+
+function argsPreview(args) {
+  if (args === undefined) return "redacted";
+  const s = typeof args === "string" ? args : JSON.stringify(args);
+  return s.length > 70 ? s.slice(0, 67) + "…" : s;
+}
+
+// ---------- connection finder ----------
+function renderFinder() {
+  const q = document.getElementById("finder").value.trim();
+  const box = document.getElementById("hits");
+  if (!q || !state.data) { box.replaceChildren(); return; }
+  const port = /^\d+$/.test(q) ? Number(q) : null;
+  const hits = state.data.egress.filter((r) => {
+    const e = (r.egress || [])[0] || {};
+    if (port != null) return e.source_port === port || e.dest_port === port;
+    return addr(e.source_ip, e.source_port) === q || addr(e.dest_ip, e.dest_port) === q || (e.url || "").includes(q) || (e.host || "").includes(q);
+  }).slice(0, 20);
+  box.replaceChildren(...(hits.length ? hits.map((r) => {
+    const e = r.egress[0];
+    return h("button", { class: "hit", onclick: () => focusSeq(r.seq) },
+      h("span", { class: "mono" }, `${addr(e.source_ip, e.source_port)} → ${addr(e.dest_ip, e.dest_port)}`),
+      h("span", { class: "muted", style: "font-size:12px" }, `${r.agent_id} · run ${short(r.run_id)} · step ${r.step_id} · ${clock(r.ts)}`));
+  }) : [h("div", { class: "faint", style: "font-size:12px" }, "No recorded connection matches.")]));
+}
+
+function focusSeq(seq) {
+  const rec = state.data.records.find((r) => r.seq === seq);
+  if (rec?.run_id) state.runId = rec.run_id;
+  state.follow.run = false;
+  state.focusSeq = seq;
+  state.open.add(String(seq));
+  render();
+}
+
+document.getElementById("finder").addEventListener("input", () => { renderFinder(); writeHash(); });
+document.getElementById("file").addEventListener("change", (e) => {
+  state.name = e.target.value; state.etag = null; state.runId = null; state.open.clear();
+  state.follow = { file: state.name === state.files[0]?.name, run: true };
+  tick();
+});
+readHash();
+tick();
+</script>
+</body>
+</html>

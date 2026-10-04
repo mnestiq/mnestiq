@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -e ".[dev,anthropic,openai]" httpx requests ruff mypy
+      - name: Lint
+        run: ruff check src tests
+      - name: Types
+        run: mypy src
+      - name: Tests (network beyond loopback is blocked by tests/_netguard.py)
+        run: python -m pytest -q
+      - name: Schema copy in sync with spec
+        shell: bash
+        run: cmp ../spec/schema/record.schema.json src/mnestiq/schema/record.schema.json
