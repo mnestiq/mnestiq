@@ -1,0 +1,59 @@
+name: release
+
+# Publishing a GitHub release tagged v<version> builds the package and uploads it to
+# PyPI through Trusted Publishing: no API token is stored anywhere.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches the package version
+        shell: bash
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match package version v${version}"
+            exit 1
+          fi
+      - name: Test
+        run: |
+          python -m pip install -e ".[dev,anthropic,openai]" httpx requests
+          python -m pytest -q
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: python/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mnestiq
+    permissions:
+      id-token: write  # lets PyPI verify this workflow; no other write access
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
