@@ -35,6 +35,7 @@ from .jsonable import to_jsonable
 from .keys import key_id, public_key_b64
 from .merkle import merkle_root
 from .sinks import Sink
+from .verify import schema_problem
 
 SPEC_VERSION = "0.1"
 _log = logging.getLogger("mnestiq")
@@ -154,6 +155,8 @@ class Recorder:
         last: dict | None = None
         pending: list[str] = []
         for rec in sink.existing():
+            if not isinstance(rec, dict) or not {"chain_id", "seq", "record_hash"} <= rec.keys():
+                raise RecorderError("the sink already holds data that is not Mnestiq evidence, use a new file")
             last = rec
             if rec.get("kind") == "checkpoint":
                 pending = []
@@ -193,6 +196,9 @@ class Recorder:
 
     def _write(self, record: dict) -> dict:
         record["record_hash"] = record_hash(record)
+        problem = schema_problem(record)
+        if problem:
+            raise RecorderError(f"record would not pass verification, not written: {problem}")
         self._sink.append(record)
         self._seq += 1
         self._prev = record["record_hash"]

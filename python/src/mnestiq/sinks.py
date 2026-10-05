@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 from collections.abc import Iterator
 
 from .canonical import canonical_json
@@ -35,6 +36,10 @@ class FileSink:
     ``fsync=True`` forces each record to disk before the agent proceeds: slower,
     but nothing is lost if the host dies mid-incident. New files are created
     owner-read/write only (evidence can contain prompts and customer data).
+
+    One writer per file: a second sink on a file that is already open for writing,
+    in this process or another, raises ``SinkError``. The lock goes away with the
+    process, so a crash never leaves the file locked.
     """
 
     def __init__(self, path: str | Path, *, fsync: bool = False) -> None:
@@ -42,9 +47,15 @@ class FileSink:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fsync = fsync
         self._lock = threading.Lock()
-        self.recovered: dict | None = self._recover_torn_tail()
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         self._fh = os.fdopen(fd, "ab")
+        try:
+            _lock_exclusive(self._fh)
+        except OSError as exc:
+            self._fh.close()
+            raise SinkError(f"{self.path} is already being written by another recorder") from exc
+        self.recovered: dict | None = self._recover_torn_tail()
+        self._fh.seek(0, os.SEEK_END)
 
     def _recover_torn_tail(self) -> dict | None:
         if not self.path.exists() or self.path.stat().st_size == 0:
@@ -122,7 +133,43 @@ class FileSink:
                 self._fh.flush()
                 if self._fsync:
                     os.fsync(self._fh.fileno())
+                _unlock(self._fh)
                 self._fh.close()
+
+
+# Windows locks are mandatory, so a lock on the data itself would stop the dashboard and
+# verify from reading a file that is being written. Lock one byte far past the end instead.
+_LOCK_OFFSET = 1 << 40
+
+
+def _lock_exclusive(fh: BinaryIO) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        fh.seek(_LOCK_OFFSET)
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        finally:
+            fh.seek(0, os.SEEK_END)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(fh: BinaryIO) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(_LOCK_OFFSET)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 class HeadFile:

@@ -1,6 +1,8 @@
 """Crash recovery, write failures, size limits and threading."""
 
 import concurrent.futures
+import subprocess
+import sys
 import threading
 import warnings
 
@@ -197,3 +199,59 @@ def test_concurrent_writers_keep_a_valid_chain(tmp_path, key, pub):
     for e in _events(path):
         per_run.setdefault(e["run_id"], []).append(e["step_id"])
     assert all(steps == list(range(27)) for steps in per_run.values())
+
+
+# --- what the recorder refuses to write -----------------------------------------------------
+
+def test_record_outside_the_schema_is_refused_not_written(tmp_path, key, pub):
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signing_key=key, checkpoint_every=2)
+    with pytest.warns(RuntimeWarning), rec.run() as run:
+        assert run.emit("model_call") is None
+        run.note("still recording")
+    rec.close()
+    assert rec.failures == 1
+    assert "model_call" not in path.read_text("utf-8")
+    assert verify_file(path, [pub]).ok
+
+    strict = Recorder(FileSink(tmp_path / "s.jsonl"), agent_id="a", strict=True)
+    with pytest.raises(RecorderError, match="event_type"), strict.run() as run:
+        run.emit("model_call")
+
+
+def test_sink_with_non_evidence_content_is_refused(tmp_path):
+    path = tmp_path / "e.jsonl"
+    path.write_text('{"hello": "not evidence"}\n', "utf-8")
+    with pytest.raises(RecorderError, match="not Mnestiq evidence"):
+        Recorder(FileSink(path), agent_id="a")
+
+
+# --- one writer per file --------------------------------------------------------------------
+
+def test_second_writer_on_an_open_file_is_refused(tmp_path, key, pub):
+    path = tmp_path / "e.jsonl"
+    first = Recorder(FileSink(path), agent_id="a", signing_key=key, checkpoint_every=2)
+    with pytest.raises(SinkError, match="already being written"):
+        FileSink(path)
+    with first.run() as run:
+        run.note("one")
+    assert verify_file(path, [pub]).ok  # readable while the writer holds the lock
+    first.close()
+
+    second = Recorder(FileSink(path), agent_id="a", signing_key=key, checkpoint_every=2)
+    with second.run() as run:
+        run.note("two")
+    second.close()
+    report = verify_file(path, [pub])
+    assert report.ok and len({r["chain_id"] for r in load(path)}) == 1
+
+
+def test_lock_holds_across_processes(tmp_path):
+    path = tmp_path / "e.jsonl"
+    sink = FileSink(path)
+    other = subprocess.run(
+        [sys.executable, "-c", "import sys\nfrom mnestiq import FileSink, SinkError\n"
+         "try:\n    FileSink(sys.argv[1])\nexcept SinkError:\n    sys.exit(3)\n", str(path)],
+        capture_output=True, timeout=60)
+    sink.close()
+    assert other.returncode == 3, other.stderr.decode()

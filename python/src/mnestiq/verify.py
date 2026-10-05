@@ -13,8 +13,9 @@ from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import best_match
 
-from .canonical import CanonicalizationError
+from .canonical import CanonicalizationError, canonical_json
 from .hashing import (
     GENESIS_HASH,
     digest_bytes,
@@ -64,6 +65,14 @@ class Report:
 def _validator() -> Draft202012Validator:
     schema = json.loads(resources.files("mnestiq.schema").joinpath("record.schema.json").read_text("utf-8"))
     return Draft202012Validator(schema)
+
+
+def schema_problem(record: dict) -> str | None:
+    """The first way a record breaks the schema, or None if it is valid."""
+    error = best_match(_validator().iter_errors(json.loads(canonical_json(record))))
+    if error is None:
+        return None
+    return f"{'/'.join(map(str, error.absolute_path)) or 'record'}: {error.message}"
 
 
 def verify_file(path: str | Path, trusted_keys: Iterable[str] = (), head: dict | None = None) -> Report:
