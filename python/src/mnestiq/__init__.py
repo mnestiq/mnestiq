@@ -4,7 +4,7 @@ from .recorder import Recorder, RecorderError, Run, Segment, current_run
 from .sinks import FileSink, HeadFile, MemorySink, SinkError
 from .verify import Report, verify_file, verify_lines
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 SPEC_VERSION = "0.1"
 
 __all__ = [

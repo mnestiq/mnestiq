@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- The recorder refuses records the verifier would reject, such as an unknown `event_type`,
+  instead of writing them into the signed chain.
+- `FileSink` allows one writer per evidence file. A second recorder on a file that is
+  already being written raises `SinkError` instead of interleaving two chains.
+- Opening a file that holds data other than Mnestiq evidence raises a clear error.
+
 ## 0.1.0
 
 First public release.
