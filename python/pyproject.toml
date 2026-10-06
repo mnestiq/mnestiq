@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnestiq"
-version = "0.1.1"
+version = "0.2.0.dev0"
 description = "Tamper-evident flight recorder for AI agents: hash-chained, signed evidence logs with provenance-tagged context."
 readme = "README.md"
 license = "Apache-2.0"
