@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator
@@ -27,6 +27,9 @@ from .hashing import (
 )
 from .keys import ED25519, key_id, verify_signature
 from .merkle import merkle_root
+
+if TYPE_CHECKING:
+    from cryptography import x509
 
 
 @dataclass
@@ -50,6 +53,7 @@ class Report:
     signer_keys: list[str] = field(default_factory=list)
     rotations: list[dict] = field(default_factory=list)  # signed hand-overs: seq, from_key, to_key
     quiet: list[dict] = field(default_factory=list)  # gaps longer than the heartbeat allows: from, to, seconds
+    timestamps: list[dict] = field(default_factory=list)  # verified RFC 3161 tokens: seq, time (UTC)
     errors: list[Issue] = field(default_factory=list)
     warnings: list[Issue] = field(default_factory=list)
 
@@ -74,6 +78,7 @@ class _Keys:
     trusted: set[str]  # pinned, plus keys a trusted key handed over to
     pinned: bool
     expected: str | None = None  # the key the next checkpoint must be signed by
+    tsa_roots: list[x509.Certificate] | None = None  # roots for RFC 3161 tokens; None means the defaults
 
 
 @lru_cache(maxsize=1)
@@ -90,17 +95,22 @@ def schema_problem(record: dict) -> str | None:
     return f"{'/'.join(map(str, error.absolute_path)) or 'record'}: {error.message}"
 
 
-def verify_file(path: str | Path, trusted_keys: Iterable[str] = (), head: dict | None = None) -> Report:
+def verify_file(path: str | Path, trusted_keys: Iterable[str] = (), head: dict | None = None,
+                tsa_roots: Iterable[x509.Certificate] | None = None) -> Report:
     with open(path, "rb") as fh:
-        return verify_lines(fh, trusted_keys, head)
+        return verify_lines(fh, trusted_keys, head, tsa_roots)
 
 
-def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (), head: dict | None = None) -> Report:
+def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (), head: dict | None = None,
+                 tsa_roots: Iterable[x509.Certificate] | None = None) -> Report:
     """Verify a chain. ``head`` is a checkpoint kept elsewhere (``HeadFile``): the chain must
-    contain exactly that checkpoint, which detects a file cut back to an earlier one."""
+    contain exactly that checkpoint, which detects a file cut back to an earlier one.
+    ``tsa_roots`` are the roots RFC 3161 timestamp tokens must chain to (default: those of
+    the default timestamp authorities, see ``mnestiq.timestamps``)."""
     report = Report()
     pins = {key_id(k) for k in trusted_keys}
-    keys = _Keys(trusted=set(pins), pinned=bool(pins))
+    keys = _Keys(trusted=set(pins), pinned=bool(pins),
+                 tsa_roots=list(tsa_roots) if tsa_roots is not None else None)
     validator = _validator()
     version: str | None = None
 
@@ -326,5 +336,38 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _K
             if kid in keys.trusted:  # a trusted key vouches for its successor
                 keys.trusted.add(next_kid)
     if rec.get("timestamp_token"):
-        report.warn("timestamp_unverified",
-                    "RFC 3161 timestamp token present but not verified by this version", line_no, seq)
+        _check_timestamp(rec, keys, report, line_no, seq)
+
+
+def _check_timestamp(rec: dict, keys: _Keys, report: Report, line_no: int, seq: int | None) -> None:
+    """An RFC 3161 token proves the checkpoint's signature existed at the time it states."""
+    from .timestamps import TimestampError, default_roots, verify_token
+
+    try:
+        roots = keys.tsa_roots if keys.tsa_roots is not None else default_roots()
+        when = verify_token(base64.b64decode(rec["timestamp_token"], validate=True),
+                            base64.b64decode(rec.get("signature", ""), validate=True), roots)
+    except TimestampError as exc:
+        if "pip install" in str(exc):
+            report.warn("timestamp_unverified", f"RFC 3161 timestamp token not checked: {exc}", line_no, seq)
+        else:
+            report.error("timestamp", f"the RFC 3161 timestamp token is not valid for this checkpoint: {exc}",
+                         line_no, seq)
+        return
+    except ValueError:
+        report.error("timestamp", "the RFC 3161 timestamp token is not base64", line_no, seq)
+        return
+    when = when.astimezone(timezone.utc)
+    report.timestamps.append({"seq": seq, "time": when.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    try:
+        claimed = datetime.strptime(str((rec.get("ts") or {}).get("wall")), "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return
+    drift = (claimed.replace(tzinfo=timezone.utc) - when).total_seconds()
+    if drift > 300:
+        report.warn("clock", f"the checkpoint says {claimed:%Y-%m-%dT%H:%M:%SZ} but a timestamp authority saw it "
+                             f"at {when:%Y-%m-%dT%H:%M:%SZ}: the recorder's clock was {drift / 60:.0f} min fast",
+                    line_no, seq)
+    elif drift < -600:
+        report.warn("clock", f"the checkpoint says {claimed:%Y-%m-%dT%H:%M:%SZ} but was timestamped only at "
+                             f"{when:%Y-%m-%dT%H:%M:%SZ}: its time is proven only from then", line_no, seq)

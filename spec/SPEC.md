@@ -255,6 +255,24 @@ evidence is intact, but there is a period it says nothing about. The same checkp
 sent to a second place as they are written, let that place raise the alarm while the
 silence is happening rather than afterwards.
 
+### 6.9 Timestamps
+
+A checkpoint's `ts.wall` comes from the producer's clock. A `timestamp_token` adds a
+time that does not: an RFC 3161 timestamp authority (TSA) signs that the checkpoint's
+signature existed at that time. Verifiers that check tokens MUST report a token as an
+error unless all of these hold:
+
+- its message imprint is the hash of the checkpoint's `signature` bytes (base64-decoded);
+- the TSA's signature over the time-stamp info is valid;
+- the TSA's certificate has the time-stamping extended key usage, marked critical, and
+  chains to a root the verifier trusts.
+
+Verifiers SHOULD warn when `ts.wall` is more than 5 minutes after the token's time (the
+producer's clock was fast), or when the token is much later than `ts.wall` (the time is
+proven only from the token on). A verifier that cannot check tokens MUST say so rather
+than count them as checked. Every record a timestamped checkpoint covers existed no
+later than the token's time.
+
 ## 7. Provenance sources
 
 | Source | Trusted? | Meaning |

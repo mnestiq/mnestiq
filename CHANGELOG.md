@@ -21,6 +21,11 @@ Evidence format v0.2. Files written by 0.1 still verify unchanged.
 - Heartbeats: `Recorder(checkpoint_interval=...)` writes and signs a `heartbeat` event when
   nothing was signed for that long, so a stopped recorder is not mistaken for a quiet agent.
   `verify` warns about silences longer than the heartbeats allow (`Report.quiet`).
+- RFC 3161 timestamps: `Timestamper()` gets a token from DigiCert, then Sectigo, for each
+  checkpoint and checks it before writing it. `verify` now checks every token (covers this
+  signature, the authority's signature, certificate chain and key usage) instead of skipping
+  them, reports the proven time and warns when the agent's clock disagrees. `--tsa-root`
+  trusts other authorities. Install with `pip install "mnestiq[timestamps]"`.
 
 ## 0.1.1
 

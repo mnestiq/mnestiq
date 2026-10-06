@@ -172,10 +172,11 @@ only by a signed hand-over. See [SPEC.md, sections 2 and 6](spec/SPEC.md).
 
 v0.2 draft. Done: spec, verifier, Python recorder, Anthropic + OpenAI capture,
 egress identity propagation (httpx, requests, raw TCP), local dashboard, signing outside
-the agent (signing service, Azure Key Vault) with signed key hand-overs.
+the agent (signing service, Azure Key Vault) with signed key hand-overs, heartbeats,
+RFC 3161 timestamps from public authorities, checked by the verifier.
 
 Next:
-1. RFC 3161 timestamping and external anchoring; S3 Object Lock sink.
+1. External anchoring of checkpoint heads; S3 Object Lock sink.
 2. Automatic run propagation into executors (today: `run.bind`); aiohttp; subprocess egress.
 3. OpenAI Agents SDK and LangGraph capture; streaming output capture.
 4. TypeScript SDK; MCP proxy.
@@ -186,7 +187,7 @@ Next:
 ```bash
 cd python
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e ".[dev,anthropic,openai,azure]" httpx requests ruff mypy
+pip install -e ".[dev,anthropic,openai,azure,timestamps]" httpx requests ruff mypy
 pytest
 ruff check src tests
 mypy src

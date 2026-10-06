@@ -40,6 +40,7 @@ Changelog = "https://github.com/mnestiq/mnestiq/blob/main/CHANGELOG.md"
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.40"]
 azure = ["azure-keyvault-keys>=4.9", "azure-identity>=1.17"]
+timestamps = ["rfc3161-client>=1.0.3"]
 dev = ["pytest>=8"]
 
 [project.scripts]

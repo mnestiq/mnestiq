@@ -197,6 +197,34 @@ AzureDiagnostics
 This is a second record, kept by Microsoft rather than by you or us, of when each signature
 was made and by which identity.
 
+## Proving when: timestamps
+
+A checkpoint carries the time from the agent's machine, and whoever controls that machine
+controls its clock. An RFC 3161 timestamp adds a time from outside: a timestamp authority
+signs "this checkpoint's signature existed at T" with a certificate from a public
+certificate authority. Only the SHA-256 of the signature is sent.
+
+```bash
+pip install "mnestiq[timestamps]"
+```
+
+```python
+from mnestiq import Recorder, Timestamper
+
+recorder = Recorder(sink, agent_id="support-bot", signer=signer, timestamper=Timestamper())
+```
+
+`Timestamper()` asks DigiCert, then Sectigo. Each token is checked before it is written, so
+a bad answer moves on to the next authority. If none answers, the checkpoint is still
+signed and written, without a token, and a warning is logged. Each checkpoint waits for
+the authority (10 seconds at most per authority, `timeout=`), so use it with checkpoints
+every 100 records or more, not every record.
+
+`mnestiq verify` checks every token: that it covers this checkpoint's signature, the
+authority's signature, and its certificate chain up to DigiCert Trusted Root G4 or USERTrust
+RSA (Sectigo). Use `--tsa-root roots.pem` to trust other authorities instead. It reports the
+proven time, and warns if the agent's clock disagrees with it.
+
 ## Changing keys
 
 A chain is signed by one key at a time. To move to a new key, hand the chain over:

@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="public key (base64 or path to .pub) allowed to sign checkpoints; repeatable")
     p.add_argument("--head", metavar="FILE",
                    help="latest checkpoint kept elsewhere (HeadFile); detects a file cut back to an earlier one")
+    p.add_argument("--tsa-root", action="append", default=[], metavar="PEM",
+                   help="certificate(s) trusted for RFC 3161 timestamps, instead of the built-in roots; repeatable")
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
     p = sub.add_parser("keygen", help="generate a signing keypair")
@@ -77,7 +79,12 @@ def _verify(args: argparse.Namespace) -> int:
         head = json.loads(Path(args.head).read_text("utf-8"))
         if not isinstance(head, dict):  # e.g. "null": must not quietly turn the check off
             raise ValueError(f"{args.head} does not hold a checkpoint record")
-    report = verify_file(args.file, keys, head)
+    roots = None
+    if args.tsa_root:
+        from cryptography import x509
+
+        roots = [c for path in args.tsa_root for c in x509.load_pem_x509_certificates(Path(path).read_bytes())]
+    report = verify_file(args.file, keys, head, roots)
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
         return EXIT_OK if report.ok else EXIT_INVALID
@@ -87,6 +94,10 @@ def _verify(args: argparse.Namespace) -> int:
     print(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
     if report.signed_through_seq is not None:
         print(f"  signed    through seq {report.signed_through_seq} by {', '.join(report.signer_keys)}")
+    if report.timestamps:
+        last = report.timestamps[-1]
+        print(f"  time      {len(report.timestamps)} checkpoint(s) timestamped by an outside authority, "
+              f"the latest (seq {last['seq']}) at {last['time']}")
     for rot in report.rotations:
         print(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
     if report.head_seq is not None:
