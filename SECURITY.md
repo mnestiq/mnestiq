@@ -21,8 +21,9 @@ format defined in `spec/`. Of particular interest:
 - the dashboard or reports executing or fetching attacker-controlled content
 - the recorder breaking or blocking the agent it is recording
 
-The known limits listed in `spec/SPEC.md` (sections 2 and 6.5) are documented behaviour,
-not vulnerabilities.
+The known limits listed in [docs/threat-model.md](docs/threat-model.md) and `spec/SPEC.md`
+(sections 2 and 6.5) are documented behaviour, not vulnerabilities. The
+[break-it kit](examples/break-it/README.md) is a good place to start.
 
 ## Supported versions
 

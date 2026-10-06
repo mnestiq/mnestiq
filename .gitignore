@@ -8,6 +8,7 @@ build/
 keys/
 *.jsonl
 !python/tests/data/*.jsonl
+!examples/break-it/*.jsonl
 evidence/
 
 .mypy_cache/

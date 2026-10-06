@@ -32,6 +32,9 @@ Evidence format v0.2. Files written by 0.1 still verify unchanged.
   record failed with a canonicalization error.
 - Canonical JSON is tested against the RFC 8785 test vectors and, with Node.js installed,
   against the RFC's JavaScript reference on thousands of random values.
+- A public threat model (`docs/threat-model.md`) with one test per attack
+  (`tests/test_attacks.py`), and a break-it kit (`examples/break-it`): a signed, timestamped
+  incident file to try to alter without `verify` noticing.
 
 ## 0.1.1
 

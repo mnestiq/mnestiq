@@ -166,7 +166,9 @@ out of the agent's reach, in a signing service or Azure Key Vault
 ([docs/signing.md](docs/signing.md)), so it can't be copied and used to re-sign history.
 A signature only means something if you **pin the recorder's public key** with
 `--trusted-key`; otherwise someone who rewrites the whole file can re-sign it. Keys change
-only by a signed hand-over. See [SPEC.md, sections 2 and 6](spec/SPEC.md).
+only by a signed hand-over. See [SPEC.md, sections 2 and 6](spec/SPEC.md), and the
+[threat model](docs/threat-model.md): every attack in it is a test, and you can try your own
+on the [break-it kit](examples/break-it/README.md).
 
 ## Status and roadmap
 
