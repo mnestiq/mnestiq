@@ -21,7 +21,7 @@ evidence: the recorder's public key, and the latest checkpoint kept somewhere el
 the Evidence Vault). They are not yours to change. Check you have the originals:
 
 ```
-sha256 recorder.pub  895087d94e3c8926b7eb62620c747e3c4ceed4af20e8c7812c88e0b38cbdae67
+sha256 recorder.pub  f710b0fa45f908fda4b3e308a51a35d1f4f4c24e753e0f35aa755123329dffdd
 sha256 head.json     8c835bf5a9f46385b1e25890eba145e0c6e2c9b4ebd2b91a257ee497574e121a
 ```
 

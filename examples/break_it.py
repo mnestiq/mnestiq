@@ -53,7 +53,7 @@ def main() -> int:
     public = public_key_b64(key)
     del key  # never written anywhere
 
-    (OUT / "recorder.pub").write_text(public + "\n", encoding="ascii")
+    (OUT / "recorder.pub").write_bytes(public.encode("ascii") + b"\n")  # the same bytes on every system
     report = verify_file(OUT / "evidence.jsonl", [public], head=json.loads((OUT / "head.json").read_text()))
     print("VALID" if report.ok else "INVALID", f"{report.records} records, {len(report.timestamps)} timestamped")
     for name in ("recorder.pub", "head.json"):
