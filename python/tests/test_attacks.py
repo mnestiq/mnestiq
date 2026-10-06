@@ -291,3 +291,13 @@ def test_the_break_it_kit_verifies():
     except ImportError:
         return
     assert len(report.timestamps) == report.checkpoints and not report.warnings
+
+
+def test_the_break_it_readme_lists_the_real_checksums():
+    import hashlib
+    from pathlib import Path
+
+    kit = Path(__file__).resolve().parents[2] / "examples" / "break-it"
+    readme = (kit / "README.md").read_text("utf-8")
+    for name in ("recorder.pub", "head.json"):
+        assert hashlib.sha256((kit / name).read_bytes()).hexdigest() in readme, name
