@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 from collections.abc import Callable, Iterator
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.exceptions import InvalidSignature
 
 from .canonical import canonical_json
 from .hashing import (
@@ -32,12 +32,13 @@ from .hashing import (
 )
 from .identity import detect_sandbox_id
 from .jsonable import to_jsonable
-from .keys import key_id, public_key_b64
+from .keys import PrivateKey, key_id, verify_signature
 from .merkle import merkle_root
+from .signers import Signer, as_signer
 from .sinks import Sink
 from .verify import schema_problem
 
-SPEC_VERSION = "0.1"
+SPEC_VERSION = "0.2"
 _log = logging.getLogger("mnestiq")
 
 SOURCES = frozenset(
@@ -109,6 +110,12 @@ class Recorder:
     ``on_checkpoint`` is called with every checkpoint after it is written. Pass a
     ``HeadFile`` to keep the latest checkpoint in a second place, so cutting the
     evidence file back to an earlier checkpoint is detected (``verify --head``).
+
+    ``signer`` signs checkpoints (see ``mnestiq.signers``). In production it should keep the
+    key out of the agent's reach: ``SignerClient`` or ``AzureKeyVaultSigner``. ``signing_key``
+    is the same with a key held in this process. A remote signer is asked once per
+    checkpoint, and if it fails the recorder carries on and tries again after
+    ``retry_after`` seconds; records are never lost, only signed later.
     """
 
     def __init__(
@@ -119,13 +126,15 @@ class Recorder:
         operator_id: str | None = None,
         sandbox_id: str | None = "auto",
         public_ip: str | None = None,
-        signing_key: Ed25519PrivateKey | None = None,
+        signing_key: PrivateKey | None = None,
+        signer: Signer | None = None,
         checkpoint_every: int = 100,
         timestamper: Callable[[bytes], bytes] | None = None,
         chain_id: str | None = None,
         strict: bool = False,
         max_content_bytes: int = 1_048_576,
         on_checkpoint: Callable[[dict], None] | None = None,
+        retry_after: float = 30.0,
     ) -> None:
         if checkpoint_every < 1:
             raise ValueError("checkpoint_every must be >= 1")
@@ -144,7 +153,11 @@ class Recorder:
         # The NAT / gateway address the outside world sees. Not auto-detected: that
         # would mean the recorder making its own network calls.
         self.public_ip = public_ip or os.environ.get("MNESTIQ_PUBLIC_IP") or None
-        self._key = signing_key
+        if signing_key is not None and signer is not None:
+            raise ValueError("pass signing_key or signer, not both")
+        self._signer: Signer | None = as_signer(signing_key) if signing_key is not None else signer
+        self._retry_after = retry_after
+        self._next_try = 0.0
         self._checkpoint_every = checkpoint_every
         self._timestamper = timestamper
         self._on_checkpoint = on_checkpoint
@@ -154,14 +167,20 @@ class Recorder:
 
         last: dict | None = None
         pending: list[str] = []
+        chain_key: str | None = None  # the key the chain expects next, from its last checkpoint
         for rec in sink.existing():
             if not isinstance(rec, dict) or not {"chain_id", "seq", "record_hash"} <= rec.keys():
                 raise RecorderError("the sink already holds data that is not Mnestiq evidence, use a new file")
             last = rec
             if rec.get("kind") == "checkpoint":
                 pending = []
+                chain_key = (rec.get("next_key") or {}).get("key_id") or rec.get("key_id")
             else:
                 pending.append(rec["record_hash"])
+        if chain_key and self._signer is not None and key_id(self._signer.public_key) != chain_key:
+            raise RecorderError(
+                f"this evidence file is signed by {chain_key}, not by the configured key "
+                f"{key_id(self._signer.public_key)}. Change keys with Recorder.rotate_signer, or use a new file")
         if last is not None:
             if chain_id is not None and chain_id != last["chain_id"]:
                 raise ValueError(
@@ -217,16 +236,26 @@ class Recorder:
     def append_event(self, body: dict) -> dict:
         """Append one event. ``body`` holds event fields (event_type, run_id, ...). Raises on failure."""
         with self._lock:
-            if self._closed:
-                raise RecorderError("recorder is closed")
-            record = self._header("event")
-            record.update({k: v for k, v in body.items() if v is not None})
-            self._hash_and_cap(record)
-            self._write(record)
-            self._pending.append(record["record_hash"])
-            if self._key is not None and len(self._pending) >= self._checkpoint_every:
-                self.checkpoint()
+            record = self._append(body)
+            if (self._signer is not None and len(self._pending) >= self._checkpoint_every
+                    and time.monotonic() >= self._next_try):
+                try:
+                    self.checkpoint()
+                except Exception as exc:  # the event is written; signing is tried again later
+                    if self.strict:
+                        raise
+                    self._record_failure(exc)
             return record
+
+    def _append(self, body: dict) -> dict:
+        if self._closed:
+            raise RecorderError("recorder is closed")
+        record = self._header("event")
+        record.update({k: v for k, v in body.items() if v is not None})
+        self._hash_and_cap(record)
+        self._write(record)
+        self._pending.append(record["record_hash"])
+        return record
 
     def _hash_and_cap(self, record: dict) -> None:
         """Set ``<field>_hash`` for redactable values and drop values over the size cap."""
@@ -247,39 +276,81 @@ class Recorder:
             record["x-omitted"] = omitted
 
     def checkpoint(self) -> dict | None:
-        """Sign everything since the last checkpoint. No-op without a key or new records."""
+        """Sign everything since the last checkpoint. No-op without a signer or new records."""
         with self._lock:
-            if self._key is None or not self._pending or self._closed:
+            if self._signer is None or not self._pending or self._closed:
                 return None
-            pub = public_key_b64(self._key)
-            record = self._header("checkpoint")
-            record.update(
-                {
-                    "covers": {"from_seq": self._pending_from, "to_seq": self._seq - 1},
-                    "merkle_root": "sha256:" + merkle_root([digest_bytes(h) for h in self._pending]).hex(),
-                    "sig_alg": "ed25519",
-                    "key_id": key_id(pub),
-                    "public_key": pub,
-                }
-            )
-            signature = self._key.sign(signing_payload(record))
-            record["signature"] = base64.b64encode(signature).decode("ascii")
-            if self._timestamper is not None:
-                try:
-                    record["timestamp_token"] = base64.b64encode(self._timestamper(signature)).decode("ascii")
-                except Exception as exc:  # write the checkpoint without a token
-                    _log.warning("mnestiq: timestamping failed, checkpoint written without a token: %r", exc)
-            self._write(record)
-            self._pending = []
-            self._pending_from = self._seq
-            if self._on_checkpoint is not None:  # e.g. HeadFile: a copy of the head kept elsewhere
-                try:
-                    self._on_checkpoint(dict(record))
-                except Exception as exc:
-                    if self.strict:
-                        raise
-                    self._record_failure(exc)
+            return self._sign_checkpoint(self._signer, None)
+
+    def rotate_signer(self, new: Signer | PrivateKey, reason: str = "key rotation") -> dict:
+        """Hand the chain over to a new key.
+
+        Writes a note, then a checkpoint signed by the current key that names the new one
+        (``next_key``). Verifiers accept the new key from there on, and only because the old
+        key said so: a key change without this hand-over is reported as an error.
+        """
+        signer = as_signer(new)
+        with self._lock:
+            if self._closed:
+                raise RecorderError("recorder is closed")
+            if self._signer is None:
+                raise RecorderError("this recorder has no signer to hand over from; pass signer= instead")
+            self._append({
+                "event_type": "note", "run_id": f"recorder-{self.chain_id[:8]}", "agent_id": self.agent_id,
+                "sandbox_id": self.sandbox_id,
+                "attributes": {"message": reason, "from_key": key_id(self._signer.public_key),
+                               "to_key": key_id(signer.public_key)},
+            })
+            next_key = {"sig_alg": signer.sig_alg, "public_key": signer.public_key,
+                        "key_id": key_id(signer.public_key)}
+            record = self._sign_checkpoint(self._signer, next_key, retry=False)
+            self._signer = signer
             return record
+
+    def _sign_checkpoint(self, signer: Signer, next_key: dict | None, retry: bool = True) -> dict:
+        record = self._header("checkpoint")
+        record.update(
+            {
+                "covers": {"from_seq": self._pending_from, "to_seq": self._seq - 1},
+                "merkle_root": "sha256:" + merkle_root([digest_bytes(h) for h in self._pending]).hex(),
+                "sig_alg": signer.sig_alg,
+                "key_id": key_id(signer.public_key),
+                "public_key": signer.public_key,
+            }
+        )
+        if next_key is not None:
+            record["next_key"] = next_key
+        payload = signing_payload(record)
+        try:
+            signature = signer.sign(payload)
+            # A remote signer's answer is checked before it goes into the evidence.
+            try:
+                verify_signature(signer.sig_alg, signer.public_key, signature, payload)
+            except InvalidSignature:
+                raise RecorderError("the signer returned a signature that does not match its public key; "
+                                    "checkpoint not written") from None
+        except Exception:
+            if retry:
+                self._next_try = time.monotonic() + self._retry_after
+            raise
+        self._next_try = 0.0
+        record["signature"] = base64.b64encode(signature).decode("ascii")
+        if self._timestamper is not None:
+            try:
+                record["timestamp_token"] = base64.b64encode(self._timestamper(signature)).decode("ascii")
+            except Exception as exc:  # write the checkpoint without a token
+                _log.warning("mnestiq: timestamping failed, checkpoint written without a token: %r", exc)
+        self._write(record)
+        self._pending = []
+        self._pending_from = self._seq
+        if self._on_checkpoint is not None:  # e.g. HeadFile: a copy of the head kept elsewhere
+            try:
+                self._on_checkpoint(dict(record))
+            except Exception as exc:
+                if self.strict:
+                    raise
+                self._record_failure(exc)
+        return record
 
     def close(self) -> None:
         """Write a final checkpoint and close the sink. Safe to call more than once."""

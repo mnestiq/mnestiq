@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased (0.2.0)
+
+Evidence format v0.2. Files written by 0.1 still verify unchanged.
+
+- Signing outside the agent. `Recorder(signer=...)` takes any signer:
+  - `SignerClient` and `mnestiq signer init` / `serve`: a signing service under its own
+    account. It signs only checkpoints for its own key, close to its own clock, and per
+    chain only forward, so someone in control of the agent cannot have history signed
+    again. It logs every signature.
+  - `AzureKeyVaultSigner`: the key stays in Azure Key Vault, only a SHA-256 is sent.
+    Install with `pip install "mnestiq[azure]"`.
+- P-256 signatures (`ecdsa-p256-sha256`) next to Ed25519, for key stores without Ed25519.
+  Only low-s signatures are valid, so each checkpoint has one valid signature per key.
+- Signed key hand-overs: `Recorder.rotate_signer` writes a checkpoint naming the next key.
+  A key change without one is now an error, pinned keys or not.
+- Every signature from a signer is checked before it is written. If the signer is down, the
+  agent carries on and signing is retried after `retry_after` seconds.
+- `mnestiq keygen --alg p256`; `verify` shows key hand-overs.
+
 ## 0.1.1
 
 - The recorder refuses records the verifier would reject, such as an unknown `event_type`,

@@ -1,4 +1,4 @@
-"""mnestiq command line: verify, keygen, inspect, redact."""
+"""mnestiq command line: verify, keygen, inspect, redact, dashboard, signer."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .canonical import canonical_json
 from .hashing import redact
-from .keys import generate_private_key, key_id, load_public_key_b64, public_key_b64, save_keypair
+from .keys import ED25519, SIG_ALGS, generate_private_key, key_id, load_public_key_b64, public_key_b64, save_keypair
 from .verify import verify_file
 
 EXIT_OK, EXIT_INVALID, EXIT_USAGE = 0, 1, 2
@@ -28,9 +28,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="latest checkpoint kept elsewhere (HeadFile); detects a file cut back to an earlier one")
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
-    p = sub.add_parser("keygen", help="generate an Ed25519 signing keypair")
+    p = sub.add_parser("keygen", help="generate a signing keypair")
     p.add_argument("--out", default=".", help="directory for signing.key / signing.pub")
     p.add_argument("--name", default="signing")
+    p.add_argument("--alg", choices=SIG_ALGS, default=ED25519)
 
     p = sub.add_parser("inspect", help="print a timeline of an evidence file")
     p.add_argument("file")
@@ -46,13 +47,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-key", action="append", default=[], metavar="KEY")
     p.add_argument("--no-open", action="store_true", help="don't open a browser")
 
+    p = sub.add_parser("signer", help="a signing service that keeps the key away from the agent")
+    signer = p.add_subparsers(dest="signer_command", required=True)
+    s = signer.add_parser("init", help="create a key and an access token in a folder only the service can read")
+    s.add_argument("dir")
+    s.add_argument("--alg", choices=SIG_ALGS, default=ED25519)
+    s = signer.add_parser("serve", help="sign checkpoints for agents that hold the token")
+    s.add_argument("dir")
+    s.add_argument("--listen", default="127.0.0.1:8741", help="127.0.0.1:<port>, or a Unix socket path")
+    s.add_argument("--max-skew", type=float, default=300.0,
+                   help="refuse checkpoints whose time is further than this from the signer's clock (seconds)")
+
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # evidence may hold characters the console can't encode
         with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(errors="replace")  # type: ignore[union-attr]
     try:
         return {"verify": _verify, "keygen": _keygen, "inspect": _inspect, "redact": _redact,
-                "dashboard": _dashboard}[args.command](args)
+                "dashboard": _dashboard, "signer": _signer}[args.command](args)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -75,6 +87,8 @@ def _verify(args: argparse.Namespace) -> int:
     print(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
     if report.signed_through_seq is not None:
         print(f"  signed    through seq {report.signed_through_seq} by {', '.join(report.signer_keys)}")
+    for rot in report.rotations:
+        print(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
     if report.head_seq is not None:
         print(f"  head      matches the checkpoint at seq {report.head_seq} kept elsewhere")
     for issue in report.errors:
@@ -94,11 +108,38 @@ def _where(issue) -> str:
 
 
 def _keygen(args: argparse.Namespace) -> int:
-    key = generate_private_key()
+    key = generate_private_key(args.alg)
     priv, pub = save_keypair(key, args.out, args.name)
     print(f"private key  {priv}   (keep secret; give it to the recorder only)")
     print(f"public key   {pub}   (pin this with verify --trusted-key)")
     print(f"key id       {key_id(public_key_b64(key))}")
+    return EXIT_OK
+
+
+def _signer(args: argparse.Namespace) -> int:
+    from .signer_service import SignerService, init_signer
+    from .signers import SignerError
+
+    try:
+        if args.signer_command == "init":
+            signer = init_signer(args.dir, args.alg)
+            print(f"signer created in {args.dir}")
+            print(f"  key id      {key_id(signer.public_key)} ({signer.sig_alg})")
+            print(f"  public key  {signer.public_key}   (pin this with verify --trusted-key)")
+            print(f"  token       {Path(args.dir) / 'signer.token'}   (give it to the agent, never the key)")
+            print("Run `mnestiq signer serve` under the account that owns this folder.")
+            return EXIT_OK
+        service = SignerService(args.dir, max_skew=args.max_skew)
+        server = service.start(args.listen)
+    except SignerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"signing as {service.key_id} on {server.address}; every signature is logged in "
+          f"{Path(args.dir) / 'signatures.jsonl'}. Ctrl+C stops.", flush=True)
+    try:
+        server.wait()
+    except KeyboardInterrupt:
+        server.close()
     return EXIT_OK
 
 

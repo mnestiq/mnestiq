@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mnestiq.com/spec/0.1/record.schema.json",
-  "title": "Mnestiq Evidence Record v0.1",
-  "description": "One line of an agent evidence chain (JSON Lines). A record is either an event or a signed checkpoint.",
+  "$id": "https://mnestiq.com/spec/0.2/record.schema.json",
+  "title": "Mnestiq Evidence Record v0.2",
+  "description": "One line of an agent evidence chain (JSON Lines). A record is either an event or a signed checkpoint. Also validates v0.1 records.",
   "oneOf": [
     { "$ref": "#/$defs/event" },
     { "$ref": "#/$defs/checkpoint" }
@@ -35,6 +35,11 @@
         }
       }
     },
+    "sigAlg": {
+      "description": "ed25519, or (v0.2) ECDSA over P-256 with SHA-256 for key stores without Ed25519.",
+      "enum": ["ed25519", "ecdsa-p256-sha256"]
+    },
+    "keyId": { "type": "string", "pattern": "^(ed25519|p256):[0-9a-f]{16}$" },
     "source": {
       "description": "Provenance of a piece of model context. Anything other than system/user/model is untrusted input for taint analysis.",
       "enum": ["system", "user", "internal", "model", "tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"]
@@ -43,7 +48,7 @@
       "type": "object",
       "required": ["spec_version", "kind", "chain_id", "seq", "ts", "prev_hash", "record_hash"],
       "properties": {
-        "spec_version": { "const": "0.1" },
+        "spec_version": { "enum": ["0.1", "0.2"] },
         "chain_id": { "type": "string", "minLength": 1, "maxLength": 128 },
         "seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "ts": { "$ref": "#/$defs/timestamp" },
@@ -201,9 +206,20 @@
           "additionalProperties": false
         },
         "merkle_root": { "$ref": "#/$defs/hash" },
-        "sig_alg": { "const": "ed25519" },
-        "key_id": { "type": "string", "pattern": "^ed25519:[0-9a-f]{16}$" },
+        "sig_alg": { "$ref": "#/$defs/sigAlg" },
+        "key_id": { "$ref": "#/$defs/keyId" },
         "public_key": { "type": "string", "contentEncoding": "base64" },
+        "next_key": {
+          "description": "v0.2. Hands the chain over: checkpoints after this one are signed by this key. Signed by the current key.",
+          "type": "object",
+          "required": ["sig_alg", "public_key", "key_id"],
+          "properties": {
+            "sig_alg": { "$ref": "#/$defs/sigAlg" },
+            "public_key": { "type": "string", "contentEncoding": "base64" },
+            "key_id": { "$ref": "#/$defs/keyId" }
+          },
+          "additionalProperties": false
+        },
         "signature": { "type": "string", "contentEncoding": "base64" },
         "timestamp_token": {
           "description": "Optional RFC 3161 TimeStampToken (DER, base64) over the signature bytes.",

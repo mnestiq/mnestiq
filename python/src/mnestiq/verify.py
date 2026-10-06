@@ -24,7 +24,7 @@ from .hashing import (
     signing_payload,
     value_digest,
 )
-from .keys import key_id, public_key_from_b64
+from .keys import ED25519, key_id, verify_signature
 from .merkle import merkle_root
 
 
@@ -47,6 +47,7 @@ class Report:
     unsigned_tail: int = 0
     head_seq: int | None = None  # set when the chain matched a head checkpoint kept elsewhere
     signer_keys: list[str] = field(default_factory=list)
+    rotations: list[dict] = field(default_factory=list)  # signed hand-overs: seq, from_key, to_key
     errors: list[Issue] = field(default_factory=list)
     warnings: list[Issue] = field(default_factory=list)
 
@@ -59,6 +60,18 @@ class Report:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+SUPPORTED_VERSIONS = ("0.1", "0.2")
+
+
+@dataclass
+class _Keys:
+    """Which key signs the chain, and which keys the user's pins extend to."""
+
+    trusted: set[str]  # pinned, plus keys a trusted key handed over to
+    pinned: bool
+    expected: str | None = None  # the key the next checkpoint must be signed by
 
 
 @lru_cache(maxsize=1)
@@ -84,8 +97,10 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
     """Verify a chain. ``head`` is a checkpoint kept elsewhere (``HeadFile``): the chain must
     contain exactly that checkpoint, which detects a file cut back to an earlier one."""
     report = Report()
-    trusted = {key_id(k) for k in trusted_keys}
+    pins = {key_id(k) for k in trusted_keys}
+    keys = _Keys(trusted=set(pins), pinned=bool(pins))
     validator = _validator()
+    version: str | None = None
 
     expected_seq = 0
     prev_hash: str | None = GENESIS_HASH
@@ -118,6 +133,15 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
                 report.error("schema", f"{where}: {err.message}", line_no, seq)
             if not isinstance(rec.get("record_hash"), str) or seq is None:
                 continue  # too malformed to check links
+
+        # A chain may move to a newer version (a recorder upgraded mid-chain), never back.
+        record_version = rec.get("spec_version")
+        if record_version in SUPPORTED_VERSIONS:
+            if version is not None and SUPPORTED_VERSIONS.index(record_version) < SUPPORTED_VERSIONS.index(version):
+                report.error("spec_version", f"spec_version went back from {version} to {record_version}",
+                             line_no, seq)
+            else:
+                version = record_version
 
         # Chain identity and ordering.
         if report.chain_id is None:
@@ -168,7 +192,7 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
             last_seq = seq
         if rec.get("kind") == "checkpoint":
             report.checkpoints += 1
-            _check_checkpoint(rec, pending, trusted, report, line_no, seq)
+            _check_checkpoint(rec, pending, keys, report, line_no, seq)
             if seq is not None:
                 report.signed_through_seq = seq
                 checkpoint_hashes[seq] = stored
@@ -186,7 +210,7 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
     elif pending:
         report.warn("unsigned_tail", f"{len(pending)} record(s) after the last checkpoint are not signed; "
                                      "deletion of trailing records cannot be detected")
-    if report.checkpoints and not trusted:
+    if report.checkpoints and not pins:
         report.warn("untrusted_key", "no --trusted-key given; signatures prove internal consistency only, "
                                      "not who signed. Pin the recorder's public key.")
     if head is not None:
@@ -212,7 +236,7 @@ def _check_head(head: Any, report: Report, checkpoint_hashes: dict[int, str | No
         report.head_seq = seq
 
 
-def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], trusted: set[str],
+def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _Keys,
                       report: Report, line_no: int, seq: int | None) -> None:
     covers = rec.get("covers") or {}
     if not pending:
@@ -231,22 +255,52 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], trusted:
         report.error("merkle_root", "merkle_root does not match the covered records", line_no, seq)
 
     pub = str(rec.get("public_key") or "")
+    sig_alg = rec.get("sig_alg")
+    v01 = rec.get("spec_version") == "0.1"
+    if v01 and (sig_alg != ED25519 or "next_key" in rec):
+        report.error("spec_version", "P-256 signatures and key hand-overs need spec_version 0.2", line_no, seq)
     try:
-        public_key = public_key_from_b64(pub)
-    except Exception:
-        report.error("signature", "public_key is not a valid Ed25519 key", line_no, seq)
+        kid = key_id(pub)
+    except (ValueError, KeyError):
+        report.error("signature", "public_key is not a valid Ed25519 or P-256 key", line_no, seq)
         return
-    kid = key_id(pub)
     if rec.get("key_id") != kid:
         report.error("signature", "key_id does not match public_key", line_no, seq)
+    signed = True
     try:
-        public_key.verify(base64.b64decode(rec.get("signature", "")), signing_payload(rec))
+        verify_signature(str(sig_alg), pub, base64.b64decode(rec.get("signature", ""), validate=True),
+                         signing_payload(rec))
     except (InvalidSignature, ValueError):
+        signed = False
         report.error("signature", "checkpoint signature is invalid", line_no, seq)
     if kid not in report.signer_keys:
         report.signer_keys.append(kid)
-    if trusted and kid not in trusted:
+
+    if keys.expected is not None and kid != keys.expected:
+        message = (f"checkpoint signed by {kid}, but the chain is signed by {keys.expected} and no checkpoint "
+                   "handed it over (next_key)")
+        if v01:
+            report.warn("signer_changed", message, line_no, seq)
+        else:
+            report.error("signer_changed", message, line_no, seq)
+    if keys.pinned and kid not in keys.trusted:
         report.error("untrusted_key", f"checkpoint signed by {kid}, which is not a trusted key", line_no, seq)
+    keys.expected = kid
+
+    nxt = rec.get("next_key")
+    if isinstance(nxt, dict):
+        try:
+            next_kid = key_id(str(nxt.get("public_key") or ""))
+        except (ValueError, KeyError):
+            next_kid = None
+        if next_kid is None or nxt.get("key_id") != next_kid or nxt.get("sig_alg") not in ("ed25519",
+                                                                                            "ecdsa-p256-sha256"):
+            report.error("next_key", "next_key is not a valid key (key_id must match public_key)", line_no, seq)
+        elif signed:
+            keys.expected = next_kid
+            report.rotations.append({"seq": seq, "from_key": kid, "to_key": next_kid})
+            if kid in keys.trusted:  # a trusted key vouches for its successor
+                keys.trusted.add(next_kid)
     if rec.get("timestamp_token"):
         report.warn("timestamp_unverified",
                     "RFC 3161 timestamp token present but not verified by this version", line_no, seq)

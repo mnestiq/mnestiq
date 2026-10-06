@@ -71,6 +71,10 @@ mnestiq inspect evidence.jsonl
 mnestiq redact evidence.jsonl evidence.redacted.jsonl
 ```
 
+A key file the agent can read is fine for trying it out. In production, keep the key where
+the agent can't read it: `signer=SignerClient.from_env()` with `mnestiq signer serve` running
+under another account, or `signer=AzureKeyVaultSigner(...)`. See [docs/signing.md](docs/signing.md).
+
 ### Or try a demo first (no API key)
 
 A scripted support agent reads a poisoned web page and emails customer data out. You then
@@ -135,6 +139,7 @@ The recorder runs inside your agent, so it is built to never be the thing that b
 | **Process dies mid-write** | On restart, `FileSink` moves the torn last line to `<file>.torn-<time>` (never deleted), the chain resumes from the last complete record, and a `note` event records the recovery. A write that fails part-way is truncated, so the file never holds half a record. |
 | **Huge prompts or tool output** | Values over `max_content_bytes` (default 1 MiB) are stored as their hash only and listed in `x-omitted`; the chain still verifies. |
 | **Worker threads** | Threads don't inherit the active run. Wrap work with `run.bind(fn)`, e.g. `pool.submit(run.bind(fetch), url)`. |
+| **Signer down** (signing service or Key Vault) | Records are still written. The failure is counted and signing is tried again after `retry_after` seconds, covering everything since the last checkpoint. |
 | **Timestamp authority down** | The checkpoint is still signed and written; only the RFC 3161 token is skipped, with a warning. |
 | **Power loss** | `FileSink(path, fsync=True)` forces each record to disk before the agent continues. |
 | **Someone deletes the end of the file** | `Recorder(..., on_checkpoint=HeadFile("/other/disk/agent.head.json"))` keeps the latest checkpoint in a second place; `mnestiq verify evidence.jsonl --head /other/disk/agent.head.json` then reports a file cut back to an earlier checkpoint. |
@@ -156,18 +161,20 @@ The format makes evidence **tamper-evident after it is written**. It does not ma
 a compromised host tell the truth at write time. On its own, a file can be cut back
 to any earlier checkpoint without detection; keep the latest checkpoint somewhere
 else with `HeadFile` and verify with `--head` to close that. Keep the signing key
-outside the agent's sandbox. A signature only means something if you **pin the
-recorder's public key** with `--trusted-key`; otherwise someone who rewrites the whole
-file can re-sign it. See [SPEC.md, sections 2 and 6](spec/SPEC.md).
+out of the agent's reach, in a signing service or Azure Key Vault
+([docs/signing.md](docs/signing.md)), so it can't be copied and used to re-sign history.
+A signature only means something if you **pin the recorder's public key** with
+`--trusted-key`; otherwise someone who rewrites the whole file can re-sign it. Keys change
+only by a signed hand-over. See [SPEC.md, sections 2 and 6](spec/SPEC.md).
 
 ## Status and roadmap
 
-v0.1 draft. Done: spec, verifier, Python recorder, Anthropic + OpenAI capture,
-egress identity propagation (httpx, requests, raw TCP), local dashboard.
+v0.2 draft. Done: spec, verifier, Python recorder, Anthropic + OpenAI capture,
+egress identity propagation (httpx, requests, raw TCP), local dashboard, signing outside
+the agent (signing service, Azure Key Vault) with signed key hand-overs.
 
 Next:
-1. Out-of-process signing daemon; RFC 3161 timestamping and external anchoring;
-   S3 Object Lock sink.
+1. RFC 3161 timestamping and external anchoring; S3 Object Lock sink.
 2. Automatic run propagation into executors (today: `run.bind`); aiohttp; subprocess egress.
 3. OpenAI Agents SDK and LangGraph capture; streaming output capture.
 4. TypeScript SDK; MCP proxy.
@@ -178,7 +185,7 @@ Next:
 ```bash
 cd python
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e ".[dev,anthropic,openai]" httpx requests ruff mypy
+pip install -e ".[dev,anthropic,openai,azure]" httpx requests ruff mypy
 pytest
 ruff check src tests
 mypy src

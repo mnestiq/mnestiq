@@ -1,4 +1,4 @@
-# Mnestiq Evidence Format: v0.1 (draft)
+# Mnestiq Evidence Format: v0.2 (draft)
 
 Status: **draft**. Breaking changes are possible until v1.0. The machine-readable
 definition is [`schema/record.schema.json`](schema/record.schema.json); where this
@@ -33,13 +33,15 @@ verifier pins the recorder's public key (section 6.4).
 Does **not** protect against:
 
 - A compromised recorder host lying *at write time*. Evidence is tamper-evident,
-  not truthful at source. Mitigate by running the signing component outside the
-  agent's sandbox and correlating with independent infrastructure logs.
+  not truthful at source. Mitigate by correlating with independent infrastructure logs.
 - Truncation: cutting the file back to any earlier checkpoint, or dropping records
   after the last one (section 6.5). Mitigate by keeping the latest checkpoint in a
   second place and verifying against it (section 6.6), or with an append-only sink
   (e.g. S3 Object Lock).
-- Theft of the signing key. Keep it out of reach of the agent process.
+- Theft of the signing key. Keep it out of reach of the agent process: in a key store
+  such as Azure Key Vault, or in a signing service under another account (section 6.7).
+  Then someone who takes over the agent can obtain signatures only while in control,
+  and cannot take the key away to re-sign history later.
 
 ## 3. Encoding
 
@@ -60,7 +62,7 @@ Every record has these chain fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `spec_version` | `"0.1"` | Format version. |
+| `spec_version` | `"0.2"` | Format version (section 9). |
 | `kind` | `"event"` \| `"checkpoint"` | Record type. |
 | `chain_id` | string | Identifies the chain. Constant within a file. |
 | `seq` | integer | 0-based position in the chain. Contiguous. |
@@ -100,10 +102,11 @@ up to the record immediately before it.
 |---|---|
 | `covers` | `{from_seq, to_seq}`, inclusive. `to_seq` = this `seq - 1`. Non-empty. |
 | `merkle_root` | Section 6.2, over the `record_hash` of each covered record in order. |
-| `sig_alg` | `"ed25519"`. |
-| `public_key` | Raw 32-byte Ed25519 public key, base64. |
-| `key_id` | `ed25519:` + first 16 hex digits of SHA-256(raw public key). |
-| `signature` | Ed25519 signature over the signing payload (section 6.3), base64. |
+| `sig_alg` | `"ed25519"`, or `"ecdsa-p256-sha256"` (ECDSA over P-256 with SHA-256, for key stores without Ed25519). |
+| `public_key` | Base64 of the raw public key: 32 bytes for Ed25519, the 65-byte uncompressed SEC1 point (`0x04` \|\| X \|\| Y) for P-256. |
+| `key_id` | `ed25519:` or `p256:`, then the first 16 hex digits of SHA-256(raw public key). |
+| `signature` | Signature over the signing payload (section 6.3), base64. Ed25519: 64 bytes. P-256: the 64 bytes r \|\| s, big-endian, with s at most n/2 (section 6.3). |
+| `next_key` | Optional. `{sig_alg, public_key, key_id}`: hands the chain over to this key (section 6.7). |
 | `timestamp_token` | Optional RFC 3161 TimeStampToken (DER, base64) whose message imprint is SHA-256 of the signature bytes. |
 
 ### 4.3 Egress and identity propagation
@@ -186,12 +189,21 @@ node = SHA-256(0x01 || left || right); split at the largest power of two less th
 `record_hash` of a checkpoint is then computed per section 5.2 and *does* cover the
 signature and timestamp token.
 
+For P-256, the signature is ECDSA with SHA-256 over the payload. An ECDSA signature
+(r, s) is also valid as (r, n - s), so a third party could change a signature without
+the key. Producers MUST write s in its low form (s <= n/2, where n is the order of the
+P-256 group) and verifiers MUST reject any other, so every payload has one valid
+signature per key.
+
 ### 6.4 Trust
 
 A valid signature only proves the file is internally consistent. Someone who
 rewrites the whole file can re-sign it with their own key. Verifiers MUST let
 the user pin trusted public keys and MUST report checkpoints signed by any other
 key as errors when keys are pinned. Without pinned keys, verifiers MUST warn.
+
+A key that a trusted key handed the chain to (section 6.7) is trusted for the rest of
+that chain. A hand-over signed by an untrusted key extends nothing.
 
 ### 6.5 Known limits
 
@@ -210,6 +222,24 @@ checkpoint with the head's `seq` and an identical `record_hash`, and the head's
 `chain_id` matches. A chain that ends before the head's `seq` MUST be reported as
 truncated. A head proves the file is at least as long as when the head was last
 written; checkpoints written after that are covered by section 6.5 alone.
+
+### 6.7 Signing keys and hand-overs
+
+The signing key SHOULD be out of the agent's reach: in a hardware-backed key store
+(the producer sends only SHA-256 of the payload), or in a separate signing service
+running under another account. Such a service SHOULD sign only checkpoints for its own
+key, only with a `ts.wall` close to its own clock, and per chain only the checkpoint
+that starts right after the last one it signed, and SHOULD log every signature. Then
+someone who controls the agent cannot have earlier checkpoints signed again.
+
+A chain is signed by one key at a time. To change keys, the producer writes a
+checkpoint signed by the current key with `next_key` naming the new one. Every later
+checkpoint MUST be signed by the key named in the most recent `next_key`, or, if
+there is none, by the key that signed the chain's first checkpoint. In a v0.2 record,
+a checkpoint signed by any other key MUST be reported as an error, with or without
+pinned keys. In a v0.1 record it MUST be reported as a warning.
+
+Verifiers MUST check that `next_key.key_id` matches `next_key.public_key`.
 
 ## 7. Provenance sources
 
@@ -258,3 +288,8 @@ permissions, redactable digests, and the hash chain with signed checkpoints.
 
 `spec_version` changes on any change to hashing, required fields or semantics.
 Verifiers MUST reject versions they don't implement.
+
+v0.2 adds P-256 signatures and key hand-overs (`next_key`). Hashing and every v0.1
+field are unchanged, so a v0.2 verifier verifies v0.1 files as they are. A chain MAY
+move from v0.1 to v0.2 part-way (a recorder upgraded on a running chain), and MUST NOT
+move back. A v0.1 record MUST NOT use P-256 or `next_key`.
