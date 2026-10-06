@@ -387,8 +387,12 @@ def test_unsigned_lines_from_memory(key, pub):
 @pytest.mark.skipif(not hasattr(__import__("socket"), "AF_UNIX") or __import__("os").name == "nt",
                     reason="Unix sockets")
 def test_the_service_on_a_unix_socket(tmp_path):
+    import tempfile
+
     init_signer(tmp_path / "s")
-    server = SignerService(tmp_path / "s").start(str(tmp_path / "signer.sock"))
+    # macOS limits socket paths to 104 bytes, and its temporary folders are long.
+    sock = tempfile.mkdtemp(prefix="mnq", dir="/tmp") + "/s.sock"
+    server = SignerService(tmp_path / "s").start(sock)
     try:
         client = SignerClient(server.address, (tmp_path / "s" / "signer.token").read_text().strip())
         rec = Recorder(MemorySink(), agent_id="a", signer=client, checkpoint_every=1)
