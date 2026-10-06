@@ -443,7 +443,7 @@ function derive(payload) {
   const runs = new Map();
   const totals = { llm: 0, tool: 0, egress: 0, flags: 0, failed: 0 };
   for (const r of records) {
-    if (r.kind !== "event" || !r.run_id) continue;
+    if (r.kind !== "event" || !r.run_id || r.event_type === "heartbeat") continue;  // liveness, not agent activity
     let run = runs.get(r.run_id);
     if (!run) {
       run = { id: r.run_id, parent: r.parent_run_id || null, agent: r.agent_id, operator: r.operator_id,

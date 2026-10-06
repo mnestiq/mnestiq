@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from importlib import resources
@@ -48,6 +49,7 @@ class Report:
     head_seq: int | None = None  # set when the chain matched a head checkpoint kept elsewhere
     signer_keys: list[str] = field(default_factory=list)
     rotations: list[dict] = field(default_factory=list)  # signed hand-overs: seq, from_key, to_key
+    quiet: list[dict] = field(default_factory=list)  # gaps longer than the heartbeat allows: from, to, seconds
     errors: list[Issue] = field(default_factory=list)
     warnings: list[Issue] = field(default_factory=list)
 
@@ -108,6 +110,7 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
     checkpoint_hashes: dict[int, str | None] = {}  # seq -> stored record_hash, for the head check
     last_seq: int | None = None
     last_wall: str | None = None
+    heartbeat_s: float | None = None  # set once the chain has heartbeats on
 
     for line_no, raw in enumerate(lines, start=1):
         if isinstance(raw, bytes):
@@ -186,7 +189,15 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
         if isinstance(wall, str):
             if last_wall is not None and wall < last_wall:
                 report.warn("clock", f"wall clock went backwards ({last_wall} -> {wall})", line_no, seq)
+            if last_wall is not None and heartbeat_s:
+                _check_quiet(last_wall, wall, heartbeat_s, report, line_no, seq)
             last_wall = wall
+        if rec.get("event_type") == "heartbeat":
+            if rec.get("spec_version") == "0.1":
+                report.error("spec_version", "heartbeat events need spec_version 0.2", line_no, seq)
+            interval = (rec.get("attributes") or {}).get("interval_s")
+            if isinstance(interval, (int, float)) and not isinstance(interval, bool) and interval > 0:
+                heartbeat_s = float(interval)
 
         if seq is not None:
             last_seq = seq
@@ -216,6 +227,19 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
     if head is not None:
         _check_head(head, report, checkpoint_hashes, last_seq)
     return report
+
+
+def _check_quiet(before: str, after: str, interval: float, report: Report, line_no: int, seq: int | None) -> None:
+    """With heartbeats every ``interval`` seconds, a longer silence means the recorder was not running."""
+    try:
+        fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
+        gap = (datetime.strptime(after, fmt) - datetime.strptime(before, fmt)).total_seconds()
+    except ValueError:
+        return
+    if gap > 2 * interval + 60:
+        report.quiet.append({"from": before, "to": after, "seconds": round(gap)})
+        report.warn("quiet", f"no records from {before} to {after} ({gap / 60:.0f} min) although heartbeats "
+                             f"were on every {interval:g}s: the recorder was not running", line_no, seq)
 
 
 def _check_head(head: Any, report: Report, checkpoint_hashes: dict[int, str | None], last_seq: int | None) -> None:

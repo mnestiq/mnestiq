@@ -140,6 +140,7 @@ The recorder runs inside your agent, so it is built to never be the thing that b
 | **Huge prompts or tool output** | Values over `max_content_bytes` (default 1 MiB) are stored as their hash only and listed in `x-omitted`; the chain still verifies. |
 | **Worker threads** | Threads don't inherit the active run. Wrap work with `run.bind(fn)`, e.g. `pool.submit(run.bind(fetch), url)`. |
 | **Signer down** (signing service or Key Vault) | Records are still written. The failure is counted and signing is tried again after `retry_after` seconds, covering everything since the last checkpoint. |
+| **Recorder stopped or killed** | `Recorder(..., checkpoint_interval=300)` writes and signs a `heartbeat` when nothing was signed for 5 minutes. A recorder that stopped then shows as a gap: `verify` warns about any silence longer than the heartbeats allow, and wherever checkpoints are sent (a `HeadFile`, the Evidence Vault) can alert while it is happening. |
 | **Timestamp authority down** | The checkpoint is still signed and written; only the RFC 3161 token is skipped, with a warning. |
 | **Power loss** | `FileSink(path, fsync=True)` forces each record to disk before the agent continues. |
 | **Someone deletes the end of the file** | `Recorder(..., on_checkpoint=HeadFile("/other/disk/agent.head.json"))` keeps the latest checkpoint in a second place; `mnestiq verify evidence.jsonl --head /other/disk/agent.head.json` then reports a file cut back to an earlier checkpoint. |

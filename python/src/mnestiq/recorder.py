@@ -116,6 +116,11 @@ class Recorder:
     is the same with a key held in this process. A remote signer is asked once per
     checkpoint, and if it fails the recorder carries on and tries again after
     ``retry_after`` seconds; records are never lost, only signed later.
+
+    ``checkpoint_interval`` (seconds) makes the recorder speak up when the agent is quiet:
+    if nothing was signed for that long, it writes a ``heartbeat`` event and signs it. A
+    stopped recorder then shows as a gap in the file (``verify`` warns) and as a chain that
+    went quiet wherever its checkpoints are sent.
     """
 
     def __init__(
@@ -135,9 +140,12 @@ class Recorder:
         max_content_bytes: int = 1_048_576,
         on_checkpoint: Callable[[dict], None] | None = None,
         retry_after: float = 30.0,
+        checkpoint_interval: float | None = None,
     ) -> None:
         if checkpoint_every < 1:
             raise ValueError("checkpoint_every must be >= 1")
+        if checkpoint_interval is not None and checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be > 0 seconds")
         if max_content_bytes < 0:
             raise ValueError("max_content_bytes must be >= 0")
         self.strict = strict
@@ -158,6 +166,9 @@ class Recorder:
         self._signer: Signer | None = as_signer(signing_key) if signing_key is not None else signer
         self._retry_after = retry_after
         self._next_try = 0.0
+        self._interval = checkpoint_interval
+        self._last_signed = time.monotonic()
+        self._stop = threading.Event()
         self._checkpoint_every = checkpoint_every
         self._timestamper = timestamper
         self._on_checkpoint = on_checkpoint
@@ -204,6 +215,40 @@ class Recorder:
                 "sandbox_id": self.sandbox_id,
                 "attributes": {"message": "recovered from an interrupted write", **recovered},
             })
+        if self._interval is not None:
+            threading.Thread(target=self._heartbeats, name="mnestiq-heartbeat", daemon=True).start()
+
+    def _heartbeats(self) -> None:
+        interval = float(self._interval or 0)
+        while not self._stop.wait(min(interval, max(1.0, interval - (time.monotonic() - self._last_signed)))):
+            if time.monotonic() - self._last_signed < interval:
+                continue
+            try:
+                self.heartbeat()
+            except Exception as exc:
+                self._record_failure(exc)
+
+    def heartbeat(self) -> dict | None:
+        """Write a ``heartbeat`` event and sign everything pending. Called on a timer with
+        ``checkpoint_interval``. Returns the checkpoint, or None without a signer."""
+        with self._lock:
+            if self._closed:
+                return None
+            self._last_signed = time.monotonic()  # also paces retries while a signer is down
+            self._append({
+                "event_type": "heartbeat", "run_id": f"recorder-{self.chain_id[:8]}", "agent_id": self.agent_id,
+                "sandbox_id": self.sandbox_id,
+                "attributes": {"interval_s": self._interval} if self._interval is not None else None,
+            })
+            if self._signer is None or time.monotonic() < self._next_try:
+                return None
+            try:
+                return self.checkpoint()
+            except Exception as exc:  # the beat is written; signing is tried again later
+                if self.strict:
+                    raise
+                self._record_failure(exc)
+                return None
 
     def _record_failure(self, exc: BaseException) -> None:
         self.failures += 1
@@ -334,6 +379,7 @@ class Recorder:
                 self._next_try = time.monotonic() + self._retry_after
             raise
         self._next_try = 0.0
+        self._last_signed = time.monotonic()
         record["signature"] = base64.b64encode(signature).decode("ascii")
         if self._timestamper is not None:
             try:
@@ -354,6 +400,7 @@ class Recorder:
 
     def close(self) -> None:
         """Write a final checkpoint and close the sink. Safe to call more than once."""
+        self._stop.set()
         with self._lock:
             if self._closed:
                 return

@@ -76,7 +76,7 @@ A *hash* is the string `sha256:` followed by 64 lowercase hex digits.
 
 | Field | Required | Meaning |
 |---|---|---|
-| `event_type` | yes | `run_start`, `run_end`, `llm_call`, `tool_call`, `approval`, `egress`, `note`. |
+| `event_type` | yes | `run_start`, `run_end`, `llm_call`, `tool_call`, `approval`, `egress`, `note`, `heartbeat` (section 6.8). |
 | `run_id` | yes | The run this event belongs to. |
 | `parent_run_id` | | The run that spawned this one (sub-agents, handoffs). |
 | `step_id` | | Position of the event within its run, from 0. |
@@ -241,6 +241,20 @@ pinned keys. In a v0.1 record it MUST be reported as a warning.
 
 Verifiers MUST check that `next_key.key_id` matches `next_key.public_key`.
 
+### 6.8 Heartbeats
+
+An agent that does nothing writes nothing, and so does a recorder that was stopped. To
+tell the two apart, a producer MAY write a `heartbeat` event whenever nothing has been
+signed for a set interval, followed by a checkpoint. Its `attributes.interval_s` gives
+the interval in seconds.
+
+Once a chain has a heartbeat with `interval_s`, verifiers MUST warn about any two
+consecutive records whose `ts.wall` values are more than `2 * interval_s + 60` seconds
+apart: the recorder was not running in between. This is a warning, not an error: the
+evidence is intact, but there is a period it says nothing about. The same checkpoints,
+sent to a second place as they are written, let that place raise the alarm while the
+silence is happening rather than afterwards.
+
 ## 7. Provenance sources
 
 | Source | Trusted? | Meaning |
@@ -289,7 +303,7 @@ permissions, redactable digests, and the hash chain with signed checkpoints.
 `spec_version` changes on any change to hashing, required fields or semantics.
 Verifiers MUST reject versions they don't implement.
 
-v0.2 adds P-256 signatures and key hand-overs (`next_key`). Hashing and every v0.1
+v0.2 adds P-256 signatures, key hand-overs (`next_key`) and `heartbeat` events. Hashing and every v0.1
 field are unchanged, so a v0.2 verifier verifies v0.1 files as they are. A chain MAY
 move from v0.1 to v0.2 part-way (a recorder upgraded on a running chain), and MUST NOT
-move back. A v0.1 record MUST NOT use P-256 or `next_key`.
+move back. A v0.1 record MUST NOT use P-256, `next_key` or `heartbeat`.

@@ -133,7 +133,7 @@
         "ts": true,
         "prev_hash": true,
         "record_hash": true,
-        "event_type": { "enum": ["run_start", "run_end", "llm_call", "tool_call", "approval", "egress", "note"] },
+        "event_type": { "enum": ["run_start", "run_end", "llm_call", "tool_call", "approval", "egress", "note", "heartbeat"] },
         "run_id": { "type": "string", "minLength": 1 },
         "parent_run_id": { "type": ["string", "null"] },
         "step_id": { "type": "integer", "minimum": 0 },

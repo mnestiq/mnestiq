@@ -190,6 +190,8 @@ def _summary(rec: dict) -> str:
         else:
             what = "TCP connect"
         return f"{what}  [{src} -> {dst}]" + (f"  ERROR {e.get('error')}" if e.get("error") else "")
+    if et == "heartbeat":
+        return "recorder alive"
     if et == "note":
         return str(rec.get("attributes", {}).get("message", ""))
     return ""

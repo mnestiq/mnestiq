@@ -18,6 +18,9 @@ Evidence format v0.2. Files written by 0.1 still verify unchanged.
 - Every signature from a signer is checked before it is written. If the signer is down, the
   agent carries on and signing is retried after `retry_after` seconds.
 - `mnestiq keygen --alg p256`; `verify` shows key hand-overs.
+- Heartbeats: `Recorder(checkpoint_interval=...)` writes and signs a `heartbeat` event when
+  nothing was signed for that long, so a stopped recorder is not mistaken for a quiet agent.
+  `verify` warns about silences longer than the heartbeats allow (`Report.quiet`).
 
 ## 0.1.1
 
