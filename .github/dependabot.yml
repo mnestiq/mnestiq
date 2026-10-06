@@ -1,0 +1,14 @@
+# Keeps the pinned actions and the dependencies up to date, a pull request at a time.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /python
+    schedule:
+      interval: weekly

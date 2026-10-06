@@ -35,6 +35,8 @@ Evidence format v0.2. Files written by 0.1 still verify unchanged.
 - A public threat model (`docs/threat-model.md`) with one test per attack
   (`tests/test_attacks.py`), and a break-it kit (`examples/break-it`): a signed, timestamped
   incident file to try to alter without `verify` noticing.
+- Releases carry a GitHub build-provenance attestation (`gh attestation verify`). Workflow
+  actions are pinned to commits, Dependabot proposes updates, and CI runs `pip-audit`.
 
 ## 0.1.1
 

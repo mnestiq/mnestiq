@@ -25,6 +25,19 @@ The known limits listed in [docs/threat-model.md](docs/threat-model.md) and `spe
 (sections 2 and 6.5) are documented behaviour, not vulnerabilities. The
 [break-it kit](examples/break-it/README.md) is a good place to start.
 
+## Check a release
+
+Releases are built by GitHub Actions from a tagged commit and published to PyPI with Trusted
+Publishing: no person holds a PyPI token, and a maintainer approves each publish.
+
+- **On PyPI**, each file shows its publish attestation: who published it, from which
+  repository and workflow.
+- **Build provenance:** download the wheel or source archive and run
+  `gh attestation verify mnestiq-<version>-py3-none-any.whl --repo mnestiq/mnestiq`. It checks
+  the file was built by this repository's release workflow, at the release's commit.
+- Every action in the workflows is pinned to a commit, and Dependabot proposes updates.
+  CI checks dependencies for known vulnerabilities (`pip-audit`).
+
 ## Supported versions
 
 Mnestiq is pre-1.0. Fixes are made on the latest release only.
