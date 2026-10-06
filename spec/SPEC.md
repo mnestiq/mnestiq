@@ -53,6 +53,12 @@ Integers MUST be within +/-(2^53-1). Values that may exceed this (nanosecond
 timestamps, 64-bit ids) MUST be encoded as strings. Floating-point NaN and
 Infinity MUST NOT appear.
 
+Readers MUST reject a line in which an object has the same key twice: parsers
+disagree on which value wins, so such a line could mean one thing to one verifier and
+another to the next. Readers MUST reject NaN and Infinity, and MUST read a number
+written without a fraction or exponent but beyond +/-(2^53-1) as an IEEE-754 double,
+because JCS writes large whole-number doubles that way (3e18 is `3000000000000000000`).
+
 Unknown top-level fields MUST be prefixed `x-`; verifiers MUST ignore them
 semantically (they are still covered by the record hash).
 

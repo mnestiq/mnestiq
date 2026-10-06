@@ -23,6 +23,7 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from ..canonical import parse_json
 from ..verify import verify_file
 
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -103,7 +104,7 @@ class EvidenceStore:
                     continue
                 total += 1
                 try:
-                    rec = json.loads(raw)
+                    rec = parse_json(raw)
                     if not isinstance(rec, dict):
                         raise ValueError
                 except ValueError:

@@ -22,6 +22,41 @@ class CanonicalizationError(ValueError):
     pass
 
 
+def parse_json(data: str | bytes) -> Any:
+    """Parse JSON as every verifier must: no duplicate keys, no NaN or Infinity.
+
+    Python's ``json.loads`` keeps the last of two equal keys, other parsers keep the first,
+    and it accepts ``NaN``. Either would let one evidence line mean two different things to
+    two verifiers, so both are refused.
+    """
+    return json.loads(data, object_pairs_hook=_no_duplicates, parse_constant=_no_constant, parse_int=_number)
+
+
+def _number(text: str) -> int | float:
+    """Integers past 2^53 read as doubles, as in JavaScript. JCS writes a large whole-number
+    double such as 3e18 as ``3000000000000000000``, which must read back as that double."""
+    value = int(text)
+    if abs(value) <= MAX_SAFE_INTEGER:
+        return value
+    as_float = float(text)
+    if math.isinf(as_float):
+        raise CanonicalizationError(f"number {text[:20]}... is too large for JSON")
+    return as_float
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        seen: set[str] = set()
+        dup = next(k for k, _ in pairs if k in seen or seen.add(k))  # type: ignore[func-returns-value]
+        raise CanonicalizationError(f"duplicate key {dup!r} in a JSON object")
+    return obj
+
+
+def _no_constant(name: str) -> Any:
+    raise CanonicalizationError(f"{name} is not valid JSON")
+
+
 def canonical_json(value: Any) -> bytes:
     """Return the RFC 8785 canonical UTF-8 encoding of ``value``."""
     parts: list[str] = []

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 from collections.abc import Iterator
 
-from .canonical import canonical_json
+from .canonical import canonical_json, parse_json
 
 
 class SinkError(Exception):
@@ -81,7 +81,7 @@ class FileSink:
             fh.seek(start)
             tail = fh.read()
             try:
-                json.loads(tail)
+                parse_json(tail)
                 complete = True
             except ValueError:
                 complete = False
@@ -122,7 +122,7 @@ class FileSink:
                 if not line.strip():
                     continue
                 try:
-                    yield json.loads(line)
+                    yield parse_json(line)
                 except ValueError as exc:
                     raise SinkError(f"{self.path} line {n} is not valid JSON ({exc}); "
                                     "the chain cannot be resumed. Verify the file and start a new one.") from exc

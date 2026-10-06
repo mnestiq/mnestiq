@@ -180,7 +180,7 @@ Next:
 2. Automatic run propagation into executors (today: `run.bind`); aiohttp; subprocess egress.
 3. OpenAI Agents SDK and LangGraph capture; streaming output capture.
 4. TypeScript SDK; MCP proxy.
-5. Spec test vectors; Merkle inclusion proofs for selective disclosure.
+5. Evidence test vectors for other implementations; Merkle inclusion proofs for selective disclosure.
 
 ## Development
 

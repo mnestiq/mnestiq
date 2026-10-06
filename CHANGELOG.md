@@ -26,6 +26,12 @@ Evidence format v0.2. Files written by 0.1 still verify unchanged.
   signature, the authority's signature, certificate chain and key usage) instead of skipping
   them, reports the proven time and warns when the agent's clock disagrees. `--tsa-root`
   trusts other authorities. Install with `pip install "mnestiq[timestamps]"`.
+- Evidence is read strictly: a line with a duplicate key, `NaN` or `Infinity` fails
+  verification, so no line can mean different things to different parsers. Large
+  whole-number doubles (JCS writes 3e18 as `3000000000000000000`) now verify; before, such a
+  record failed with a canonicalization error.
+- Canonical JSON is tested against the RFC 8785 test vectors and, with Node.js installed,
+  against the RFC's JavaScript reference on thousands of random values.
 
 ## 0.1.1
 

@@ -28,7 +28,7 @@ from multiprocessing.connection import Listener
 from pathlib import Path
 from typing import Any
 
-from .canonical import canonical_json
+from .canonical import canonical_json, parse_json
 from .keys import ED25519, generate_private_key, key_id, load_private_key, save_keypair
 from .signers import LocalSigner, SignerError, parse_address
 
@@ -82,7 +82,7 @@ class SignerService:
 
     def sign(self, payload: bytes) -> bytes:
         try:
-            cp = json.loads(payload)
+            cp = parse_json(payload)
         except ValueError:
             raise SignerError("the payload is not JSON") from None
         if not isinstance(cp, dict) or cp.get("kind") != "checkpoint":

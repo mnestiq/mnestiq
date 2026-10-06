@@ -16,7 +16,7 @@ from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
-from .canonical import CanonicalizationError, canonical_json
+from .canonical import CanonicalizationError, canonical_json, parse_json
 from .hashing import (
     GENESIS_HASH,
     digest_bytes,
@@ -128,8 +128,8 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
         if not raw.strip():
             continue
         try:
-            rec = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            rec = parse_json(raw)
+        except ValueError as exc:  # also duplicate keys and NaN (CanonicalizationError)
             report.error("parse", f"line is not valid JSON: {exc}", line_no)
             continue
         if not isinstance(rec, dict):

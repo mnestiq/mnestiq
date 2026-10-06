@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from .canonical import canonical_json
+from .canonical import canonical_json, parse_json
 from .hashing import redact
 from .keys import ED25519, SIG_ALGS, generate_private_key, key_id, load_public_key_b64, public_key_b64, save_keypair
 from .verify import verify_file
@@ -76,7 +76,7 @@ def _verify(args: argparse.Namespace) -> int:
     keys = [load_public_key_b64(k) for k in args.trusted_key]
     head = None
     if args.head:
-        head = json.loads(Path(args.head).read_text("utf-8"))
+        head = parse_json(Path(args.head).read_text("utf-8"))
         if not isinstance(head, dict):  # e.g. "null": must not quietly turn the check off
             raise ValueError(f"{args.head} does not hold a checkpoint record")
     roots = None
@@ -159,7 +159,7 @@ def _inspect(args: argparse.Namespace) -> int:
         for raw in fh:
             if not raw.strip():
                 continue
-            rec = json.loads(raw)
+            rec = parse_json(raw)
             if args.run and rec.get("run_id") != args.run:
                 continue
             ts = rec.get("ts", {}).get("wall", "?")
