@@ -7,6 +7,7 @@ build/
 *.key
 keys/
 *.jsonl
+!python/tests/data/*.jsonl
 evidence/
 
 .mypy_cache/
