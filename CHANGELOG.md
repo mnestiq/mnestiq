@@ -1,42 +1,90 @@
 # Changelog
 
-## Unreleased (0.2.0)
+## 0.2.0 (2026-10-07)
 
-Evidence format v0.2. Files written by 0.1 still verify unchanged.
+This release moves checkpoint signing out of the agent's process, adds independent
+timestamps and liveness signals, and introduces version 0.2 of the evidence format. Evidence
+written by 0.1.x continues to verify without changes.
 
-- Signing outside the agent. `Recorder(signer=...)` takes any signer:
-  - `SignerClient` and `mnestiq signer init` / `serve`: a signing service under its own
-    account. It signs only checkpoints for its own key, close to its own clock, and per
-    chain only forward, so someone in control of the agent cannot have history signed
-    again. It logs every signature.
-  - `AzureKeyVaultSigner`: the key stays in Azure Key Vault, only a SHA-256 is sent.
-    Install with `pip install "mnestiq[azure]"`.
-- P-256 signatures (`ecdsa-p256-sha256`) next to Ed25519, for key stores without Ed25519.
-  Only low-s signatures are valid, so each checkpoint has one valid signature per key.
-- Signed key hand-overs: `Recorder.rotate_signer` writes a checkpoint naming the next key.
-  A key change without one is now an error, pinned keys or not.
-- Every signature from a signer is checked before it is written. If the signer is down, the
-  agent carries on and signing is retried after `retry_after` seconds.
-- `mnestiq keygen --alg p256`; `verify` shows key hand-overs.
-- Heartbeats: `Recorder(checkpoint_interval=...)` writes and signs a `heartbeat` event when
-  nothing was signed for that long, so a stopped recorder is not mistaken for a quiet agent.
-  `verify` warns about silences longer than the heartbeats allow (`Report.quiet`).
-- RFC 3161 timestamps: `Timestamper()` gets a token from DigiCert, then Sectigo, for each
-  checkpoint and checks it before writing it. `verify` now checks every token (covers this
-  signature, the authority's signature, certificate chain and key usage) instead of skipping
-  them, reports the proven time and warns when the agent's clock disagrees. `--tsa-root`
-  trusts other authorities. Install with `pip install "mnestiq[timestamps]"`.
-- Evidence is read strictly: a line with a duplicate key, `NaN` or `Infinity` fails
-  verification, so no line can mean different things to different parsers. Large
-  whole-number doubles (JCS writes 3e18 as `3000000000000000000`) now verify; before, such a
-  record failed with a canonicalization error.
-- Canonical JSON is tested against the RFC 8785 test vectors and, with Node.js installed,
-  against the RFC's JavaScript reference on thousands of random values.
-- A public threat model (`docs/threat-model.md`) with one test per attack
-  (`tests/test_attacks.py`), and a break-it kit (`examples/break-it`): a signed, timestamped
-  incident file to try to alter without `verify` noticing.
-- Releases carry a GitHub build-provenance attestation (`gh attestation verify`). Workflow
-  actions are pinned to commits, Dependabot proposes updates, and CI runs `pip-audit`.
+### Highlights
+
+- **Signing outside the agent.** Signing keys can now be held where the agent cannot read
+  them: in Azure Key Vault, or in a dedicated signing service running under a separate
+  account. A compromised agent can no longer copy the key or have earlier history signed
+  again.
+- **Independent timestamps.** Checkpoints can carry RFC 3161 timestamps from public
+  timestamp authorities, and the verifier now validates them in full.
+- **Liveness.** Recorders can emit signed heartbeats, so a stopped recorder can be told apart
+  from an idle agent.
+- **Published threat model.** Each documented attack is backed by an automated test, and a
+  public challenge kit is provided for independent review.
+
+### Evidence format 0.2
+
+- Adds ECDSA P-256 signatures (`ecdsa-p256-sha256`) alongside Ed25519, for key stores that
+  do not support Ed25519. Only low-s signatures are accepted, so every checkpoint has exactly
+  one valid signature per key.
+- Adds signed key hand-overs (`next_key`). A change of signing key is accepted only when the
+  previous key authorised it. Any other key change is reported as an error, whether or not
+  keys are pinned.
+- Adds the `heartbeat` event type.
+- Readers must reject duplicate object keys, `NaN` and `Infinity`, and read large whole
+  numbers as IEEE-754 doubles, as RFC 8785 serialises them.
+- A chain may move from version 0.1 to 0.2 part-way through, but never back.
+
+### Added
+
+- `Recorder(signer=...)`, accepting any signer:
+  - `SignerClient`, with `mnestiq signer init` and `mnestiq signer serve`: a local signing
+    service. It signs only checkpoints for its own key, only near its own clock, and per
+    chain only in order. Every signature is written to an audit log.
+  - `AzureKeyVaultSigner`: keys held in Azure Key Vault or Managed HSM. Only the SHA-256
+    digest of each checkpoint leaves the machine. Requires `mnestiq[azure]`.
+  - `LocalSigner`, for keys held in process (development and testing).
+- `Recorder.rotate_signer()` for signed key rotation.
+- `Recorder(checkpoint_interval=...)` and `Recorder.heartbeat()`.
+- `Timestamper`, which requests RFC 3161 timestamps from DigiCert, with Sectigo as fallback,
+  and validates each token before it is written. Requires `mnestiq[timestamps]`.
+- `mnestiq keygen --alg p256` and `mnestiq verify --tsa-root`.
+- `Report.rotations`, `Report.timestamps` and `Report.quiet`.
+- Threat model (`docs/threat-model.md`), attack test suite (`tests/test_attacks.py`) and the
+  break-it challenge kit (`examples/break-it`).
+- Signing guide (`docs/signing.md`).
+
+### Changed
+
+- The verifier now validates RFC 3161 timestamp tokens (the message imprint, the authority's
+  signature, the certificate chain and the time-stamping key usage) instead of reporting them
+  as unchecked. It warns when the recorder's clock disagrees with the timestamp.
+- The verifier warns about gaps longer than the configured heartbeat interval allows.
+- Every signature returned by a signer is verified before it is written to evidence. If a
+  signer is unavailable, recording continues and signing is retried after `retry_after`
+  seconds.
+- A recorder that resumes an existing chain with a different key now refuses to start, rather
+  than producing evidence that would fail verification.
+- The dashboard uses colour only for untrusted input, findings and tampering.
+
+### Fixed
+
+- Records containing large whole-number floating-point values (for example `3e18`) failed
+  verification with a canonicalisation error.
+
+### Security and build
+
+- Canonical JSON is tested against the RFC 8785 test vectors and cross-checked against the
+  RFC's JavaScript reference implementation.
+- Releases carry a GitHub build provenance attestation, verifiable with
+  `gh attestation verify`.
+- All GitHub Actions are pinned to commit hashes, Dependabot is enabled, and CI audits
+  dependencies with `pip-audit`.
+
+### Upgrading
+
+- Existing code continues to work. `signing_key=` is still accepted and is equivalent to
+  `signer=LocalSigner(key)`.
+- Verifiers older than 0.2.0 reject version 0.2 records. Upgrade verifiers before recorders.
+- For production deployments, move signing keys to Azure Key Vault or the signing service.
+  See `docs/signing.md`.
 
 ## 0.1.1
 
