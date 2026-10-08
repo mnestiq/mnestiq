@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.1 (2026-10-08)
+
+### Fixed
+
+- With outside timestamps and egress capture both on, the recorder's own request to the
+  timestamp authority was captured as the agent's egress and written in the middle of a
+  checkpoint. The chain broke there, and a signing service then refused every later
+  checkpoint. The recorder's own signing and timestamp traffic is no longer captured, and any
+  event written while a checkpoint is made now follows it. Found with a real agent.
+- The signing service checks each connection's token on that connection's own thread, with a
+  5 second limit. Before, one connection that said nothing held up every client after it, and
+  the client waited for ever. The client's timeout now covers connecting too.
+- The signing service flushes its state to disk before using it, so a power cut cannot leave
+  it behind the signatures it gave.
+
 ## 0.2.0 (2026-10-07)
 
 This release moves checkpoint signing out of the agent's process, adds independent

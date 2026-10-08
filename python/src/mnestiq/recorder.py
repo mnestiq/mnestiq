@@ -173,6 +173,11 @@ class Recorder:
         self._timestamper = timestamper
         self._on_checkpoint = on_checkpoint
         self._lock = threading.RLock()
+        # While a checkpoint is being signed, an event written from the same thread (a hook seeing
+        # the signer's or the timestamp authority's traffic, say) would take the checkpoint's place
+        # in the chain. Such events wait here and are written right after the checkpoint.
+        self._checkpointing = False
+        self._deferred: list[dict] = []
         # Maps tool name -> provenance of its output, filled by @recorder.tool.
         self.tool_sources: dict[str, str] = {}
 
@@ -295,6 +300,9 @@ class Recorder:
     def _append(self, body: dict) -> dict:
         if self._closed:
             raise RecorderError("recorder is closed")
+        if self._checkpointing:
+            self._deferred.append(dict(body))
+            return dict(body)
         record = self._header("event")
         record.update({k: v for k, v in body.items() if v is not None})
         self._hash_and_cap(record)
@@ -323,7 +331,7 @@ class Recorder:
     def checkpoint(self) -> dict | None:
         """Sign everything since the last checkpoint. No-op without a signer or new records."""
         with self._lock:
-            if self._signer is None or not self._pending or self._closed:
+            if self._signer is None or not self._pending or self._closed or self._checkpointing:
                 return None
             return self._sign_checkpoint(self._signer, None)
 
@@ -353,6 +361,19 @@ class Recorder:
             return record
 
     def _sign_checkpoint(self, signer: Signer, next_key: dict | None, retry: bool = True) -> dict:
+        self._checkpointing = True
+        try:
+            return self._make_checkpoint(signer, next_key, retry)
+        finally:
+            self._checkpointing = False
+            deferred, self._deferred = self._deferred, []
+            for body in deferred:
+                self._append(body)
+
+    def _make_checkpoint(self, signer: Signer, next_key: dict | None, retry: bool) -> dict:
+        # The signer's and the timestamp authority's traffic is the recorder's own, not the agent's.
+        from .egress import suppress_egress
+
         record = self._header("checkpoint")
         record.update(
             {
@@ -367,7 +388,8 @@ class Recorder:
             record["next_key"] = next_key
         payload = signing_payload(record)
         try:
-            signature = signer.sign(payload)
+            with suppress_egress():
+                signature = signer.sign(payload)
             # A remote signer's answer is checked before it goes into the evidence.
             try:
                 verify_signature(signer.sig_alg, signer.public_key, signature, payload)
@@ -383,7 +405,9 @@ class Recorder:
         record["signature"] = base64.b64encode(signature).decode("ascii")
         if self._timestamper is not None:
             try:
-                record["timestamp_token"] = base64.b64encode(self._timestamper(signature)).decode("ascii")
+                with suppress_egress():
+                    token = self._timestamper(signature)
+                record["timestamp_token"] = base64.b64encode(token).decode("ascii")
             except Exception as exc:  # write the checkpoint without a token
                 _log.warning("mnestiq: timestamping failed, checkpoint written without a token: %r", exc)
         self._write(record)

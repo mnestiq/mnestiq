@@ -24,16 +24,18 @@ import secrets
 import subprocess
 import threading
 from datetime import datetime, timezone
-from multiprocessing.connection import Listener
+from multiprocessing import AuthenticationError
+from multiprocessing.connection import Listener, answer_challenge, deliver_challenge
 from pathlib import Path
 from typing import Any
 
 from .canonical import canonical_json, parse_json
 from .keys import ED25519, generate_private_key, key_id, load_private_key, save_keypair
-from .signers import LocalSigner, SignerError, parse_address
+from .signers import LocalSigner, SignerError, parse_address, read_timeout
 
 _log = logging.getLogger("mnestiq.signer")
 MAX_REQUEST = 1 << 20
+HANDSHAKE_SECONDS = 5.0  # a client that has not proven the token by then is cut off
 
 
 def init_signer(directory: str | Path, alg: str = ED25519) -> LocalSigner:
@@ -109,9 +111,7 @@ class SignerService:
                               "merkle_root": cp.get("merkle_root"), "key_id": self.key_id,
                               "signature": base64.b64encode(signature).decode("ascii")})
             self._state[chain] = {"seq": seq, "signed_at": _now()}
-            tmp = self._state_path.with_name("state.json.tmp")
-            tmp.write_text(json.dumps(self._state, sort_keys=True), "utf-8")
-            os.replace(tmp, self._state_path)
+            write_durably(self._state_path, json.dumps(self._state, sort_keys=True))
         return signature
 
     def _append_log(self, entry: dict[str, Any]) -> None:
@@ -132,7 +132,10 @@ class SignerServer:
         target = parse_address(address)
         if isinstance(target, str) and os.name == "nt":
             raise SignerError("on Windows the signer listens on 127.0.0.1:<port>")
-        self._listener = Listener(target, authkey=service.token)
+        # The token is checked on each connection's own thread, not in accept(), so a client that
+        # connects and says nothing cannot hold up everyone after it.
+        self._listener = Listener(target)
+        self._token = service.token
         bound = self._listener.address
         self.address = f"{bound[0]}:{bound[1]}" if isinstance(bound, tuple) else str(bound)
         self._closed = False
@@ -147,13 +150,18 @@ class SignerServer:
                 if self._closed:
                     return
                 continue
-            except Exception as exc:  # a client without the token fails the challenge
-                _log.warning("mnestiq signer: rejected a connection: %r", exc)
-                continue
             threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
 
     def _serve(self, conn: Any) -> None:
         with contextlib.closing(conn):
+            try:
+                read_timeout(conn, HANDSHAKE_SECONDS)
+                deliver_challenge(conn, self._token)
+                answer_challenge(conn, self._token)
+                read_timeout(conn, None)
+            except (AuthenticationError, OSError, EOFError) as exc:  # wrong token, or silent too long
+                _log.warning("mnestiq signer: rejected a connection: %r", exc)
+                return
             while True:
                 try:
                     raw = conn.recv_bytes(MAX_REQUEST)
@@ -174,6 +182,24 @@ class SignerServer:
 
     def wait(self) -> None:
         self._thread.join()
+
+
+def write_durably(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` so that a crash or power cut leaves the old or the new
+    content, never an empty or older file: write a copy, flush it to disk, swap it in, and on
+    POSIX flush the folder so the swap itself is kept."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    if os.name != "nt":
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def _parse_wall(wall: Any) -> datetime:

@@ -401,3 +401,60 @@ def test_the_service_on_a_unix_socket(tmp_path):
         assert verify_lines(canonical_json(r) for r in rec._sink.records).ok
     finally:
         server.close()
+
+
+def test_a_silent_connection_does_not_hold_up_the_service(service, monkeypatch):
+    import socket
+
+    import mnestiq.signer_service
+
+    monkeypatch.setattr(mnestiq.signer_service, "HANDSHAKE_SECONDS", 0.5)
+    host, port = service.server.address.split(":")
+    silent = socket.create_connection((host, int(port)))  # connects and never answers the challenge
+    try:
+        started = time.monotonic()
+        client = SignerClient(service.server.address, service.token, timeout=5)
+        assert client.public_key == service.pub
+        assert time.monotonic() - started < 2
+        client.close()
+        silent.settimeout(5)
+        silent.recv(1024)  # the challenge
+        assert silent.recv(1024) == b""  # then the service hangs up
+    finally:
+        silent.close()
+
+
+def test_the_client_gives_up_on_a_silent_signer():
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    try:
+        started = time.monotonic()
+        with pytest.raises(SignerError, match="not reachable"):
+            SignerClient(f"127.0.0.1:{listener.getsockname()[1]}", "0" * 64, timeout=0.5)
+        assert time.monotonic() - started < 5
+    finally:
+        listener.close()
+
+
+def test_the_service_state_reaches_the_disk_before_it_is_swapped_in(tmp_path, service, monkeypatch):
+    import os
+
+    import mnestiq.signer_service
+
+    steps = []
+    real_fsync, real_replace = os.fsync, os.replace
+    tmp = service.dir / "state.json.tmp"
+    monkeypatch.setattr(mnestiq.signer_service.os, "fsync",
+                        lambda fd: (steps.append("fsync new state" if tmp.exists() else "fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(mnestiq.signer_service.os, "replace",
+                        lambda a, b: (steps.append("replace"), real_replace(a, b))[1])
+    client = SignerClient(service.server.address, service.token)
+    rec = Recorder(FileSink(tmp_path / "e.jsonl"), agent_id="a", signer=client, checkpoint_every=1)
+    events(rec, 1)
+    rec.close()
+    client.close()
+    assert "replace" in steps and steps[steps.index("replace") - 1] == "fsync new state"
+    assert not tmp.exists()

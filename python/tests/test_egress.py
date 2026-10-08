@@ -221,3 +221,48 @@ def test_sandbox_id_env_override(monkeypatch):
     assert detect_sandbox_id() == "ecs:task/abc"
     monkeypatch.delenv("MNESTIQ_SANDBOX_ID")
     assert detect_sandbox_id().split(":", 1)[0] in ("host", "container", "k8s")
+
+
+def test_a_timestamp_authority_reached_during_a_checkpoint_does_not_break_the_chain(tcp_server):
+    """Found with a real agent: the recorder's own call to the timestamp authority was captured as the
+    agent's egress, written in the middle of the checkpoint, and took its place in the chain."""
+    from mnestiq.keys import generate_private_key
+
+    port, _ = tcp_server
+
+    def timestamper(signature):
+        socket.create_connection(("127.0.0.1", port), timeout=5).close()  # what a real TSA request does
+        raise OSError("no answer")  # the checkpoint is then written without a token
+
+    rec = Recorder(MemorySink(), agent_id="agent", sandbox_id="container:abc123", signing_key=generate_private_key(),
+                   timestamper=timestamper, checkpoint_every=2)
+    with rec.run() as run:
+        for i in range(5):
+            run.note(str(i))
+    rec.close()
+    assert_valid(rec)
+    assert egress_events(rec) == []  # the recorder's own traffic is not the agent's
+    assert sum(r["kind"] == "checkpoint" for r in rec._sink.records) >= 3
+
+
+def test_an_event_written_while_a_checkpoint_is_signed_comes_after_it():
+    """Whatever writes during a checkpoint (a hook, a logging handler), the chain stays whole."""
+    from mnestiq.keys import generate_private_key
+    from mnestiq.signers import LocalSigner
+
+    class Chatty(LocalSigner):
+        def sign(self, payload):
+            rec.append_event({"event_type": "note", "run_id": "r", "agent_id": "agent",
+                              "attributes": {"message": "written while signing"}})
+            return super().sign(payload)
+
+    rec = Recorder(MemorySink(), agent_id="agent", sandbox_id="container:abc123",
+                   signer=Chatty(generate_private_key()), checkpoint_every=3)
+    with rec.run() as run:
+        for i in range(7):
+            run.note(str(i))
+    rec.close()
+    assert_valid(rec)
+    kinds = [(r["kind"], (r.get("attributes") or {}).get("message")) for r in rec._sink.records]
+    first = kinds.index(("checkpoint", None))
+    assert kinds[first + 1] == ("event", "written while signing")

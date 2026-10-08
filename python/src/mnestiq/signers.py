@@ -15,6 +15,8 @@ import base64
 import hashlib
 import json
 import os
+import socket
+import struct
 import threading
 from typing import Any, Protocol, runtime_checkable
 
@@ -152,13 +154,12 @@ class SignerClient:
 
     def _call(self, request: dict) -> dict:
         from multiprocessing import AuthenticationError
-        from multiprocessing.connection import Client
 
         with self._lock:
             for attempt in (1, 2):  # one reconnect if the service restarted
                 try:
                     if self._conn is None:
-                        self._conn = Client(parse_address(self.address), authkey=self._token)
+                        self._conn = _connect(parse_address(self.address), self._token, self._timeout)
                     self._conn.send_bytes(json.dumps(request).encode("utf-8"))
                     if not self._conn.poll(self._timeout):
                         raise TimeoutError("the signer did not answer")
@@ -177,10 +178,41 @@ class SignerClient:
         return reply
 
 
+def _connect(address: Any, token: bytes, timeout: float) -> Any:
+    """Connect to the signer and prove the token both ways. A signer that stays silent is given up
+    on after ``timeout`` seconds, instead of holding the agent forever."""
+    from multiprocessing.connection import Client, answer_challenge, deliver_challenge
+
+    conn = Client(address)
+    try:
+        read_timeout(conn, timeout)
+        answer_challenge(conn, token)
+        deliver_challenge(conn, token)
+        read_timeout(conn, None)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def read_timeout(conn: Any, seconds: float | None) -> None:
+    """Make reads on a connection's socket fail with OSError after ``seconds`` without data.
+    None waits for ever."""
+    sock = socket.socket(fileno=conn.fileno())
+    try:
+        if os.name == "nt":  # a DWORD of milliseconds
+            value = struct.pack("=L", int((seconds or 0) * 1000))
+        else:  # a struct timeval
+            value = struct.pack("ll", int(seconds or 0), int(((seconds or 0) % 1) * 1_000_000))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, value)
+    finally:
+        sock.detach()  # the connection still owns the socket
+
+
 def parse_address(address: str) -> Any:
     """``host:port`` for TCP on this machine, or a filesystem path for a Unix socket."""
     host, sep, port = address.rpartition(":")
-    if sep and port.isdigit() and host and "/" not in address and "\\" not in address:
+    if sep and port.isdecimal() and host and "/" not in address and "\\" not in address:
         if host not in ("127.0.0.1", "localhost"):
             raise SignerError(f"the signer listens on this machine only (127.0.0.1), not on {host}")
         return (host, int(port))
