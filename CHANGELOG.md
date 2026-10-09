@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-10-10)
 
 Upgrading is recommended for everyone: this release includes security hardening across
 verification, signing and the local tools.
