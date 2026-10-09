@@ -27,10 +27,12 @@ from datetime import datetime, timezone
 from multiprocessing import AuthenticationError
 from multiprocessing.connection import Listener, answer_challenge, deliver_challenge
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from .canonical import canonical_json, parse_json
+from .hashing import digest_bytes
 from .keys import ED25519, generate_private_key, key_id, load_private_key, save_keypair
+from .merkle import merkle_root
 from .signers import LocalSigner, SignerError, parse_address, read_timeout
 
 _log = logging.getLogger("mnestiq.signer")
@@ -77,12 +79,15 @@ class SignerService:
             return {"error": f"unknown op {request.get('op')!r}"}
         try:
             payload = base64.b64decode(str(request.get("payload", "")), validate=True)
-            return {"signature": base64.b64encode(self.sign(payload)).decode("ascii")}
+            leaves = request.get("leaves")
+            if leaves is not None and not (isinstance(leaves, list) and all(isinstance(x, str) for x in leaves)):
+                raise SignerError("leaves is a list of record hashes")
+            return {"signature": base64.b64encode(self.sign(payload, leaves)).decode("ascii")}
         except (SignerError, ValueError) as exc:
             _log.warning("mnestiq signer: refused: %s", exc)
             return {"error": str(exc)}
 
-    def sign(self, payload: bytes) -> bytes:
+    def sign(self, payload: bytes, leaves: list[str] | None = None) -> bytes:
         try:
             cp = parse_json(payload)
         except ValueError:
@@ -95,23 +100,39 @@ class SignerService:
                 self.signer.sig_alg, self.signer.public_key, self.key_id):
             raise SignerError(f"the checkpoint names another key; this signer is {self.key_id}")
         chain, seq, covers = cp.get("chain_id"), cp.get("seq"), cp.get("covers")
-        if not isinstance(chain, str) or not isinstance(seq, int) or not isinstance(covers, dict):
+        if not isinstance(chain, str) or not _is_int(seq) or not isinstance(covers, dict):
             raise SignerError("the checkpoint has no chain_id, seq or covers")
+        first, last_covered = covers.get("from_seq"), covers.get("to_seq")
+        # A checkpoint covers the records just before it. The state below is this seq, so it must
+        # follow from the range, or a client could move the state back and have history signed again.
+        if not (_is_int(first) and _is_int(last_covered) and 0 <= first <= last_covered and seq == last_covered + 1):
+            raise SignerError(f"the checkpoint at seq {seq!r} does not cover the records just before it "
+                              f"({first!r}..{last_covered!r})")
         skew = abs((datetime.now(timezone.utc) - _parse_wall((cp.get("ts") or {}).get("wall"))).total_seconds())
         if skew > self.max_skew:
             raise SignerError(f"the checkpoint's time is {skew:.0f}s from this signer's clock "
                               f"(at most {self.max_skew:.0f}s)")
         with self._lock:
             last = self._state.get(chain)
-            if last is not None and covers.get("from_seq") != last["seq"] + 1:
-                raise SignerError(f"chain {chain} was signed up to seq {last['seq']}; this checkpoint covers "
-                                  f"from {covers.get('from_seq')} (only the next checkpoint is signed)")
+            # The same records asked for again, after an answer was lost on the way back: signing
+            # them again rewrites nothing, and refusing would stop the chain for good.
+            again = (last is not None and last["seq"] == seq and last.get("covers") == covers
+                     and last.get("merkle_root") == cp.get("merkle_root"))
+            moves_on = last is None or first == last["seq"] + 1
+            extends = (last is not None and not (moves_on or again)
+                       and _extends(last, covers, cp.get("merkle_root"), leaves))
+            if not (moves_on or again or extends):
+                signed_to = last["seq"] if last is not None else None
+                raise SignerError(f"chain {chain} was signed up to seq {signed_to}, and this checkpoint covers "
+                                  f"from {first} (only the next checkpoint is signed)")
             signature = self.signer.sign(payload)
             self._append_log({"signed_at": _now(), "chain_id": chain, "seq": seq, "covers": covers,
                               "merkle_root": cp.get("merkle_root"), "key_id": self.key_id,
                               "signature": base64.b64encode(signature).decode("ascii")})
-            self._state[chain] = {"seq": seq, "signed_at": _now()}
-            write_durably(self._state_path, json.dumps(self._state, sort_keys=True))
+            if not again:
+                self._state[chain] = {"seq": seq, "covers": covers, "merkle_root": cp.get("merkle_root"),
+                                      "signed_at": _now()}
+                write_durably(self._state_path, json.dumps(self._state, sort_keys=True))
         return signature
 
     def _append_log(self, entry: dict[str, Any]) -> None:
@@ -209,6 +230,35 @@ def _parse_wall(wall: Any) -> datetime:
         return datetime.strptime(wall, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
     except ValueError:
         raise SignerError(f"ts.wall {wall!r} is not RFC 3339 UTC") from None
+
+
+def _extends(last: dict[str, Any], covers: dict, root: Any, leaves: list[str] | None) -> bool:
+    """True if this checkpoint covers the records the last one signed, unchanged, and more after them.
+
+    That happens when a signed checkpoint never reached the file (the agent crashed, the disk was
+    full) and the agent wrote more records meanwhile: the last checkpoint's place is taken, so the
+    next one starts where it started. The record hashes prove the earlier records are the ones
+    signed: their Merkle root must be the root signed before. Nothing signed is rewritten.
+    """
+    old = last.get("covers")
+    if not leaves or not isinstance(old, dict) or not last.get("merkle_root"):
+        return False
+    start, end, old_end = covers.get("from_seq"), covers.get("to_seq"), old.get("to_seq")
+    if not (_is_int(start) and _is_int(end) and _is_int(old_end)) or start != old.get("from_seq") or end <= old_end:
+        return False
+    if len(leaves) != end - start + 1:
+        return False
+    try:
+        digests = [digest_bytes(h) for h in leaves]
+    except ValueError:
+        return False
+    old_n = old_end - start + 1
+    return ("sha256:" + merkle_root(digests).hex() == root
+            and "sha256:" + merkle_root(digests[:old_n]).hex() == last["merkle_root"])
+
+
+def _is_int(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _now() -> str:

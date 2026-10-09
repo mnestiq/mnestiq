@@ -13,7 +13,26 @@ permissions:
   contents: read
 
 jobs:
+  # The tests install many packages from PyPI and run their code: they get no signing rights.
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Test
+        run: |
+          python -m pip install -e ".[dev,anthropic,openai,azure,timestamps]" httpx requests
+          python -m pytest -q
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,10 +54,6 @@ jobs:
             echo "release tag ${GITHUB_REF_NAME} does not match package version v${version}"
             exit 1
           fi
-      - name: Test
-        run: |
-          python -m pip install -e ".[dev,anthropic,openai,azure,timestamps]" httpx requests
-          python -m pytest -q
       - name: Build
         run: |
           python -m pip install build twine

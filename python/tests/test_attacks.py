@@ -301,3 +301,15 @@ def test_the_break_it_readme_lists_the_real_checksums():
     readme = (kit / "README.md").read_text("utf-8")
     for name in ("recorder.pub", "head.json"):
         assert hashlib.sha256((kit / name).read_bytes()).hexdigest() in readme, name
+
+
+def test_a_key_with_the_same_key_id_is_not_trusted(tmp_path, monkeypatch, key, pub):
+    """key_id is 64 bits of a hash. Someone who finds another key with the pinned key's id (a large
+    but finite search) must still fail: trust is decided on the whole key."""
+    import mnestiq.verify
+
+    other = generate_private_key()
+    path = record_demo(tmp_path / "e.jsonl", other)
+    monkeypatch.setattr(mnestiq.verify, "key_id", lambda b64: "ed25519:0000000000000000")  # every key collides
+    report = verify_file(path, [pub])
+    assert not report.ok and "untrusted_key" in {e.code for e in report.errors}

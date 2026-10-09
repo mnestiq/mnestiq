@@ -29,6 +29,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         _Handler.seen.append({"path": self.path, "headers": dict(self.headers), "client": self.client_address})
+        if self.path == "/slow":  # reads the request, answers late: the client gives up first
+            import time
+            time.sleep(1.5)
+        if self.path == "/redirect-elsewhere":  # to the same server under another name
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{self.server.server_port}/ok")
+            self.end_headers()
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/ok")
@@ -266,3 +274,61 @@ def test_an_event_written_while_a_checkpoint_is_signed_comes_after_it():
     kinds = [(r["kind"], (r.get("attributes") or {}).get("message")) for r in rec._sink.records]
     first = kinds.index(("checkpoint", None))
     assert kinds[first + 1] == ("event", "written while signing")
+
+
+def test_a_request_cancelled_by_a_timeout_is_still_recorded(server, rec):
+    """The server already has the request when the agent's framework gives up on it. A cancelled
+    request used to leave no trace, so an attacker's slow server made an upload invisible."""
+    async def go():
+        async with httpx.AsyncClient() as client:
+            await asyncio.wait_for(client.get(f"{server}/slow"), 0.3)
+
+    with rec.run():
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(go())
+    (event,) = egress_events(rec)
+    assert "CancelledError" in event["egress"][0]["error"]
+    assert _Handler.seen and _Handler.seen[0]["path"] == "/slow"
+
+
+def test_a_cancelled_tool_is_still_recorded(rec):
+    @rec.tool()
+    async def upload(path):
+        await asyncio.sleep(5)
+
+    async def go():
+        await asyncio.wait_for(upload("export.csv"), 0.1)
+
+    with rec.run():
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(go())
+    (call,) = [r["tool_calls"][0] for r in rec._sink.records if r.get("event_type") == "tool_call"]
+    assert call["name"] == "upload" and "CancelledError" in call["error"]
+
+
+def test_a_run_id_a_header_cannot_carry_does_not_break_the_request(server, rec):
+    """A caller-chosen run id with a line break or non-Latin text made the agent's request fail."""
+    for run_id in ("ünïcode-run", "line\r\nbreak"):
+        _Handler.seen.clear()
+        with rec.run(run_id=run_id):
+            assert httpx.get(f"{server}/ok").status_code == 200
+        assert RUN_HEADER not in _Handler.seen[0]["headers"] and EGRESS_HEADER in _Handler.seen[0]["headers"]
+
+
+def test_a_failed_request_does_not_record_the_secret_in_its_error(rec):
+    with rec.run():
+        with pytest.raises(requests.RequestException):  # requests puts the whole URL in its error
+            requests.get("http://127.0.0.1:9/x?api_key=SECRET123&q=1", timeout=2)
+    (event,) = egress_events(rec)
+    assert "SECRET123" not in canonical_json(event).decode()
+
+
+def test_a_redirect_does_not_carry_the_headers_to_a_host_left_out(server, rec):
+    """requests copies the first request's headers onto the redirect: with stamp_hosts, the run's
+    identity used to reach the host it was meant to be kept from."""
+    instrument_egress(ignore_hosts=set(), stamp_hosts={"127.0.0.1"})
+    with rec.run():
+        assert requests.get(f"{server}/redirect-elsewhere", timeout=5).status_code == 200
+    first, second = _Handler.seen
+    assert RUN_HEADER in first["headers"]
+    assert RUN_HEADER not in second["headers"] and EGRESS_HEADER not in second["headers"]

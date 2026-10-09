@@ -15,3 +15,5 @@ evidence/
 .ruff_cache/
 real-run/
 live-runs/
+.coverage
+htmlcov/

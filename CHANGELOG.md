@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+Upgrading is recommended for everyone: this release includes security hardening across
+verification, signing and the local tools.
+
+### Security
+
+- Stronger checks on RFC 3161 timestamps, the signing service, and verification with a pinned key.
+- The recorder refuses to extend a chain whose earlier records no longer match.
+- The dashboard needs the key printed in its link, and evidence text can no longer drive the
+  terminal or the page's styling.
+- Less of what the agent handles reaches logs, error messages and request headers.
+- The release workflow runs the tests without access to signing or publishing.
+
+### Changes to note
+
+- `verify --trusted-key` reports a file with no signed checkpoints as INVALID (a pinned key that
+  signed nothing proves nothing). Without a pinned key it is still a warning.
+- `mnestiq dashboard` prints a link with a key, and answers only requests that carry it.
+
+### Detection
+
+- New finding `MNQ-005`, untrusted link in answer: the model's answer carries an image, or a
+  link with data in its query, to a host that appears in untrusted content and not in the
+  user's or system's words. An image is fetched as soon as the answer is shown, so this is how an
+  injected instruction can leak data with no tool call at all. In `mnestiq.findings` and in the
+  dashboard.
+- `MNQ-004` treats more actions as sensitive by name: cancel, suspend, deactivate, terminate,
+  close an account, change, modify, forward, share, invite and unsubscribe.
+- Domains and links in untrusted content are matched more precisely, and quickly on long text.
+
+### Recording
+
+- Recording never raises into the agent: unusual values (invalid Unicode, number subclasses,
+  objects that cannot be copied, cyclic data) are recorded as well as they can be, and any
+  failure is counted.
+- Requests and tools cancelled by a timeout are recorded, with the cancellation as the error.
+- Writes are unbuffered and flushed before the head file, so a failed or interrupted write cannot
+  break the chain later.
+- Processes that fork, tools defined as methods, and streams finished in another task are
+  handled.
+- OpenAI: more Responses API output types are recorded as tool output, and Chat Completions
+  custom tool calls are recorded.
+
+### Verification
+
+- `mnestiq.verify.ChainVerifier`: feed a chain's lines as they arrive and ask for the report at
+  any point. The result is exactly that of `verify_lines` over the same lines, so a collector
+  following a growing file checks only what is new.
+- `verify` reports malformed records instead of stopping, and an unreachable timestamp authority
+  no longer holds up checkpoints.
+
 ## 0.2.1 (2026-10-08)
 
 ### Fixed

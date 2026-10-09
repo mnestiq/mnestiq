@@ -206,3 +206,21 @@ def test_fuzz_matches_the_javascript_reference():
     mismatches = [(v, e, canonical_json(v).decode()) for v, e in zip(values, expected, strict=True)
                   if canonical_json(v).decode() != e]
     assert not mismatches, mismatches[:3]
+
+
+def test_number_subclasses_are_written_as_plain_numbers():
+    """IntEnum prints as Color.RED on Python 3.10, and numpy floats print as np.float64(0.5):
+    written through their own str or repr, the event was dropped or the JSON was invalid."""
+    import enum
+
+    class Color(enum.IntEnum):
+        RED = 1
+
+        def __str__(self):
+            return "Color.RED"
+
+    class Fancy(float):
+        def __repr__(self):
+            return f"Fancy({float(self)!r})"
+
+    assert canonical_json({"c": Color.RED, "f": Fancy(0.5), "g": Fancy(1e21)}) == b'{"c":1,"f":0.5,"g":1e+21}'

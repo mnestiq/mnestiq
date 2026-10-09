@@ -94,7 +94,8 @@ mnestiq dashboard evidence --trusted-key evidence/incident.pub
 mnestiq dashboard evidence/ --trusted-key keys/signing.pub
 ```
 
-A local investigation view at `http://127.0.0.1:8765`: runs and sub-runs, a step-by-step
+A local investigation view at the link it prints (`http://127.0.0.1:8765/?key=...`, whose key keeps
+other accounts on the machine out): runs and sub-runs, a step-by-step
 timeline with every piece of model context colored by provenance, findings (below), the
 verification status of every record (sealed, unsealed, or tampered), and a connection
 finder: paste an `ip:port` from a firewall or flow log and jump to the agent step that
@@ -105,11 +106,14 @@ opened it. It live-updates while agents write.
 | `MNQ-001` | untrusted argument | A tool call's arguments carry an email address, URL, account number or long number that appears in untrusted content and nowhere in the system prompt or the user's messages. |
 | `MNQ-002` | auto-approval | An action was approved without a human after untrusted content reached the model. |
 | `MNQ-003` | egress after taint | An outbound connection (not to loopback) followed untrusted content reaching the model. |
-| `MNQ-004` | untrusted sensitive action | A sensitive action (credentials, permissions, deletion, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words. Mark tools with `@recorder.tool(sensitive=True)`; unmarked tools are judged by name. |
+| `MNQ-004` | untrusted sensitive action | A sensitive action (credentials, permissions, deletion, cancellations, account changes, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words. Mark tools with `@recorder.tool(sensitive=True)`. Unmarked tools are judged by name. |
+| `MNQ-005` | untrusted link in answer | The model's answer carries an image, or a link with data in its query, to a host that appears in untrusted content and not in the user's or system's words. An image is fetched as soon as the answer is shown, so it can carry data out with no tool call. |
 
 `MNQ-001` is the signature of a hijack: an injected instruction has to put the attacker's
 address, account or URL into a tool call. `MNQ-004` covers hijacks with no destination, such as
-"change the password to ..." or "delete file 13". Findings describe what was observed, not a
+"change the password to ...", "delete file 13" or "cancel order 4100". `MNQ-005` covers leaks
+through the answer itself, such as an injected image link that carries the customer's email
+address. Findings describe what was observed, not a
 verdict: an agent that visits a link a colleague posted triggers `MNQ-001` too. The same
 rules are available in Python as `mnestiq.findings`.
 
@@ -144,7 +148,7 @@ The recorder runs inside your agent, so it is built to never be the thing that b
 | **Timestamp authority down** | The checkpoint is still signed and written; only the RFC 3161 token is skipped, with a warning. |
 | **Power loss** | `FileSink(path, fsync=True)` forces each record to disk before the agent continues. |
 | **Someone deletes the end of the file** | `Recorder(..., on_checkpoint=HeadFile("/other/disk/agent.head.json"))` keeps the latest checkpoint in a second place; `mnestiq verify evidence.jsonl --head /other/disk/agent.head.json` then reports a file cut back to an earlier checkpoint. |
-| **Sensitive content** | New evidence files are created owner-read/write only. Use `mnestiq redact` before sharing. |
+| **Sensitive content** | New evidence files are created owner-read/write only on Linux and macOS. On Windows a file takes its folder's access list, so keep evidence in a folder only the agent's account can read. Use `mnestiq redact` before sharing. |
 | **Large evidence in the dashboard** | The dashboard verifies the whole file but shows the most recent 20,000 records. |
 
 ## Repository layout

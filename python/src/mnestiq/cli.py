@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -14,6 +16,15 @@ from .keys import ED25519, SIG_ALGS, generate_private_key, key_id, load_public_k
 from .verify import verify_file
 
 EXIT_OK, EXIT_INVALID, EXIT_USAGE = 0, 1, 2
+
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _say(text: str) -> None:
+    """Print text that may come from an evidence file: control characters (terminal escapes that
+    could move the cursor and redraw INVALID as VALID) are shown as ? instead."""
+    print(_CONTROL.sub("?", text))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -89,23 +100,23 @@ def _verify(args: argparse.Namespace) -> int:
         print(json.dumps(report.to_dict(), indent=2))
         return EXIT_OK if report.ok else EXIT_INVALID
 
-    print(f"{'VALID' if report.ok else 'INVALID'}  {args.file}")
-    print(f"  chain     {report.chain_id}")
-    print(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
+    _say(f"{'VALID' if report.ok else 'INVALID'}  {args.file}")
+    _say(f"  chain     {report.chain_id}")
+    _say(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
     if report.signed_through_seq is not None:
-        print(f"  signed    through seq {report.signed_through_seq} by {', '.join(report.signer_keys)}")
+        _say(f"  signed    through seq {report.signed_through_seq} by {', '.join(report.signer_keys)}")
     if report.timestamps:
         last = report.timestamps[-1]
-        print(f"  time      {len(report.timestamps)} checkpoint(s) timestamped by an outside authority, "
+        _say(f"  time      {len(report.timestamps)} checkpoint(s) timestamped by an outside authority, "
               f"the latest (seq {last['seq']}) at {last['time']}")
     for rot in report.rotations:
-        print(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
+        _say(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
     if report.head_seq is not None:
-        print(f"  head      matches the checkpoint at seq {report.head_seq} kept elsewhere")
+        _say(f"  head      matches the checkpoint at seq {report.head_seq} kept elsewhere")
     for issue in report.errors:
-        print(f"  ERROR   {_where(issue)}{issue.code}: {issue.message}")
+        _say(f"  ERROR   {_where(issue)}{issue.code}: {issue.message}")
     for issue in report.warnings:
-        print(f"  warning {_where(issue)}{issue.code}: {issue.message}")
+        _say(f"  warning {_where(issue)}{issue.code}: {issue.message}")
     return EXIT_OK if report.ok else EXIT_INVALID
 
 
@@ -165,10 +176,10 @@ def _inspect(args: argparse.Namespace) -> int:
             ts = rec.get("ts", {}).get("wall", "?")
             if rec.get("kind") == "checkpoint":
                 c = rec.get("covers", {})
-                print(f"{ts}  #{rec['seq']:<5} ---- checkpoint seq {c.get('from_seq')}..{c.get('to_seq')} "
+                _say(f"{ts}  #{rec['seq']:<5} ---- checkpoint seq {c.get('from_seq')}..{c.get('to_seq')} "
                       f"signed by {rec.get('key_id')}")
                 continue
-            print(f"{ts}  #{rec['seq']:<5} {rec.get('run_id', '')[:8]}/{rec.get('step_id', '-'):<3} "
+            _say(f"{ts}  #{rec['seq']:<5} {rec.get('run_id', '')[:8]}/{rec.get('step_id', '-'):<3} "
                   f"{rec.get('event_type', '?'):<10} {_summary(rec)}")
     return EXIT_OK
 
@@ -223,11 +234,17 @@ def _redact(args: argparse.Namespace) -> int:
     if dst.exists():
         raise ValueError(f"{dst} already exists")
     count = 0
-    with open(src, "rb") as fin, open(dst, "wb") as fout:
-        for raw in fin:
-            if raw.strip():
-                fout.write(canonical_json(redact(json.loads(raw))) + b"\n")
-                count += 1
+    partial = dst.with_name(dst.name + ".partial")
+    try:
+        with open(src, "rb") as fin, open(partial, "wb") as fout:
+            for raw in fin:
+                if raw.strip():
+                    # parse_json keeps numbers exactly as the hashes saw them (json.loads would not)
+                    fout.write(canonical_json(redact(parse_json(raw))) + b"\n")
+                    count += 1
+        os.replace(partial, dst)
+    finally:  # a failure leaves no half-written file in the way of the next try
+        partial.unlink(missing_ok=True)
     print(f"wrote {count} redacted records to {dst}")
     return EXIT_OK
 

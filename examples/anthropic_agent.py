@@ -146,6 +146,8 @@ def main() -> None:
     @recorder.tool(source="web")
     def fetch_page(url: str) -> str:
         import urllib.request
+        if not url.startswith(("http://", "https://")):  # the model picks the URL: no file:// reads
+            raise ValueError("only http and https pages can be fetched")
         with urllib.request.urlopen(url, timeout=10) as resp:
             return resp.read().decode()
 

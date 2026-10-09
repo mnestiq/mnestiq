@@ -75,8 +75,10 @@ These are limits by design. We would rather you hear them from us.
    Mnestiq Workbench checks the agent's story against network, proxy, DNS and cloud logs the
    agent does not control, and flags traffic no recorded step explains.
 2. **Signatures while in control.** Someone in control of the agent can ask the signing service
-   or Key Vault for signatures on new checkpoints. They cannot get old ones signed again, or
-   take the key away, and every signature is logged by the service or by Key Vault.
+   or Key Vault for signatures on new checkpoints. They cannot take the key away, and every
+   signature is logged by the service or by Key Vault. The signing service also refuses to sign
+   old checkpoints again. Key Vault signs whatever the agent's identity sends, so there a
+   rewritten history shows only against a copy kept elsewhere: a head file or the vault.
 3. **A new chain with a made-up past.** Someone can start a fresh file and fill it with
    invented history. The signing service's log shows when each chain was first signed, the vault
    reports every new chain, and timestamps show the "past" was only signed today.
@@ -86,6 +88,11 @@ These are limits by design. We would rather you hear them from us.
 5. **Root on the vault server** can read the signer's key. Customers who copy anchors into their
    own write-once storage are still covered for everything anchored before.
 6. **Time between checkpoints** is the machine's own until the next timestamp.
+7. **Redaction hides content, not its shape.** A redacted value keeps its SHA-256 digest, so a
+   short or guessable value (a yes or no, a known email address) can be confirmed by hashing
+   guesses. Only prompts, documents and tool arguments and results can be redacted: URLs, error
+   messages and approval text stay. `verify` says how many fields were redacted, since the
+   detection rules cannot see them.
 
 ## Detection is not perfect
 
@@ -94,8 +101,12 @@ leads to an outbound action or a sensitive tool call) were measured on AgentDojo
 runs. Replaying 577 recorded hijacks, they flagged about 97%. Of 52 real hijacks of a local
 model, they caught 50. They also fire on about one in five clean runs,
 where an agent legitimately acts on data that came from outside, such as an email address in
-a customer's message. They miss attacks that need no outside destination, such as changing a
-password or persuading the user. Findings are leads for a person to triage, not verdicts.
+a customer's message. They miss attacks that need no outside destination and use only values
+the user gave, such as persuading the user. MNQ-005, added later, flags data leaked through an
+image or a link in the model's answer. It is checked against scripted attacks, not yet measured
+at scale. Content that a tool labels trusted (`internal`) is never treated as an injection, so a
+tool that returns text a customer can write, such as an order note, should label it
+`tool_output`. Findings are leads for a person to triage, not verdicts.
 
 ## Report a problem
 

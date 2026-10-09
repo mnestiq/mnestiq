@@ -48,7 +48,8 @@ EGRESS_HEADER = "X-Mnestiq-Egress-Id"
 DEFAULT_IGNORE_HOSTS = frozenset({"api.anthropic.com", "api.openai.com"})
 
 _SECRET_PARAM = re.compile(
-    r"(?i)(api[_-]?key|^key$|token|secret|passw|signature|^sig$|credential|auth|^code$|session)"
+    r"(?i)(api[_-]?key|^key$|token|secret|passw|signature|^sig$|credential|auth|^code$|session|jwt|bearer|"
+    r"private|cookie|^otp$)"
 )
 _IN_PROGRESS = {0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY, 10035}  # 10035: WSAEWOULDBLOCK
 
@@ -189,10 +190,21 @@ def _http_scope(method: str, url: str) -> Iterator[_HttpCtx | None]:
         _active_http.reset(token)
 
 
+_HEADER_SAFE = re.compile(r"[!-~]{1,200}")
+_URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_PARAM_IN_TEXT = re.compile(r"([?&]([\w.-]+)=)([^&\s'\"#)]+)")
+
+
 def _stamp(ctx: _HttpCtx, headers: Any) -> None:
     if ctx.stamped:
-        headers[RUN_HEADER] = ctx.run.run_id
+        # A run id the caller chose may hold characters a header cannot carry: sending it would
+        # make the agent's own request fail, so then only the egress id goes.
+        if _HEADER_SAFE.fullmatch(ctx.run.run_id):
+            headers[RUN_HEADER] = ctx.run.run_id
         headers[EGRESS_HEADER] = ctx.egress_id
+    else:  # a redirect copies the first request's headers: they must not reach a host left out
+        for name in (RUN_HEADER, EGRESS_HEADER):
+            headers.pop(name, None)
 
 
 def _addr(entry: dict, prefix: str, addr: tuple | None) -> None:
@@ -220,13 +232,20 @@ def _emit(run: Run, entry: dict, started: float, error: BaseException | None) ->
     public_ip = getattr(run.recorder, "public_ip", None)
     if public_ip:
         entry["public_ip"] = public_ip
-    message = f"{type(error).__name__}: {error}" if error else None
+    # Libraries put the full URL in their errors, query secrets included: mask it like the url field.
+    message = None
+    if error:
+        message = _URL_IN_TEXT.sub(lambda m: sanitize_url(m.group()), f"{type(error).__name__}: {error}")
+        message = _PARAM_IN_TEXT.sub(  # a path and query alone, as requests reports them
+            lambda m: m.group(1) + "***" if _SECRET_PARAM.search(m.group(2)) else m.group(), message)
     if message:
         entry["error"] = message
     with suppress_egress():
         try:
             run.egress(entry, latency_ms=int((time.perf_counter() - started) * 1000), error=message)
-        except Exception as exc:  # recording must not break the request
+        except Exception as exc:  # recording must not break the request, unless strict says it must
+            if run.recorder.strict:
+                raise
             warnings.warn(f"mnestiq: failed to record egress: {exc!r}", RuntimeWarning, stacklevel=2)
 
 
@@ -248,7 +267,7 @@ def _patch_httpx(module_name: str) -> None:
             _stamp(ctx, request.headers)
             try:
                 response = sync_orig(self, request)
-            except Exception as exc:
+            except BaseException as exc:  # a cancelled request may still have sent its data
                 _finish_http(ctx, error=exc)
                 raise
             _finish_http(ctx, status=response.status_code, conn=_httpx_addrs(response))
@@ -261,7 +280,7 @@ def _patch_httpx(module_name: str) -> None:
             _stamp(ctx, request.headers)
             try:
                 response = await async_orig(self, request)
-            except Exception as exc:
+            except BaseException as exc:  # a cancelled request may still have sent its data
                 _finish_http(ctx, error=exc)
                 raise
             _finish_http(ctx, status=response.status_code, conn=_httpx_addrs(response))
@@ -295,7 +314,7 @@ def _patch_requests() -> None:
             _stamp(ctx, request.headers)
             try:
                 response = original(self, request, *args, **kwargs)
-            except Exception as exc:
+            except BaseException as exc:  # a cancelled request may still have sent its data
                 _finish_http(ctx, error=exc)
                 raise
             # Addresses come from the socket hook (new connections only).

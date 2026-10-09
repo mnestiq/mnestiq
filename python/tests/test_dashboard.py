@@ -15,16 +15,22 @@ def dashboard(tmp_path, key, pub):
     bad = tmp_path / "nested" / "bad.jsonl"
     bad.parent.mkdir()
     bad.write_text(good.read_text("utf-8").replace("auto-approve-email", "human:bob"), "utf-8")
-    server = create_server(tmp_path, trusted_keys=[pub], port=0)
+    server = create_server(tmp_path, trusted_keys=[pub], port=0, key=KEY)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield server.server_address[1], good
     server.shutdown()
     server.server_close()
 
 
-def get(port, path, host=None, headers=None):
+KEY = "test-key"
+
+
+def get(port, path, host=None, headers=None, key=KEY):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    conn.request("GET", path, headers={"Host": host or f"127.0.0.1:{port}", **(headers or {})})
+    sent = {"Host": host or f"127.0.0.1:{port}", **(headers or {})}
+    if key is not None:
+        sent["X-Mnestiq-Key"] = key
+    conn.request("GET", path, headers=sent)
     res = conn.getresponse()
     body = res.read()
     conn.close()
@@ -102,3 +108,22 @@ def test_only_listed_files_are_readable(dashboard, name):
     port, _ = dashboard
     res, _ = get(port, f"/api/file?name={name}")
     assert res.status == 404
+
+
+def test_data_needs_the_key_from_the_printed_link(dashboard):
+    """Other accounts on the same machine can reach 127.0.0.1: without the key they get nothing."""
+    port, _ = dashboard
+    assert get(port, "/api/files", key=None)[0].status == 403
+    assert get(port, "/api/files", key="wrong")[0].status == 403
+    assert get(port, "/api/files")[0].status == 200
+    assert get(port, "/", key=None)[0].status == 200  # the page itself holds no evidence
+
+
+def test_a_line_nested_too_deep_does_not_break_the_dashboard(dashboard, tmp_path):
+    port, _ = dashboard
+    good = (tmp_path / "good.jsonl").read_bytes()
+    (tmp_path / "deep.jsonl").write_bytes(good + b"[" * 100000 + b"]" * 100000 + b"\n")
+    res, body = get(port, "/api/files")
+    assert res.status == 200
+    entry = next(f for f in json.loads(body)["files"] if f["name"].endswith("deep.jsonl"))
+    assert entry["ok"] is False

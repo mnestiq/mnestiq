@@ -142,8 +142,14 @@ class SignerClient:
             raise SignerError("set MNESTIQ_SIGNER_TOKEN to the signer's token")
         return cls(os.environ.get("MNESTIQ_SIGNER", "127.0.0.1:8741"), token.strip())
 
-    def sign(self, payload: bytes) -> bytes:
-        reply = self._call({"op": "sign", "payload": base64.b64encode(payload).decode("ascii")})
+    # The service can extend a checkpoint it signed that never reached the file, given the records' hashes.
+    can_extend = True
+
+    def sign(self, payload: bytes, leaves: list[str] | None = None) -> bytes:
+        request: dict[str, Any] = {"op": "sign", "payload": base64.b64encode(payload).decode("ascii")}
+        if leaves is not None:
+            request["leaves"] = leaves
+        reply = self._call(request)
         return base64.b64decode(reply["signature"])
 
     def close(self) -> None:

@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import warnings
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from collections.abc import Callable, Iterator
 
 from cryptography.exceptions import InvalidSignature
 
-from .canonical import canonical_json
+from .canonical import CanonicalizationError, canonical_json
 from .hashing import (
     GENESIS_HASH,
     REDACTABLE_FIELDS,
@@ -31,10 +32,10 @@ from .hashing import (
     value_digest,
 )
 from .identity import detect_sandbox_id
-from .jsonable import to_jsonable
+from .jsonable import to_jsonable, valid_texts
 from .keys import PrivateKey, key_id, verify_signature
 from .merkle import merkle_root
-from .signers import Signer, as_signer
+from .signers import Signer, SignerError, as_signer
 from .sinks import Sink
 from .verify import schema_problem
 
@@ -46,6 +47,7 @@ SOURCES = frozenset(
 )
 
 _MISSING = object()
+TIMESTAMP_RETRY_S = 300  # after a failed timestamp, checkpoints skip it this long
 _current_run: contextvars.ContextVar[Run | None] = contextvars.ContextVar("mnestiq_run", default=None)
 
 
@@ -171,6 +173,7 @@ class Recorder:
         self._stop = threading.Event()
         self._checkpoint_every = checkpoint_every
         self._timestamper = timestamper
+        self._timestamp_next_try = 0.0
         self._on_checkpoint = on_checkpoint
         self._lock = threading.RLock()
         # While a checkpoint is being signed, an event written from the same thread (a hook seeing
@@ -187,12 +190,19 @@ class Recorder:
         for rec in sink.existing():
             if not isinstance(rec, dict) or not {"chain_id", "seq", "record_hash"} <= rec.keys():
                 raise RecorderError("the sink already holds data that is not Mnestiq evidence, use a new file")
-            last = rec
-            if rec.get("kind") == "checkpoint":
+            if rec.get("kind") != "checkpoint":
+                # The next checkpoint signs the records after the last one: it must not vouch for a
+                # record someone changed while the agent was down.
+                expected_prev = last["record_hash"] if last else GENESIS_HASH
+                if rec.get("prev_hash") != expected_prev or _hash_or_none(rec) != rec["record_hash"]:
+                    raise RecorderError(f"record {rec.get('seq')} does not match its "
+                                        "hash chain, so it was changed after it was written. It will not be signed: "
+                                        "keep this file as evidence and start a new one")
+                pending.append(rec["record_hash"])
+            else:
                 pending = []
                 chain_key = (rec.get("next_key") or {}).get("key_id") or rec.get("key_id")
-            else:
-                pending.append(rec["record_hash"])
+            last = rec
         if chain_key and self._signer is not None and key_id(self._signer.public_key) != chain_key:
             raise RecorderError(
                 f"this evidence file is signed by {chain_key}, not by the configured key "
@@ -221,7 +231,32 @@ class Recorder:
                 "attributes": {"message": "recovered from an interrupted write", **recovered},
             })
         if self._interval is not None:
+            # A first beat now: it puts the interval in the evidence, so a recorder stopped before
+            # its first quiet spell still shows as a silence.
+            try:
+                self.heartbeat()
+            except Exception as exc:
+                if strict:
+                    raise
+                self._record_failure(exc)
             threading.Thread(target=self._heartbeats, name="mnestiq-heartbeat", daemon=True).start()
+        # A forked child shares this file and this chain's position: if it wrote too, the chain
+        # would break. It records nothing until it makes its own Recorder.
+        if hasattr(os, "register_at_fork"):
+            me = weakref.ref(self)
+
+            def in_child() -> None:
+                recorder = me()
+                if recorder is not None:
+                    recorder._forked()
+
+            os.register_at_fork(after_in_child=in_child)
+
+    def _forked(self) -> None:
+        self._closed = True
+        self._stop.set()
+        warnings.warn("mnestiq: this process was forked; the parent's Recorder records nothing here. "
+                      "Make a new Recorder with its own file in the child.", RuntimeWarning, stacklevel=1)
 
     def _heartbeats(self) -> None:
         interval = float(self._interval or 0)
@@ -265,7 +300,7 @@ class Recorder:
 
     def _write(self, record: dict) -> dict:
         record["record_hash"] = record_hash(record)
-        problem = schema_problem(record)
+        problem = schema_problem(record, show_value=False)  # the failure is logged: never the agent's data
         if problem:
             raise RecorderError(f"record would not pass verification, not written: {problem}")
         self._sink.append(record)
@@ -389,7 +424,15 @@ class Recorder:
         payload = signing_payload(record)
         try:
             with suppress_egress():
-                signature = signer.sign(payload)
+                try:
+                    signature = signer.sign(payload)
+                except SignerError as exc:
+                    # A checkpoint the service signed never reached the file: show it the records,
+                    # so it can see the ones it signed are unchanged and sign them with the new ones.
+                    if not (getattr(signer, "can_extend", False) and "was signed up to" in str(exc)):
+                        raise
+                    extending: Any = signer  # SignerClient takes the records' hashes too
+                    signature = extending.sign(payload, leaves=list(self._pending))
             # A remote signer's answer is checked before it goes into the evidence.
             try:
                 verify_signature(signer.sig_alg, signer.public_key, signature, payload)
@@ -403,18 +446,24 @@ class Recorder:
         self._next_try = 0.0
         self._last_signed = time.monotonic()
         record["signature"] = base64.b64encode(signature).decode("ascii")
-        if self._timestamper is not None:
+        if self._timestamper is not None and time.monotonic() >= self._timestamp_next_try:
             try:
                 with suppress_egress():
                     token = self._timestamper(signature)
                 record["timestamp_token"] = base64.b64encode(token).decode("ascii")
             except Exception as exc:  # write the checkpoint without a token
-                _log.warning("mnestiq: timestamping failed, checkpoint written without a token: %r", exc)
+                # Every checkpoint waits for the authorities: after a failure, leave them alone a while.
+                self._timestamp_next_try = time.monotonic() + TIMESTAMP_RETRY_S
+                _log.warning("mnestiq: timestamping failed, checkpoint written without a token (next try in "
+                             "%d s): %r", TIMESTAMP_RETRY_S, exc)
         self._write(record)
         self._pending = []
         self._pending_from = self._seq
         if self._on_checkpoint is not None:  # e.g. HeadFile: a copy of the head kept elsewhere
             try:
+                sync = getattr(self._sink, "sync", None)
+                if sync is not None:  # after a power cut the head must not be ahead of the file
+                    sync()
                 self._on_checkpoint(dict(record))
             except Exception as exc:
                 if self.strict:
@@ -436,7 +485,12 @@ class Recorder:
                 self._record_failure(exc)
             finally:
                 self._closed = True
-                self._sink.close()
+                try:
+                    self._sink.close()
+                except Exception as exc:  # e.g. the disk is still full: the agent goes on
+                    if self.strict:
+                        raise
+                    self._record_failure(exc)
 
     def __enter__(self) -> Recorder:
         return self
@@ -474,7 +528,7 @@ class Recorder:
         else:
             run.emit("run_end", status="ok")
         finally:
-            _current_run.reset(token)
+            _restore_run(token, parent)
 
     @contextmanager
     def ensure_run(self) -> Iterator[Run]:
@@ -505,11 +559,19 @@ class Recorder:
             self.tool_sources[tool_name] = source
             sig = inspect.signature(fn)
 
+            params = list(sig.parameters)
+            # On a method, self (or cls) is the object, with whatever it holds (clients, keys):
+            # not an argument the model chose.
+            bound_to = params[0] if params and params[0] in ("self", "cls") else None
+
             def arguments(args: tuple, kwargs: dict) -> dict:
                 try:
-                    return dict(sig.bind(*args, **kwargs).arguments)
+                    found = dict(sig.bind(*args, **kwargs).arguments)
                 except TypeError:
-                    return {"args": list(args), "kwargs": kwargs}
+                    return {"args": list(args[1:] if bound_to else args), "kwargs": kwargs}
+                if bound_to:
+                    found.pop(bound_to, None)
+                return found
 
             if inspect.iscoroutinefunction(fn):
 
@@ -519,7 +581,7 @@ class Recorder:
                         start = time.perf_counter()
                         try:
                             result = await fn(*args, **kwargs)
-                        except Exception as exc:
+                        except BaseException as exc:  # cancelled too: the tool may have acted already
                             run.tool_call(tool_name, arguments(args, kwargs), error=f"{type(exc).__name__}: {exc}",
                                           result_source=source, latency_ms=_ms_since(start), attributes=marks)
                             raise
@@ -535,7 +597,7 @@ class Recorder:
                     start = time.perf_counter()
                     try:
                         result = fn(*args, **kwargs)
-                    except Exception as exc:
+                    except BaseException as exc:  # cancelled too: the tool may have acted already
                         run.tool_call(tool_name, arguments(args, kwargs), error=f"{type(exc).__name__}: {exc}",
                                       result_source=source, latency_ms=_ms_since(start), attributes=marks)
                         raise
@@ -550,6 +612,38 @@ class Recorder:
 
 def _ms_since(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
+
+
+def _restore_run(token: contextvars.Token, previous: Run | None) -> None:
+    """Put back the run that was active before. A stream may be finished in another task than the one
+    that opened it (a web framework streaming the answer), where the token cannot be used: there,
+    setting the previous run back does the same, and the agent never sees an error."""
+    try:
+        _current_run.reset(token)
+    except ValueError:
+        _current_run.set(previous)
+
+
+def _hash_or_none(record: dict) -> str | None:
+    try:
+        return record_hash(record)
+    except Exception:
+        return None
+
+
+def _fail_open(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Recording an event never raises into the agent (unless strict): turning the agent's own
+    objects into JSON happens before ``emit``, so it is guarded here as well."""
+    @functools.wraps(method)
+    def guarded(self: Run, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            if self.recorder.strict:
+                raise
+            self.recorder._record_failure(exc)
+            return None
+    return guarded
 
 
 class Run:
@@ -599,13 +693,17 @@ class Run:
         }
         body.update(fields)
         try:
-            return self.recorder.append_event(body)
+            try:
+                return self.recorder.append_event(body)
+            except CanonicalizationError:  # text that is not valid Unicode: keep the event, mend the text
+                return self.recorder.append_event(valid_texts(body))
         except Exception as exc:
             if self.recorder.strict:
                 raise
             self.recorder._record_failure(exc)
             return None
 
+    @_fail_open
     def llm_call(
         self,
         *,
@@ -647,6 +745,7 @@ class Run:
             attributes=attributes,
         )
 
+    @_fail_open
     def tool_call(
         self,
         name: str,
@@ -671,6 +770,7 @@ class Run:
             attributes=attributes,
         )
 
+    @_fail_open
     def approval(self, action: str, decision: str, approver: str, *,
                  approver_type: str = "human", reason: str | None = None) -> dict | None:
         entry = {"action": action, "decision": decision, "approver": approver, "approver_type": approver_type}
@@ -678,6 +778,7 @@ class Run:
             entry["reason"] = reason
         return self.emit("approval", approvals=[entry])
 
+    @_fail_open
     def egress(self, entry: dict, *, latency_ms: int | None = None, error: str | None = None) -> dict | None:
         """Record one outbound request or connection. Usually called by mnestiq.egress."""
         return self.emit(
@@ -688,6 +789,7 @@ class Run:
             error=error,
         )
 
+    @_fail_open
     def note(self, message: str, **attributes: Any) -> dict | None:
         return self.emit("note", attributes=to_jsonable({"message": message, **attributes}))
 

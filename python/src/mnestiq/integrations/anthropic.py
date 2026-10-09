@@ -17,7 +17,7 @@ from typing import Any
 
 from ..jsonable import get, is_not_given, to_jsonable
 from ..recorder import Recorder, Run, Segment
-from ._common import is_async_client, is_stream, sampling_params, wrap_create
+from ._common import _as_list, follow_copies, is_stream, sampling_params, wrap_method
 
 
 def instrument_anthropic(client: Any, recorder: Recorder, *, tool_sources: dict[str, str] | None = None) -> Any:
@@ -54,16 +54,24 @@ def instrument_anthropic(client: Any, recorder: Recorder, *, tool_sources: dict[
                                                             "cache_creation_input_tokens")},
         )
 
-    original = client.messages.create
-    client.messages.create = wrap_create(recorder, original, record, is_async=is_async_client(client, original))
+    # The beta namespace and the parse() helper send their own requests: each is recorded too.
+    for messages in (client.messages, getattr(getattr(client, "beta", None), "messages", None)):
+        if messages is None:
+            continue
+        for name in ("create", "parse"):
+            wrap_method(messages, name, recorder, record, client)
+        # messages.stream() sends its request without going through messages.create.
+        original_stream = getattr(messages, "stream", None)
+        if original_stream is not None and not getattr(original_stream, "_mnestiq_recorded", False):
+            def stream(*args: Any, _original: Any = original_stream, **kwargs: Any) -> _RecordedStream:
+                if "messages" in kwargs:
+                    kwargs["messages"] = _as_list(kwargs["messages"])
+                seen = {**kwargs, "messages": list(kwargs.get("messages") or [])}  # as sent, not as at the end
+                return _RecordedStream(_original(*args, **kwargs), recorder, seen, record)
 
-    # messages.stream() sends its request without going through messages.create.
-    original_stream = getattr(client.messages, "stream", None)
-    if original_stream is not None:
-        def stream(*args: Any, **kwargs: Any) -> _RecordedStream:
-            return _RecordedStream(original_stream(*args, **kwargs), recorder, kwargs, record)
-
-        client.messages.stream = stream
+            stream._mnestiq_recorded = True  # type: ignore[attr-defined]
+            messages.stream = stream
+    follow_copies(client, lambda c: instrument_anthropic(c, recorder, tool_sources=tool_sources))
     return client
 
 
@@ -153,6 +161,12 @@ def context_segments(system: Any, messages: list, sources: dict[str, str]) -> li
             if btype == "tool_result":
                 name = tool_names.get(block.get("tool_use_id"))
                 segments.append(Segment(source=sources.get(name or "", "tool_output"), role=role, name=name,
+                                        content=block))
+            elif isinstance(btype, str) and btype.endswith("_tool_result"):
+                # A server tool's result (web search, web fetch, code execution, MCP): content from
+                # outside, carried in the assistant turn but never the model's own words.
+                source = "web" if btype.startswith("web_") else "tool_output"
+                segments.append(Segment(source=source, role=role, name=btype.removesuffix("_tool_result"),
                                         content=block))
             elif role == "assistant":
                 segments.append(Segment(source="model", role=role, content=block))

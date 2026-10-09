@@ -19,6 +19,7 @@ parsing and handed to the verifier separately. Install with ``pip install mnesti
 from __future__ import annotations
 
 import logging
+import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Sequence
 from datetime import datetime
@@ -26,6 +27,7 @@ from importlib import resources
 from typing import Any
 
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 
 _log = logging.getLogger("mnestiq")
 
@@ -67,8 +69,9 @@ class Timestamper:
 
     def __call__(self, signature: bytes) -> bytes:
         rfc = _rfc3161()
-        request = rfc.TimestampRequestBuilder().data(signature).nonce(nonce=True).cert_request(
-            cert_request=True).build()
+        # SHA-256, as the spec says (the library would pick SHA-512).
+        request = rfc.TimestampRequestBuilder().data(signature).hash_algorithm(rfc.HashAlgorithm.SHA256).nonce(
+            nonce=True).cert_request(cert_request=True).build()
         problems = []
         for url in self.urls:
             try:
@@ -78,8 +81,9 @@ class Timestamper:
                 verify_token(token, signature, self.roots, nonce=request.nonce)
                 return token
             except Exception as exc:
-                problems.append(f"{url}: {exc}")
-                _log.info("mnestiq: timestamp from %s failed: %r", url, exc)
+                shown = _without_credentials(url)  # this goes to logs and into error messages
+                problems.append(f"{shown}: {exc}")
+                _log.info("mnestiq: timestamp from %s failed: %r", shown, exc)
         raise TimestampError("no timestamp authority answered: " + "; ".join(problems))
 
     def _post(self, url: str, body: bytes) -> bytes:
@@ -110,10 +114,10 @@ def verify_token(token: bytes, signature: bytes, roots: Iterable[x509.Certificat
                      and c.serial_number == infos[0].serial_number), None)
         if leaf is None:
             raise TimestampError("the token does not include the TSA's certificate")
-        # A TSA may also send its root cross-signed by an older root. Leave such copies out, so
-        # the chain can only end at the trusted root itself.
-        root_keys = {_spki(r) for r in roots}
-        intermediates = [c for c in certs if c != leaf and _spki(c) not in root_keys]
+        # The certificates come from the token, which anyone can edit. The library treats every
+        # certificate it is given as trusted, so it only gets the path checked here: from the
+        # TSA's certificate up to one of ``roots``.
+        intermediates = _chain_to_root(leaf, [c for c in certs if c != leaf], roots, response.tst_info.gen_time)
         builder = rfc.VerifierBuilder(tsa_certificate=leaf, roots=roots, intermediates=intermediates, nonce=nonce)
         builder.build().verify_message(response, signature)
     except TimestampError:
@@ -122,6 +126,53 @@ def verify_token(token: bytes, signature: bytes, roots: Iterable[x509.Certificat
         raise TimestampError(str(exc) or type(exc).__name__) from None
     gen_time: datetime = response.tst_info.gen_time
     return gen_time
+
+
+MAX_CHAIN = 4
+
+
+def _chain_to_root(leaf: x509.Certificate, candidates: list[x509.Certificate],
+                   roots: list[x509.Certificate], at: datetime) -> list[x509.Certificate]:
+    """The intermediates linking ``leaf`` to one of ``roots``, each signed by the next and valid
+    at ``at``. Raises if there is no such path: a certificate the token brings cannot end it."""
+    root_keys = {_spki(r) for r in roots}
+    path: list[x509.Certificate] = []
+    current = leaf
+    for _ in range(MAX_CHAIN + 1):
+        _valid_at(current, at)
+        if any(_issued_by(current, r) for r in roots):
+            return path
+        if _spki(current) in root_keys or current.issuer == current.subject:
+            break  # a copy of a root signed by something else, or a self-signed certificate
+        issuer = next((c for c in candidates if c not in path and c != current and _is_ca(c)
+                       and _issued_by(current, c)), None)
+        if issuer is None:
+            break
+        path.append(issuer)
+        current = issuer
+    raise TimestampError("the TSA's certificate does not chain to a trusted root")
+
+
+def _issued_by(cert: x509.Certificate, issuer: x509.Certificate) -> bool:
+    if cert.issuer != issuer.subject:
+        return False
+    try:
+        cert.verify_directly_issued_by(issuer)
+    except (ValueError, TypeError, InvalidSignature):
+        return False
+    return True
+
+
+def _is_ca(cert: x509.Certificate) -> bool:
+    try:
+        return bool(cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca)
+    except x509.ExtensionNotFound:
+        return False
+
+
+def _valid_at(cert: x509.Certificate, at: datetime) -> None:
+    if not cert.not_valid_before_utc <= at <= cert.not_valid_after_utc:
+        raise TimestampError(f"certificate {cert.subject.rfc4514_string()} was not valid at {at:%Y-%m-%d %H:%M:%S}Z")
 
 
 def _spki(cert: x509.Certificate) -> bytes:
@@ -205,3 +256,11 @@ def _der(tag: int, content: bytes) -> bytes:
         return bytes([tag, n]) + content
     size = n.to_bytes((n.bit_length() + 7) // 8, "big")
     return bytes([tag, 0x80 | len(size)]) + size + content
+
+
+def _without_credentials(url: str) -> str:
+    """The URL without a user:password@ part, for logs."""
+    parts = urllib.parse.urlsplit(url)
+    if "@" not in parts.netloc:
+        return url
+    return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))

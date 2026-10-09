@@ -6,16 +6,21 @@ Serves a single-page dashboard on 127.0.0.1 that reads evidence files from disk,
 verifies them with the same verifier as the CLI, and live-updates as agents write.
 
 Containment: binds to loopback only, rejects non-local Host headers (DNS
-rebinding), and sends a Content-Security-Policy that forbids the page from
-loading or contacting anything except this server.
+rebinding), answers data requests only with the random key in the link it prints
+(other accounts on the same machine can reach 127.0.0.1 too), and sends a
+Content-Security-Policy that forbids the page from loading or contacting anything
+except this server.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
+import secrets
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,13 +29,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from ..canonical import parse_json
-from ..verify import verify_file
+from ..verify import verify_lines
 
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 MAX_RECORDS = 20_000   # sent to the browser per file, verification still reads everything
 MAX_ERRORS = 1_000
+MAX_CACHED = 32        # files whose prepared answer is kept in memory
+KEY_HEADER = "X-Mnestiq-Key"
 
 
 @dataclass
@@ -49,7 +56,7 @@ class EvidenceStore:
         self.trusted_keys = trusted_keys
         self.max_records = max_records
         self._sniffed: dict[Path, tuple[int, bool]] = {}
-        self._cache: dict[Path, _Loaded] = {}
+        self._cache: OrderedDict[Path, _Loaded] = OrderedDict()
         self._lock = threading.Lock()
 
     def files(self) -> list[Path]:
@@ -93,23 +100,27 @@ class EvidenceStore:
         with self._lock:
             cached = self._cache.get(path)
             if cached and cached.stamp == stamp:
+                self._cache.move_to_end(path)
                 return cached
+        # One read: the records shown are the ones verified, even while the file grows.
+        data = path.read_bytes()
+        stamp = (st.st_mtime_ns, len(data))
+        lines = data.splitlines(keepends=True)
         # Verification covers the whole file. The browser only gets the most recent records.
-        report = verify_file(path, self.trusted_keys)
+        report = verify_lines(lines, self.trusted_keys)
         records: deque[dict] = deque(maxlen=self.max_records)
         total = 0
-        with open(path, "rb") as fh:
-            for line_no, raw in enumerate(fh, start=1):
-                if not raw.strip():
-                    continue
-                total += 1
-                try:
-                    rec = parse_json(raw)
-                    if not isinstance(rec, dict):
-                        raise ValueError
-                except ValueError:
-                    rec = {"_unparseable": True, "_line": line_no, "_raw": raw[:300].decode("utf-8", "replace")}
-                records.append(rec)
+        for line_no, raw in enumerate(lines, start=1):
+            if not raw.strip():
+                continue
+            total += 1
+            try:
+                rec = parse_json(raw)
+                if not isinstance(rec, dict):
+                    raise ValueError
+            except (ValueError, RecursionError):
+                rec = {"_unparseable": True, "_line": line_no, "_raw": raw[:300].decode("utf-8", "replace")}
+            records.append(rec)
         summary = {
             "name": self.name(path),
             "size": st.st_size,
@@ -129,10 +140,12 @@ class EvidenceStore:
         loaded = _Loaded(stamp, summary, payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
         with self._lock:
             self._cache[path] = loaded
+            while len(self._cache) > MAX_CACHED:
+                self._cache.popitem(last=False)
         return loaded
 
 
-def make_handler(store: EvidenceStore, port: int) -> type[BaseHTTPRequestHandler]:
+def make_handler(store: EvidenceStore, port: int, key: str) -> type[BaseHTTPRequestHandler]:
     page = resources.files(__package__).joinpath("index.html").read_bytes()
     allowed_hosts = {f"{h}:{port}" for h in LOCAL_HOSTS}
 
@@ -147,6 +160,9 @@ def make_handler(store: EvidenceStore, port: int) -> type[BaseHTTPRequestHandler
                 return self._send(HTTPStatus.FORBIDDEN, b"forbidden host", "text/plain")
             url = urlsplit(self.path)
             query = parse_qs(url.query)
+            if url.path.startswith("/api/") and not hmac.compare_digest(self.headers.get(KEY_HEADER, ""), key):
+                return self._send(HTTPStatus.FORBIDDEN, b'{"error":"open the link the dashboard printed"}',
+                                  "application/json")
             try:
                 if url.path == "/":
                     return self._send(HTTPStatus.OK, page, "text/html; charset=utf-8")
@@ -187,15 +203,21 @@ def make_handler(store: EvidenceStore, port: int) -> type[BaseHTTPRequestHandler
 
 class DashboardServer(ThreadingHTTPServer):
     store: EvidenceStore
+    key: str
+    # On Windows SO_REUSEADDR lets a second server bind a port already in use, and the browser
+    # would show the other folder's evidence: there, binding a used port fails instead.
+    allow_reuse_address = os.name != "nt"
 
 
 def create_server(path: str | Path, *, trusted_keys: list[str] | None = None,
-                  port: int = 8765) -> DashboardServer:
-    """Bind on loopback. ``port=0`` picks a free port."""
+                  port: int = 8765, key: str | None = None) -> DashboardServer:
+    """Bind on loopback. ``port=0`` picks a free port. ``key`` (random by default) is what data
+    requests must carry: it is in the link ``serve`` prints."""
     store = EvidenceStore(path, trusted_keys or [])
     server = DashboardServer(("127.0.0.1", port), BaseHTTPRequestHandler)
+    server.key = key or secrets.token_urlsafe(24)
     # The Host check needs the real port, which is only known after binding.
-    server.RequestHandlerClass = make_handler(store, server.server_address[1])
+    server.RequestHandlerClass = make_handler(store, server.server_address[1], server.key)
     server.store = store
     return server
 
@@ -203,8 +225,8 @@ def create_server(path: str | Path, *, trusted_keys: list[str] | None = None,
 def serve(path: str | Path, *, trusted_keys: list[str] | None = None, port: int = 8765,
           open_browser: bool = True) -> None:
     server = create_server(path, trusted_keys=trusted_keys, port=port)
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
-    print(f"Mnestiq dashboard: {url}  (serving {server.store.root}; Ctrl+C to stop)")
+    url = f"http://127.0.0.1:{server.server_address[1]}/?key={server.key}"
+    print(f"Mnestiq dashboard: {url}  (serving {server.store.root}, Ctrl+C to stop)", flush=True)
     if open_browser:
         import webbrowser
 

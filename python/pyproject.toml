@@ -49,6 +49,13 @@ mnestiq = "mnestiq.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/mnestiq"]
 
+[tool.hatch.build.targets.sdist]
+# The test data is ignored by the repository's .gitignore patterns as hatch reads them: list what
+# the source archive holds instead, so the tests run from it.
+ignore-vcs = true
+include = ["src", "tests", "README.md", "LICENSE", "pyproject.toml"]
+exclude = ["**/__pycache__", "**/*.pyc", ".coverage"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

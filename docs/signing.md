@@ -28,7 +28,10 @@ goes into the evidence.
 - **Protected:** someone who takes over the agent, or later gets at the evidence, cannot copy
   the key and re-sign a rewritten history. With the signing service they also cannot get
   earlier checkpoints signed again, even while they control the agent: the service signs
-  each chain only forward.
+  each chain only forward. Each checkpoint must cover the records just before it. If a signed
+  checkpoint is lost before it reaches the file, the next one may cover the same records again
+  and more, and the service signs it only once the record hashes show the records it signed are
+  unchanged.
 - **Not protected:** while someone controls the agent, they can feed it false events, and
   those get signed like true ones. Evidence is tamper-evident after it is written, not
   truthful at the source. The Workbench cross-checks the agent's story against network and

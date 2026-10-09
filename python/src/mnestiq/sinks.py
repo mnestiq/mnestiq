@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import sys
 import threading
@@ -35,7 +36,9 @@ class FileSink:
 
     ``fsync=True`` forces each record to disk before the agent proceeds: slower,
     but nothing is lost if the host dies mid-incident. New files are created
-    owner-read/write only (evidence can contain prompts and customer data).
+    owner-read/write only on Linux and macOS (evidence can contain prompts and customer
+    data). On Windows a file takes the access list of its folder: keep evidence in a
+    folder only the agent's account can read.
 
     One writer per file: a second sink on a file that is already open for writing,
     in this process or another, raises ``SinkError``. The lock goes away with the
@@ -48,7 +51,8 @@ class FileSink:
         self._fsync = fsync
         self._lock = threading.Lock()
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
-        self._fh = os.fdopen(fd, "ab")
+        # Unbuffered: a write that fails must not stay in a buffer and land in the file later.
+        self._fh = os.fdopen(fd, "ab", buffering=0)
         try:
             _lock_exclusive(self._fh)
         except OSError as exc:
@@ -91,7 +95,9 @@ class FileSink:
                 return None
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             sidecar = self.path.with_name(f"{self.path.name}.torn-{stamp}")
-            sidecar.write_bytes(tail)
+            fd = os.open(sidecar, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as side:  # what was cut off is evidence too: owner-only like the file
+                side.write(tail)
             fh.truncate(start)
         return {"bytes": len(tail), "sidecar": sidecar.name}
 
@@ -102,16 +108,17 @@ class FileSink:
                 raise SinkError(f"{self.path} is closed")
             pos = self._fh.tell()
             try:
-                self._fh.write(line)
-                self._fh.flush()
+                view = memoryview(line)
+                while view:  # an unbuffered write may take part of the line
+                    written = self._fh.write(view)
+                    if not written:
+                        raise OSError("no bytes written")
+                    view = view[written:]
                 if self._fsync:
                     os.fsync(self._fh.fileno())
             except OSError:
-                try:  # drop the partial write
+                with contextlib.suppress(OSError):  # drop the partial write
                     self._fh.truncate(pos)
-                    self._fh.flush()
-                except OSError:
-                    pass
                 raise
 
     def existing(self) -> Iterator[dict]:
@@ -126,6 +133,12 @@ class FileSink:
                 except ValueError as exc:
                     raise SinkError(f"{self.path} line {n} is not valid JSON ({exc}); "
                                     "the chain cannot be resumed. Verify the file and start a new one.") from exc
+
+    def sync(self) -> None:
+        """Make sure what was written is on the disk."""
+        with self._lock:
+            if not self._fh.closed:
+                os.fsync(self._fh.fileno())
 
     def close(self) -> None:
         with self._lock:

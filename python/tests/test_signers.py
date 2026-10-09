@@ -316,6 +316,46 @@ def test_the_service_will_not_resign_history(tmp_path, service):
         client.sign(signing_payload(forged))
 
 
+def test_the_service_state_cannot_be_moved_back(tmp_path, service):
+    """The attack: a throwaway checkpoint that starts at the next record but names a low seq, to
+    reset the service, then the rewritten history signed from the start."""
+    client = SignerClient(service.server.address, service.token)
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signer=client, checkpoint_every=2)
+    events(rec, 4)
+    rec.close()
+    last = [r for r in load(path) if r["kind"] == "checkpoint"][-1]
+    base = {k: v for k, v in last.items() if k not in ("signature", "record_hash")}
+    nxt = last["seq"] + 1
+    for seq in (-1, 0, nxt + 5):
+        reset = dict(base, seq=seq, covers={"from_seq": nxt, "to_seq": nxt})
+        with pytest.raises(SignerError, match="does not cover the records just before it"):
+            client.sign(signing_payload(reset))
+    for covers in ({"from_seq": 5, "to_seq": 2}, {"from_seq": "1", "to_seq": 2}, {"from_seq": True, "to_seq": 2}):
+        with pytest.raises(SignerError, match="does not cover"):
+            client.sign(signing_payload(dict(base, covers=covers)))
+    first = next(r for r in load(path) if r["kind"] == "checkpoint")
+    replay = {k: v for k, v in first.items() if k not in ("signature", "record_hash")}
+    with pytest.raises(SignerError, match="only the next checkpoint"):
+        client.sign(signing_payload(replay))
+
+
+def test_a_lost_answer_does_not_stop_the_chain(tmp_path, service):
+    """The service signed, the answer never arrived, and the client asks again for the same records."""
+    client = SignerClient(service.server.address, service.token)
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signer=client, checkpoint_every=2)
+    events(rec, 4)
+    rec.close()
+    last = [r for r in load(path) if r["kind"] == "checkpoint"][-1]
+    payload = signing_payload({k: v for k, v in last.items() if k not in ("signature", "record_hash")})
+    assert base64.b64encode(client.sign(payload)).decode() == last["signature"]
+    changed = {k: v for k, v in last.items() if k not in ("signature", "record_hash")}
+    changed["merkle_root"] = "sha256:" + "cd" * 32  # same range, other records: still refused
+    with pytest.raises(SignerError, match="only the next checkpoint"):
+        client.sign(signing_payload(changed))
+
+
 def test_the_service_signs_checkpoints_only_and_near_its_clock(service):
     client = SignerClient(service.server.address, service.token)
     with pytest.raises(SignerError, match="only checkpoint"):
@@ -350,6 +390,7 @@ def test_the_service_remembers_chains_across_restarts(tmp_path, service):
         cp = next(r for r in load(path) if r["kind"] == "checkpoint")
         replay = {k: v for k, v in cp.items() if k not in ("signature", "record_hash")}
         replay["ts"] = {"wall": time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime()), "mono_us": 1}
+        replay["merkle_root"] = "sha256:" + "ef" * 32  # the same range with other records
         with pytest.raises(SignerError, match="only the next checkpoint"):
             client.sign(signing_payload(replay))
     finally:
@@ -458,3 +499,51 @@ def test_the_service_state_reaches_the_disk_before_it_is_swapped_in(tmp_path, se
     client.close()
     assert "replace" in steps and steps[steps.index("replace") - 1] == "fsync new state"
     assert not tmp.exists()
+
+
+def test_a_signed_checkpoint_lost_before_more_records_does_not_stop_the_chain(tmp_path, service):
+    """The service signed a checkpoint, the file never got it (a crash, a full disk), and the agent
+    wrote more records. The next checkpoint starts where the lost one started: the service sees from
+    the record hashes that the records it signed are unchanged, and signs the longer range."""
+    client = SignerClient(service.server.address, service.token)
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signer=client, checkpoint_every=100)
+    events(rec, 3)
+    real_write = rec._write
+    lost = {"done": False}
+
+    def write(record):
+        if record.get("kind") == "checkpoint" and not lost["done"]:
+            lost["done"] = True
+            raise OSError(28, "No space left on device")  # signed, never written
+        return real_write(record)
+
+    rec._write = write
+    with pytest.raises(OSError):
+        rec.checkpoint()
+    events(rec, 2)
+    rec.checkpoint()
+    rec.close()
+    assert rec.failures == 0 and verify_file(path, [service.pub]).ok
+    cps = [r for r in load(path) if r["kind"] == "checkpoint"]
+    assert cps[0]["covers"]["from_seq"] == 0 and cps[0]["covers"]["to_seq"] >= 4
+
+
+def test_an_extension_must_keep_the_records_already_signed(tmp_path, service):
+    """The leaves are checked: a longer range whose first records differ from what was signed is refused."""
+    client = SignerClient(service.server.address, service.token)
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signer=client, checkpoint_every=100)
+    events(rec, 3)
+    rec.close()
+    signed = next(r for r in load(path) if r["kind"] == "checkpoint")
+    n = signed["covers"]["to_seq"] - signed["covers"]["from_seq"] + 1
+    forged_leaves = ["sha256:" + "ab" * 32] * (n + 2)
+    longer = {k: v for k, v in signed.items() if k not in ("signature", "record_hash")}
+    longer["covers"] = {"from_seq": signed["covers"]["from_seq"], "to_seq": signed["covers"]["to_seq"] + 2}
+    longer["seq"] = longer["covers"]["to_seq"] + 1
+    from mnestiq.hashing import digest_bytes
+    from mnestiq.merkle import merkle_root
+    longer["merkle_root"] = "sha256:" + merkle_root([digest_bytes(h) for h in forged_leaves]).hex()
+    with pytest.raises(SignerError, match="only the next checkpoint"):
+        client.sign(signing_payload(longer), leaves=forged_leaves)

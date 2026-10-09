@@ -8,10 +8,10 @@
 :root {
   --bg: #f4f5f7; --panel: #ffffff; --sunken: #f7f8fa; --hover: #f0f2f5; --select: #e8eefb;
   --line: #dfe2e7; --line-strong: #c9ced6;
-  --text: #1b1f24; --muted: #59626e; --faint: #8a929d;
+  --text: #1b1f24; --muted: #59626e; --faint: #646c77;
   --accent: #1f5fd1;
   --ok: #18794e; --ok-bg: #e6f4ec; --bad: #c4321f; --bad-bg: #fcebe8; --warn: #9a5b00; --warn-bg: #fdf4e3; --untrusted: #c2410c;
-  --t-llm: var(--muted); --t-tool: var(--muted); --t-egress: var(--muted); --t-approval: var(--muted); --t-run: #8a929d;
+  --t-llm: var(--muted); --t-tool: var(--muted); --t-egress: var(--muted); --t-approval: var(--muted); --t-run: #646c77;
   --s-system: var(--muted); --s-user: var(--muted); --s-internal: var(--muted); --s-model: var(--muted); --s-tool_output: var(--untrusted); --s-retrieved_doc: var(--untrusted);
   --s-web: var(--untrusted); --s-agent_msg: var(--untrusted); --s-memory: var(--untrusted); --s-unknown: var(--untrusted);
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Cascadia Code", Consolas, "Liberation Mono", monospace;
@@ -22,10 +22,10 @@
   :root:not([data-theme="light"]) {
     --bg: #0d0f12; --panel: #14171b; --sunken: #101317; --hover: #1a1e24; --select: #1a2638;
     --line: #262b33; --line-strong: #343a44;
-    --text: #e3e6ea; --muted: #9aa3ae; --faint: #6c7480;
+    --text: #e3e6ea; --muted: #9aa3ae; --faint: #8a929d;
     --accent: #5b9bff;
     --ok: #4cc38a; --ok-bg: #11291d; --bad: #ff6b57; --bad-bg: #331512; --warn: #f0b13c; --warn-bg: #2e2210; --untrusted: #fb923c;
-    --t-llm: var(--muted); --t-tool: var(--muted); --t-egress: var(--muted); --t-approval: var(--muted); --t-run: #6c7480;
+    --t-llm: var(--muted); --t-tool: var(--muted); --t-egress: var(--muted); --t-approval: var(--muted); --t-run: #8a929d;
     --s-system: var(--muted); --s-user: var(--muted); --s-internal: var(--muted); --s-model: var(--muted); --s-tool_output: var(--untrusted); --s-retrieved_doc: var(--untrusted);
     --s-web: var(--untrusted); --s-agent_msg: var(--untrusted); --s-memory: var(--untrusted); --s-unknown: var(--untrusted);
     color-scheme: dark;
@@ -34,10 +34,10 @@
 :root[data-theme="dark"] {
   --bg: #0d0f12; --panel: #14171b; --sunken: #101317; --hover: #1a1e24; --select: #1a2638;
   --line: #262b33; --line-strong: #343a44;
-  --text: #e3e6ea; --muted: #9aa3ae; --faint: #6c7480;
+  --text: #e3e6ea; --muted: #9aa3ae; --faint: #8a929d;
   --accent: #5b9bff;
   --ok: #4cc38a; --ok-bg: #11291d; --bad: #ff6b57; --bad-bg: #331512; --warn: #f0b13c; --warn-bg: #2e2210; --untrusted: #fb923c;
-  --t-llm: var(--muted); --t-tool: var(--muted); --t-egress: var(--muted); --t-approval: var(--muted); --t-run: #6c7480;
+  --t-llm: var(--muted); --t-tool: var(--muted); --t-egress: var(--muted); --t-approval: var(--muted); --t-run: #8a929d;
   --s-system: var(--muted); --s-user: var(--muted); --s-internal: var(--muted); --s-model: var(--muted); --s-tool_output: var(--untrusted); --s-retrieved_doc: var(--untrusted);
   --s-web: var(--untrusted); --s-agent_msg: var(--untrusted); --s-memory: var(--untrusted); --s-unknown: var(--untrusted);
   color-scheme: dark;
@@ -264,7 +264,8 @@ const RULES = {
   "MNQ-001": { name: "untrusted argument", explain: "A tool call's arguments carry an address, URL or account number that appears in untrusted content and not in the user's or system's words." },
   "MNQ-002": { name: "auto-approval", explain: "An action was approved without a human after untrusted content reached the model in this run." },
   "MNQ-003": { name: "egress after taint", explain: "Outbound network connection (not to loopback) after untrusted content reached the model in this run." },
-  "MNQ-004": { name: "untrusted sensitive action", explain: "A sensitive action (credentials, permissions, deletion, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words." },
+  "MNQ-004": { name: "untrusted sensitive action", explain: "A sensitive action (credentials, permissions, deletion, cancellations, account changes, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words." },
+  "MNQ-005": { name: "untrusted link in answer", explain: "The model's answer carries an image, or a link with data in it, to a host that appears in untrusted content and not in the user's or system's words. An image is fetched as soon as the answer is shown, so it can carry data out without any tool call." },
 };
 // follow: while the newest file/run is selected, move to newer ones as agents write them.
 // MNQ-001: tool-call arguments carrying a destination or identifier (email, URL or host, account
@@ -279,9 +280,11 @@ const DATE = /[0-9]{4}-[0-9]{2}-[0-9]{2}/;  // 2024-03-07 is not a number to tra
 const SEP = /[ -]/g;
 function indicators(text) {
   const found = new Set();
-  for (const rx of [IND_RX[0], IND_RX[2]]) for (const m of text.matchAll(rx)) found.add(m[0].toLowerCase().replace(/[.,;:/]+$/, ""));
+  // Word by word, each cut at 2048 characters: hostile text cannot make the patterns take quadratic time.
+  const words = text.split(/\s+/).filter(Boolean).map((w) => w.slice(0, 2048));
+  for (const w of words) for (const rx of [IND_RX[0], IND_RX[2]]) for (const m of w.matchAll(rx)) found.add(m[0].toLowerCase().replace(/[.,;:/]+$/, ""));
   // A model may add or drop the scheme or "www." when it copies a link.
-  for (const m of text.matchAll(IND_RX[1])) found.add(m[0].toLowerCase().replace(/^(?:https?:\/\/)?(?:www\.)?/, "").replace(/[.,;:/]+$/, ""));
+  for (const w of words) for (const m of w.matchAll(IND_RX[1])) found.add(m[0].toLowerCase().replace(/^(?:https?:\/\/)?(?:www\.)?/, "").replace(/[.,;:/]+$/, ""));
   for (const m of text.matchAll(LONG_NUM)) if (!DATE.test(m[0])) found.add(m[0].replace(SEP, ""));
   // Keep the longest form: an email's domain or an IBAN's digits are not separate indicators.
   const all = [...found].filter((f) => f.length >= 6);
@@ -291,26 +294,33 @@ const strings = (v) => (v == null ? [] : Array.isArray(v) ? v.flatMap(strings)
   : typeof v === "object" ? Object.values(v).flatMap(strings) : [String(v)]);
 function corpus(segs) {
   const text = segs.flatMap((s) => strings(s.content)).join("\n").toLowerCase();
-  return { text, compact: text.replace(SEP, "") };
+  return { text, compact: text.replace(/(?<=[0-9])[ -](?=[0-9])/g, "") };  // "12 34" is one number, "account 1234" is not
 }
 const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // Whole matches only: "billing@acme.exam" must not count as present in "billing@acme.example".
 const inCorpus = (c, ind) => new RegExp(`(?<![a-z0-9_-])${escapeRx(ind)}(?![a-z0-9])`)
   .test(/^[0-9]+$/.test(ind) || ind.startsWith("+") ? c.compact : c.text);
-// Loopback traffic never leaves the machine (a local model server, a sidecar): not egress.
-function isLoopback(e) {
-  const host = String(e.dest_ip || e.host || "").replace(/^\[|\]$/g, "").split("%")[0].toLowerCase();
+// Loopback traffic never leaves the machine (a local model server, a sidecar): not egress. A request
+// for another host sent to a proxy on this machine does leave it.
+function loopbackHost(value) {
+  const host = String(value || "").replace(/^\[|\]$/g, "").split("%")[0].toLowerCase();
   return host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
+function isLoopback(e) {
+  return loopbackHost(e.dest_ip || e.host) && (!e.host || loopbackHost(e.host));
 }
 // MNQ-004: a sensitive action whose argument values came from untrusted content. Mirrors
 // mnestiq/findings.py. Sensitive = marked by the recorder, else guessed from the tool's name.
-const SENSITIVE_NAME = /password|passwd|credential|secret|token|api_?key|permission|role|grant|revoke|delete|remove|erase|reset|disable|transfer|refund|payment|send_money|pay_|schedule_transaction|update_scheduled|update_user|update_email|update_account|create_user|reserve|book_/i;
-const DESTRUCTIVE_NAME = /delete|remove|erase|revoke|disable/i;  // a bare id is the whole payload
+const SENSITIVE_NAME = /password|passwd|credential|secret|token|api_?key|permission|role|grant|revoke|delete|remove|erase|reset|disable|transfer|refund|payment|send_money|pay_|schedule_transaction|update_scheduled|update_user|update_email|update_account|create_user|reserve|book_|cancel|suspend|deactivate|terminate|close_account|change_|modify_|forward|share_|invite|unsubscribe/i;
+const DESTRUCTIVE_NAME = /delete|remove|erase|revoke|disable|cancel|suspend|deactivate|terminate/i;  // a bare id is the whole payload
 const NUMBER = /^[+-]?[0-9]+(?:\.[0-9]+)?$/;
 const DATE_ONLY = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
+const READ_ONLY = /^(get|list|read|search|find|fetch|lookup|query|describe|view|show|check)_/;
 function isSensitive(ev, name) {
   const marked = (ev.attributes || {}).sensitive;
-  return typeof marked === "boolean" ? marked : SENSITIVE_NAME.test(name || "");
+  if (typeof marked === "boolean") return marked;
+  const snake = (name || "").replace(/(?<=[a-z0-9])(?=[A-Z])/g, "_").toLowerCase();  // sendMoney reads as send_money
+  return !READ_ONLY.test(snake) && SENSITIVE_NAME.test(snake);  // reading about an action is not taking it
 }
 function untrustedValues(tool, args, context) {
   const segs = context.filter((s) => UNTRUSTED.has(s.source));
@@ -329,16 +339,71 @@ function untrustedValues(tool, args, context) {
   }
   return hits;
 }
+// MNQ-005: images, and links carrying data, that untrusted content put in the model's answer.
+// Mirrors mnestiq/findings.py.
+const IMAGE_RX = /!\[[^\]]*\]\(\s*<?([^)\s>]+)|<img\b[^>]*?\bsrc\s*=\s*["']?([^"'\s>]+)/gi;
+const LINK_RX = /https?:[\/\\]*[^\s"'<>)\]]+/gi;
+const REF_IMAGE_RX = /!\[[^\]]*\]\[([^\]]+)\]/g;
+const REF_DEF_RX = /^\s*\[([^\]]+)\]:\s*<?(\S+?)>?(?:\s|$)/gm;
+// The host and its parent domains of two labels or more: img.evil.example loads from evil.example's owner too.
+function domains(host) {
+  const labels = host.split(".");
+  const out = [];
+  for (let i = 0; i < labels.length - 1; i++) out.push(labels.slice(i).join("."));
+  return out.length ? out : [host];
+}
+const SKIP_BLOCKS = new Set(["tool_use", "function_call", "tool_call", "thinking", "redacted_thinking"]);
+function answerText(v) {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.map(answerText).join("\n");
+  if (v && typeof v === "object" && !SKIP_BLOCKS.has(v.type)) return typeof v.text === "string" ? v.text : answerText(v.content);
+  return "";
+}
+function hostOf(url) {  // as _host in findings.py: no scheme, user, port or path
+  // A browser reads a backslash as a slash, and a single slash after the scheme loads the same host.
+  const rest = url.toLowerCase().replace(/^(?:[a-z][a-z0-9+.-]*:)?[\/\\]*/, "").split(/[\/\\?#]/)[0].split("@").pop();
+  return rest.startsWith("[") ? rest.split("]")[0] + "]" : rest.split(":")[0];
+}
+function answerLinks(ev, untrustedSegs) {
+  const text = answerText((ev.output || {}).content);
+  if (!untrustedSegs.length || !text) return [];
+  const untrusted = corpus(untrustedSegs);
+  const trusted = corpus((ev.context || []).filter((s) => TRUSTED.has(s.source)));
+  const images = new Set();
+  for (const m of text.matchAll(IMAGE_RX)) for (const u of [m[1], m[2]]) if (u) images.add(u);
+  const refs = new Map([...text.matchAll(REF_DEF_RX)].map((m) => [m[1].toLowerCase(), m[2]]));
+  for (const m of text.matchAll(REF_IMAGE_RX)) if (refs.has(m[1].toLowerCase())) images.add(refs.get(m[1].toLowerCase()));
+  const candidates = [...images].sort().map((u) => [u, "image"]);
+  for (const m of text.matchAll(LINK_RX))
+    if (!images.has(m[0]) && m[0].includes("?") && m[0].split("?").slice(1).join("?").includes("=")) candidates.push([m[0], "link"]);
+  const hits = [];
+  const seen = new Set();
+  for (const [url, kind] of candidates) {
+    const host = hostOf(url);
+    const named = domains(host).find((d) => inCorpus(untrusted, d));
+    if (host.length < 4 || seen.has(host + " " + kind) || !named || domains(host).some((d) => inCorpus(trusted, d))) continue;
+    seen.add(host + " " + kind);
+    hits.push({ kind, host, url: url.slice(0, 200),
+      sources: [...new Set(untrustedSegs.filter((s) => inCorpus(corpus([s]), named)).map((s) => s.source))].sort() });
+  }
+  return hits;
+}
 function untrustedArguments(ev, untrustedSegs) {
   const untrusted = corpus(untrustedSegs);
   const trusted = corpus((ev.context || []).filter((s) => TRUSTED.has(s.source)));
   const hits = [];
   for (const call of ev.tool_calls || [])
     for (const value of strings(call.arguments))
-      for (const ind of indicators(value))
-        if (inCorpus(untrusted, ind) && !inCorpus(trusted, ind))
+      for (const ind of indicators(value)) {
+        let found = inCorpus(untrusted, ind) && !inCorpus(trusted, ind) ? ind : null;
+        if (!found && /[/?]/.test(ind)) {  // a planted link the model filled with data: its host came from the content
+          const host = hostOf(ind);
+          if (host.length >= 6 && host.includes(".") && inCorpus(untrusted, host) && !inCorpus(trusted, host)) found = host;
+        }
+        if (found)
           hits.push({ tool: call.name, indicator: ind,
-            sources: [...new Set(untrustedSegs.filter((s) => inCorpus(corpus([s]), ind)).map((s) => s.source))].sort() });
+            sources: [...new Set(untrustedSegs.filter((s) => inCorpus(corpus([s]), found)).map((s) => s.source))].sort() });
+      }
   return hits;
 }
 const state = { files: [], name: null, etag: null, data: null, runId: null, focusSeq: null, open: new Set(), lastOk: 0,
@@ -385,8 +450,10 @@ function writeHash() {
 }
 
 // ---------- data ----------
+// The key from the link the dashboard printed: data requests need it (other local accounts reach 127.0.0.1 too).
+const KEY = new URLSearchParams(location.search).get("key") || "";
 async function loadFiles() {
-  const res = await fetch("/api/files", { cache: "no-store" });
+  const res = await fetch("/api/files", { headers: { "X-Mnestiq-Key": KEY }, cache: "no-store" });
   const body = await res.json();
   state.files = body.files;
   const newest = state.files[0]?.name;
@@ -400,7 +467,7 @@ async function loadFiles() {
 
 async function loadFile() {
   if (!state.name) { state.data = null; render(); return; }
-  const headers = state.etag ? { "If-None-Match": state.etag } : {};
+  const headers = { "X-Mnestiq-Key": KEY, ...(state.etag ? { "If-None-Match": state.etag } : {}) };
   const res = await fetch(`/api/file?name=${encodeURIComponent(state.name)}`, { headers, cache: "no-store" });
   if (res.status === 304) return;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -438,7 +505,10 @@ function derive(payload) {
   const errBySeq = new Map();
   for (const e of report.errors) if (e.seq != null) (errBySeq.get(e.seq) || errBySeq.set(e.seq, []).get(e.seq)).push(e);
   const checkpoints = records.filter((r) => r.kind === "checkpoint" && r.covers);
-  const sealed = (seq) => checkpoints.some((c) => seq >= c.covers.from_seq && seq <= c.covers.to_seq);
+  // A record is sealed only by a checkpoint that verifies: one that fails (a record edited and its
+  // hash recomputed breaks the Merkle root there) seals nothing.
+  const covering = (seq) => checkpoints.find((c) => seq >= c.covers.from_seq && seq <= c.covers.to_seq);
+  const sealed = (seq) => { const c = covering(seq); return c ? (errBySeq.has(c.seq) ? "failed" : "sealed") : ""; };
 
   const runs = new Map();
   const totals = { llm: 0, tool: 0, egress: 0, flags: 0, failed: 0 };
@@ -474,6 +544,8 @@ function derive(payload) {
           taint = taint || { step: ev.step_id, sources: [...new Set(bad.map((s) => s.source))] };
           for (const hit of untrustedArguments(ev, bad))
             ev._flags.push({ rule: "MNQ-001", finding: `${hit.tool} ← ${hit.indicator} (from ${hit.sources.join(",")})`, taint: ev.step_id });
+          for (const link of answerLinks(ev, bad))
+            ev._flags.push({ rule: "MNQ-005", finding: `${link.kind} to ${link.host} in the answer (from ${link.sources.join(",")}): ${link.url}`, taint: ev.step_id });
         }
       } else if (taint && ev.event_type === "egress" && !isLoopback((ev.egress || [])[0] || {})) {
         const e = (ev.egress || [])[0] || {};
@@ -692,7 +764,8 @@ function renderEvent(ev, d) {
     const src = tc.result_source || "tool_output";
     headline = tc.name || "tool";
     sub.push(h("span", { class: "call" }, `${tc.name}(${argsPreview(tc.arguments)})`), h("span", {}, "→ result"),
-      h("span", { class: `tag${UNTRUSTED.has(src) ? " untrusted" : ""}`, style: `--c:var(--s-${src})` }, src),
+      // src comes from the file: only a known source name may reach the style attribute.
+      h("span", { class: `tag${UNTRUSTED.has(src) ? " untrusted" : ""}`, style: `--c:var(--s-${SOURCES.includes(src) ? src : "unknown"})` }, src),
       tc.latency_ms != null ? h("span", { class: "faint mono" }, `${tc.latency_ms} ms`) : null);
     if (tc.error) sub.push(h("span", { class: "err" }, tc.error));
     if (open) {
@@ -725,6 +798,7 @@ function renderEvent(ev, d) {
     h("pre", { class: "content" }, JSON.stringify(ev, (k, v) => (k.startsWith("_") ? undefined : v), 2))));
 
   const seal = errors.length ? h("span", { class: "seal broken", title: "record no longer matches what was signed" }, "BROKEN")
+    : sealed === "failed" ? h("span", { class: "seal broken", title: "the checkpoint covering this record does not verify" }, "SEAL FAILS")
     : h("span", { class: `seal${sealed ? " sealed" : ""}`, title: sealed ? "covered by a signed checkpoint" : "not yet covered by a signed checkpoint" }, sealed ? "sealed" : "pending");
   return h("tr", {
       class: `ev${open ? " open" : ""}${errors.length ? " tampered" : ""}${ev._flags.length ? " flagged" : ""}`,

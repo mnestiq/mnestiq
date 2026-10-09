@@ -79,9 +79,9 @@ def _write(value: Any, out: list[str]) -> None:
             raise CanonicalizationError(
                 f"integer {value} exceeds 2^53-1; encode it as a string instead"
             )
-        out.append(str(value))
+        out.append(str(int(value)))  # int(): a subclass (IntEnum, numpy) may print itself otherwise
     elif isinstance(value, float):
-        out.append(_format_number(value))
+        out.append(_format_number(float(value)))
     elif isinstance(value, str):
         out.append(json.dumps(value, ensure_ascii=False))
     elif isinstance(value, (list, tuple)):

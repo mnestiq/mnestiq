@@ -33,8 +33,10 @@ Publishing: no person holds a PyPI token, and a maintainer approves each publish
 - **On PyPI**, each file shows its publish attestation: who published it, from which
   repository and workflow.
 - **Build provenance:** download the wheel or source archive and run
-  `gh attestation verify mnestiq-<version>-py3-none-any.whl --repo mnestiq/mnestiq`. It checks
-  the file was built by this repository's release workflow, at the release's commit.
+  `gh attestation verify mnestiq-<version>-py3-none-any.whl --repo mnestiq/mnestiq
+  --signer-workflow mnestiq/mnestiq/.github/workflows/release.yml --source-ref refs/tags/v<version>`.
+  It checks the file was built by this repository's release workflow, from the release's tag.
+  Without the last two options it checks only that some workflow in this repository built it.
 - Every action in the workflows is pinned to a commit, and Dependabot proposes updates.
   CI checks dependencies for known vulnerabilities (`pip-audit`).
 

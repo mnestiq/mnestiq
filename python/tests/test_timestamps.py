@@ -78,6 +78,58 @@ def test_an_untrusted_root_is_refused(tmp_path):
     assert len(report.timestamps) == len(checkpoints()) - len(sectigo)
 
 
+def _with_certs(token, certs):
+    """The token with its certificate list replaced, which the TSA's signature does not cover."""
+    from cryptography.hazmat.primitives.serialization import Encoding
+
+    from mnestiq.timestamps import _children, _der, _read
+
+    _, bare = split_certificates(token)
+    tag, body, _ = _read(bare, 0)
+    oid, explicit = _children(body)[:2]
+    _, inner, _ = _read(explicit, 0)
+    _, signed_data, _ = _read(inner, 0)
+    parts = _children(signed_data)
+    listed = _der(0xA0, b"".join(c.public_bytes(Encoding.DER) for c in certs))
+    signed = _der(0x30, b"".join(parts[:-1]) + listed + parts[-1])
+    return _der(tag, oid + _der(explicit[0], signed))
+
+
+def test_a_root_brought_by_the_token_is_not_trusted():
+    """Certificates in a token are not signed by anyone: a self-signed one in there must not become
+    a trust anchor. Here the token carries DigiCert's root while only Sectigo's is trusted."""
+    digicert = next(c for c in checkpoints()
+                    if any("DigiCert" in x.subject.rfc4514_string() for x in split_certificates(token_of(c)[0])[0]))
+    token, signature = token_of(digicert)
+    g4 = next(c for c in default_roots() if "DigiCert" in c.subject.rfc4514_string())
+    sectigo_only = [c for c in default_roots() if "DigiCert" not in c.subject.rfc4514_string()]
+    carried = _with_certs(token, split_certificates(token)[0] + [g4])
+    assert verify_token(carried, signature, default_roots())  # still fine against the real roots
+    with pytest.raises(TimestampError, match="does not chain to a trusted root"):
+        verify_token(carried, signature, sectigo_only)
+
+
+def test_a_self_signed_tsa_is_not_trusted():
+    """A forger's own TSA certificate, self-signed with the time-stamping usage, is refused."""
+    import datetime
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    from mnestiq.timestamps import _chain_to_root
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Forged TSA")])
+    start = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+    forged = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+              .serial_number(1).not_valid_before(start).not_valid_after(start.replace(year=2040))
+              .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]), critical=True)
+              .sign(key, hashes.SHA256()))
+    with pytest.raises(TimestampError, match="does not chain to a trusted root"):
+        _chain_to_root(forged, [forged], default_roots(), start.replace(year=2026))
+
+
 def test_a_changed_token_is_refused():
     token, signature = token_of(checkpoints()[0])
     _, bare = split_certificates(token)

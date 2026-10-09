@@ -73,8 +73,9 @@ verifier follows. See the [signing guide](https://github.com/mnestiq/mnestiq/blo
 
 ## Security model
 
-Evidence is tamper-evident after it is written: edits, deletions, reordering, re-signing with
-another key and backdating are detected. It cannot prove that a compromised agent told the
+Evidence is tamper-evident after it is written: edits, insertions, reordering and re-signing with
+another key are detected. Records cut from the end are detected against a head kept elsewhere
+(a HeadFile or the Evidence Vault), and backdating against RFC 3161 timestamps. It cannot prove that a compromised agent told the
 truth at the time of writing. The [threat model](https://github.com/mnestiq/mnestiq/blob/main/docs/threat-model.md)
 lists each attack considered, how it is detected, and the automated test that demonstrates it.
 Independent reviewers are invited to try the

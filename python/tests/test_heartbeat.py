@@ -34,7 +34,9 @@ def test_a_busy_recorder_needs_no_heartbeat(key):
     with rec.run() as run:
         run.note("busy")
     rec.close()
-    assert not any(r.get("event_type") == "heartbeat" for r in rec._sink.records)
+    # One beat at the start, which puts the interval in the evidence, and none while busy.
+    beats = [r for r in rec._sink.records if r.get("event_type") == "heartbeat"]
+    assert len(beats) == 1 and beats[0]["seq"] == 0
 
 
 def test_heartbeats_continue_while_the_signer_is_down(key, recwarn):
@@ -104,3 +106,19 @@ def test_inspect_shows_heartbeats(tmp_path, key, capsys):
     rec.close()
     main(["inspect", str(tmp_path / "e.jsonl")])
     assert "recorder alive" in capsys.readouterr().out
+
+
+def test_a_recorder_stopped_before_its_first_quiet_spell_shows_as_a_silence(key, pub, tmp_path):
+    """The verifier learns the interval from a heartbeat. A recorder killed while busy, before any
+    idle beat, used to leave no interval, so its silence afterwards went unnoticed."""
+    from mnestiq import FileSink, verify_file
+    import json
+
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signing_key=key, checkpoint_every=1, checkpoint_interval=60)
+    with rec.run() as run:
+        run.note("busy")
+    rec.close()
+    first = json.loads(path.read_text().splitlines()[0])
+    assert first["event_type"] == "heartbeat" and first["attributes"]["interval_s"] == 60
+    assert verify_file(path, [pub]).ok

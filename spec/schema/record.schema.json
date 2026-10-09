@@ -41,7 +41,7 @@
     },
     "keyId": { "type": "string", "pattern": "^(ed25519|p256):[0-9a-f]{16}$" },
     "source": {
-      "description": "Provenance of a piece of model context. Anything other than system/user/model is untrusted input for taint analysis.",
+      "description": "Provenance of a piece of model context. Anything other than system, user, internal and model is untrusted input for taint analysis (see SPEC section 7).",
       "enum": ["system", "user", "internal", "model", "tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"]
     },
     "chainFields": {

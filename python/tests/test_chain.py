@@ -5,6 +5,7 @@ import pytest
 
 from mnestiq import FileSink, MemorySink, Recorder, Segment, verify_file, verify_lines
 from mnestiq.canonical import canonical_json
+from mnestiq.cli import main
 from mnestiq.hashing import digest_bytes, record_hash, redact, signing_payload, value_digest
 from mnestiq.keys import generate_private_key, key_id, public_key_b64
 from mnestiq.merkle import merkle_root
@@ -45,6 +46,17 @@ def test_unsigned_chain_is_valid_but_warns(tmp_path):
     report = verify_file(record_demo(tmp_path / "e.jsonl", None))
     assert report.ok
     assert {w.code for w in report.warnings} == {"unsigned"}
+
+
+def test_an_unsigned_file_fails_against_a_pinned_key(tmp_path, pub, capsys):
+    """A forger needs no key at all if a file with no checkpoints passes a pinned verify."""
+    path = record_demo(tmp_path / "e.jsonl", None)
+    report = verify_file(path, [pub])
+    assert not report.ok and {e.code for e in report.errors} == {"unsigned"}
+    key_file = tmp_path / "k.pub"
+    key_file.write_text(pub)
+    assert main(["verify", str(path), "--trusted-key", str(key_file)]) != 0
+    assert capsys.readouterr().out.startswith("INVALID")
 
 
 def test_unsigned_tail_warns(tmp_path, key, pub):

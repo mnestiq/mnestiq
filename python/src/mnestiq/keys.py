@@ -136,7 +136,16 @@ def save_keypair(key: PrivateKey, directory: str | Path, name: str = "signing") 
         serialization.NoEncryption(),
     )
     fd = os.open(priv_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as fh:
+    try:
+        if os.name == "nt":  # the mode does nothing on Windows: an access list naming only this user
+            from .signer_service import restrict_to_owner
+
+            restrict_to_owner(priv_path)
+    except Exception:
+        os.close(fd)
+        priv_path.unlink()
+        raise
+    with os.fdopen(fd, "wb") as fh:  # the key is written only once nobody else can read the file
         fh.write(pem)
     pub_path.write_text(public_key_b64(key) + "\n", encoding="ascii")
     return priv_path, pub_path
