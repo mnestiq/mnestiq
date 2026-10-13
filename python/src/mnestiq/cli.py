@@ -1,4 +1,4 @@
-"""mnestiq command line: verify, keygen, inspect, redact, dashboard, signer."""
+"""mnestiq command line: verify, keygen, inspect, redact, dashboard, signer, proxy."""
 
 from __future__ import annotations
 
@@ -71,13 +71,39 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--max-skew", type=float, default=300.0,
                    help="refuse checkpoints whose time is further than this from the signer's clock (seconds)")
 
+    p = sub.add_parser("proxy", help="record an agent's model calls from outside the agent")
+    p.add_argument("evidence", help="evidence file to write (continued if it exists)")
+    p.add_argument("--agent", required=True, help="the agent's name in the evidence")
+    p.add_argument("--operator", help="who runs the agent (operator_id)")
+    p.add_argument("--listen", default="127.0.0.1:8787", help="host:port (default 127.0.0.1:8787)")
+    p.add_argument("--upstream", action="append", default=[], metavar="NAME=URL",
+                   help="a provider, reached at /NAME/ on the proxy (repeatable). Default: "
+                        "openai=https://api.openai.com and anthropic=https://api.anthropic.com. "
+                        "NAME=anthropic:URL or NAME=openai:URL says which API it speaks")
+    signing = p.add_mutually_exclusive_group()
+    signing.add_argument("--signer", action="store_true",
+                         help="sign with the signing service (MNESTIQ_SIGNER, MNESTIQ_SIGNER_TOKEN)")
+    signing.add_argument("--azure-key", metavar="URL", help="sign with this Azure Key Vault key")
+    signing.add_argument("--key", metavar="PATH", help="sign with this private key file (testing)")
+    p.add_argument("--head", metavar="PATH", help="keep the latest checkpoint here too (verify --head)")
+    p.add_argument("--timestamps", action="store_true", help="timestamp checkpoints with public authorities")
+    p.add_argument("--heartbeat-minutes", type=float, default=5.0,
+                   help="sign a heartbeat, and everything not yet signed, when quiet this long "
+                        "(default 5, 0 turns it off)")
+    p.add_argument("--tool-source", action="append", default=[], metavar="TOOL=SOURCE",
+                   help="where a tool's results come from (web, retrieved_doc, internal, ...), "
+                        "repeatable. Default tool_output, untrusted")
+    p.add_argument("--allow-network", action="store_true", help="allow listening on an address other machines reach")
+    p.add_argument("--allow-client", action="append", default=[], metavar="CIDR",
+                   help="with --allow-network, an address range allowed to use the proxy (repeatable)")
+
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # evidence may hold characters the console can't encode
         with contextlib.suppress(AttributeError, ValueError):
             stream.reconfigure(errors="replace")  # type: ignore[union-attr]
     try:
         return {"verify": _verify, "keygen": _keygen, "inspect": _inspect, "redact": _redact,
-                "dashboard": _dashboard, "signer": _signer}[args.command](args)
+                "dashboard": _dashboard, "signer": _signer, "proxy": _proxy}[args.command](args)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -163,6 +189,68 @@ def _signer(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         server.close()
     return EXIT_OK
+
+
+def _proxy(args: argparse.Namespace) -> int:
+    from .keys import load_private_key
+    from .proxy import DEFAULT_UPSTREAMS, ModelProxy
+    from .recorder import SOURCES, Recorder
+    from .signers import AzureKeyVaultSigner, LocalSigner, SignerClient, SignerError
+    from .sinks import FileSink, HeadFile
+
+    sources = {}
+    for spec in args.tool_source:
+        tool, sep, source = spec.partition("=")
+        if not sep or not tool or source not in SOURCES:
+            raise ValueError(f"--tool-source {spec!r}: expected TOOL=SOURCE, "
+                             f"SOURCE one of {', '.join(sorted(SOURCES))}")
+        sources[tool] = source
+    try:
+        signer = (SignerClient.from_env() if args.signer else AzureKeyVaultSigner(args.azure_key) if args.azure_key
+                  else LocalSigner(load_private_key(args.key)) if args.key else None)
+    except SignerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    timestamper = None
+    if args.timestamps:
+        from .timestamps import Timestamper
+
+        timestamper = Timestamper()
+    recorder = Recorder(FileSink(args.evidence), agent_id=args.agent, operator_id=args.operator, signer=signer,
+                        timestamper=timestamper, on_checkpoint=HeadFile(args.head) if args.head else None,
+                        checkpoint_interval=args.heartbeat_minutes * 60 if args.heartbeat_minutes else None)
+    try:
+        proxy = ModelProxy(recorder, upstreams=args.upstream or DEFAULT_UPSTREAMS, listen=args.listen,
+                           allow_network=args.allow_network, allow_clients=args.allow_client, tool_sources=sources)
+        proxy.start()
+    except BaseException:
+        recorder.close()
+        raise
+    print(f"recording {args.agent}'s model calls to {args.evidence}" +
+          ("" if signer else " (NOT signed: pass --signer, --azure-key or --key)"), flush=True)
+    for name, up in proxy.upstreams.items():
+        print(f"  {name:<10} {proxy.base_url(name)}  ->  {up.url('')}", flush=True)
+    print("Point the agent's base URL at the address on the left. Ctrl+C stops.", flush=True)
+    _stop_cleanly_on_signals()  # a service manager stopping the proxy: sign what is pending first
+    try:
+        proxy.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proxy.close()
+        recorder.close()
+    return EXIT_OK
+
+
+def _stop_cleanly_on_signals() -> None:
+    import signal
+
+    def stop(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):  # systemd and docker stop, Ctrl+Break on Windows
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
 
 
 def _inspect(args: argparse.Namespace) -> int:

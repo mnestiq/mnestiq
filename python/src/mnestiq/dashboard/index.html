@@ -263,7 +263,7 @@ const TYPE_COLOR = { llm_call: "--t-llm", tool_call: "--t-tool", egress: "--t-eg
 const RULES = {
   "MNQ-001": { name: "untrusted argument", explain: "A tool call's arguments carry an address, URL or account number that appears in untrusted content and not in the user's or system's words." },
   "MNQ-002": { name: "auto-approval", explain: "An action was approved without a human after untrusted content reached the model in this run." },
-  "MNQ-003": { name: "egress after taint", explain: "Outbound network connection (not to loopback) after untrusted content reached the model in this run." },
+  "MNQ-003": { name: "egress after taint", explain: "Outbound network connection (not to loopback, and not the agent's own model API) after untrusted content reached the model in this run." },
   "MNQ-004": { name: "untrusted sensitive action", explain: "A sensitive action (credentials, permissions, deletion, cancellations, account changes, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words." },
   "MNQ-005": { name: "untrusted link in answer", explain: "The model's answer carries an image, or a link with data in it, to a host that appears in untrusted content and not in the user's or system's words. An image is fetched as soon as the answer is shown, so it can carry data out without any tool call." },
 };
@@ -308,6 +308,14 @@ function loopbackHost(value) {
 }
 function isLoopback(e) {
   return loopbackHost(e.dest_ip || e.host) && (!e.host || loopbackHost(e.host));
+}
+// The agent's own model API is a model call, not egress after taint. Mirrors mnestiq/findings.py.
+const MODEL_API_HOSTS = new Set(["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com",
+  "api.mistral.ai", "api.cohere.com", "api.cohere.ai", "api.groq.com", "api.x.ai", "api.deepseek.com", "openrouter.ai"]);
+const MODEL_API_HOST = /(\.openai\.azure\.com|\.services\.ai\.azure\.com|-aiplatform\.googleapis\.com|^bedrock-runtime(-fips)?\.[a-z0-9-]+\.amazonaws\.com)$/;
+function isModelApi(e) {
+  const host = String(e.host || "").toLowerCase().replace(/\.$/, "");
+  return MODEL_API_HOSTS.has(host) || MODEL_API_HOST.test(host);
 }
 // MNQ-004: a sensitive action whose argument values came from untrusted content. Mirrors
 // mnestiq/findings.py. Sensitive = marked by the recorder, else guessed from the tool's name.
@@ -547,7 +555,13 @@ function derive(payload) {
           for (const link of answerLinks(ev, bad))
             ev._flags.push({ rule: "MNQ-005", finding: `${link.kind} to ${link.host} in the answer (from ${link.sources.join(",")}): ${link.url}`, taint: ev.step_id });
         }
-      } else if (taint && ev.event_type === "egress" && !isLoopback((ev.egress || [])[0] || {})) {
+        // Behind the proxy there are no tool_call events: the sensitive action the model asked for.
+        if (taint && (ev.attributes || {}).captured_by === "proxy")
+          for (const call of ev.tool_calls || [])
+            if (isSensitive(ev, call.name))
+              for (const hit of untrustedValues(call.name, call.arguments, lastContext))
+                ev._flags.push({ rule: "MNQ-004", finding: `${call.name} (requested) ← "${hit.value}" (from ${hit.sources.join(",")})`, taint: taint.step });
+      } else if (taint && ev.event_type === "egress" && !isLoopback((ev.egress || [])[0] || {}) && !isModelApi((ev.egress || [])[0] || {})) {
         const e = (ev.egress || [])[0] || {};
         ev._flags.push({ rule: "MNQ-003", finding: `${addr(e.source_ip, e.source_port)} → ${addr(e.dest_ip, e.dest_port)}`, taint: taint.step });
       } else if (taint && ev.event_type === "approval") {
@@ -758,6 +772,8 @@ function renderEvent(ev, d) {
     if (open) {
       if (ev.output) more.push(kv("Model output", content(ev.output.content, ev.output.content_hash, "content")));
       if (ev.usage) more.push(kv("Usage", `${ev.usage.input_tokens ?? "?"} in · ${ev.usage.output_tokens ?? "?"} out tokens${ev.latency_ms != null ? ` · ${ev.latency_ms} ms` : ""}`));
+      if ((ev.attributes || {}).captured_by === "proxy")
+        more.push(kv("Recorded by", "the model API proxy, outside the agent. The tool calls are what the model asked for: whether they ran is not in this record."));
     }
   } else if (t === "tool_call") {
     const tc = (ev.tool_calls || [])[0] || {};

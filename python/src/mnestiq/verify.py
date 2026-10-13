@@ -84,16 +84,34 @@ class _Keys:
 
 
 @lru_cache(maxsize=1)
-def _validator() -> Draft202012Validator:
+def _validators() -> dict[str | None, Draft202012Validator]:
+    """The whole schema (under None), and one validator per kind of record.
+
+    The schema says a record is one of an event or a checkpoint, and each requires its own ``kind``.
+    Checked as a whole, every record is checked against both. A record whose ``kind`` names one can
+    only ever match that one, so it is checked against it alone: the same verdict at about half the
+    cost, with the error a reader needs (the field that is wrong) rather than "not valid under any
+    of the given schemas". Any other record goes through the whole schema."""
     schema = json.loads(resources.files("mnestiq.schema").joinpath("record.schema.json").read_text("utf-8"))
-    return Draft202012Validator(schema)
+    out: dict[str | None, Draft202012Validator] = {None: Draft202012Validator(schema)}
+    for kind in ("event", "checkpoint"):
+        branch = {k: v for k, v in schema.items() if k != "oneOf"}
+        branch["$ref"] = f"#/$defs/{kind}"
+        out[kind] = Draft202012Validator(branch)
+    return out
+
+
+def _validator(record: Any = None) -> Draft202012Validator:
+    kind = record.get("kind") if isinstance(record, dict) else None
+    return _validators()[kind if kind in ("event", "checkpoint") else None]
 
 
 def schema_problem(record: dict, show_value: bool = True) -> str | None:
     """The first way a record breaks the schema, or None if it is valid. ``show_value=False`` names the
     field and the rule only: the message is then safe for an application log, since a schema error
     otherwise quotes the value, which can be anything the agent handled (an API key, a document)."""
-    error = best_match(_validator().iter_errors(json.loads(canonical_json(record))))
+    instance = json.loads(canonical_json(record))
+    error = best_match(_validator(instance).iter_errors(instance))
     if error is None:
         return None
     where = "/".join(map(str, error.absolute_path)) or "record"
@@ -142,7 +160,7 @@ class ChainVerifier:
         self.lines = 0  # lines read so far, blank ones included: error line numbers count on from here
 
     def feed(self, lines: Iterable[bytes | str]) -> None:
-        report, keys, validator = self.report, self.keys, _validator()
+        report, keys = self.report, self.keys
         for raw in lines:
             self.lines += 1
             line_no = self.lines
@@ -166,7 +184,7 @@ class ChainVerifier:
             report.records += 1
             seq = rec.get("seq") if isinstance(rec.get("seq"), int) else None
 
-            schema_errors = sorted(validator.iter_errors(rec), key=lambda e: list(e.absolute_path))
+            schema_errors = sorted(_validator(rec).iter_errors(rec), key=lambda e: list(e.absolute_path))
             if schema_errors:
                 for err in schema_errors[:5]:
                     where = "/".join(map(str, err.absolute_path)) or "(record)"

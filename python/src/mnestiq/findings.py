@@ -9,8 +9,8 @@ MNQ-001  untrusted argument   A tool call's arguments carry a destination or ide
                               and nowhere in the system prompt or the user's messages.
 MNQ-002  auto-approval        An action was approved without a human after untrusted
                               content reached the model in this run.
-MNQ-003  egress after taint   An outbound connection (not to loopback) after untrusted
-                              content reached the model in this run.
+MNQ-003  egress after taint   An outbound connection (not to loopback, and not the agent's
+                              own model API) after untrusted content reached the model in this run.
 MNQ-004  untrusted sensitive  A sensitive action (credentials, permissions, deletion,
          action               cancellations, changes to accounts, payments) ran with an
                               argument value that appears in untrusted content and not in
@@ -31,6 +31,10 @@ a lead to review, not a verdict.
 
 A tool is sensitive when the recorder marked it (``@recorder.tool(sensitive=True)``),
 or, when unmarked, when its name says so (``update_password``, ``delete_file``, ...).
+
+Evidence from the model API proxy (``mnestiq proxy``) has no tool_call events: it sees the model
+ask for a tool, not the tool run. There MNQ-004 looks at the tool calls the model asked for, and
+says "requested".
 """
 
 from __future__ import annotations
@@ -239,6 +243,27 @@ def answer_links(llm_call: dict) -> list[dict]:
     return hits
 
 
+# Model APIs: an agent's calls to its model are recorded as llm_call events, and the recorder leaves
+# them out of egress. Evidence from older versions or other tools may hold them: they are not
+# "egress after taint". (Data sent to a model API under someone else's key would not show here.
+# Pinning which keys and hosts an agent may use is a network control.)
+MODEL_API_HOSTS = frozenset({"api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com",
+                             "api.mistral.ai", "api.cohere.com", "api.cohere.ai", "api.groq.com", "api.x.ai",
+                             "api.deepseek.com", "openrouter.ai"})
+_MODEL_API_HOST = re.compile(r"(\.openai\.azure\.com|\.services\.ai\.azure\.com|-aiplatform\.googleapis\.com"
+                             r"|^bedrock-runtime(-fips)?\.[a-z0-9-]+\.amazonaws\.com)$")
+
+
+def is_model_api_host(host: Any) -> bool:
+    """A model provider's API host: api.openai.com, <resource>.openai.azure.com, bedrock-runtime..."""
+    name = str(host or "").lower().rstrip(".")
+    return name in MODEL_API_HOSTS or bool(_MODEL_API_HOST.search(name))
+
+
+def _is_model_api(egress: dict) -> bool:
+    return is_model_api_host(egress.get("host"))
+
+
 def _is_local(egress: dict) -> bool:
     """Loopback traffic never leaves the machine (a local model server, a sidecar): not egress. A
     request for another host sent to a proxy on this machine does leave it."""
@@ -285,7 +310,17 @@ def _one(r: dict, out: list[dict], taint: dict[str, int], context: dict[str, lis
             out.append({**base, "rule": "MNQ-005", "taint_step": r.get("step_id"),
                         "detail": f"{link['kind']} to {link['host']} in the answer (from "
                                   f"{','.join(link['sources'])}): {link['url']}"})
-    elif run_id in taint and kind == "egress" and not _is_local((r.get("egress") or [{}])[0]):
+        if run_id in taint and (r.get("attributes") or {}).get("captured_by") == "proxy":
+            # Behind the proxy, the model asking for a sensitive action is as near as the evidence
+            # gets to the action itself.
+            for call in r.get("tool_calls") or []:
+                if is_sensitive(r, call.get("name")):
+                    for hit in untrusted_values(call.get("name"), call.get("arguments"), context[run_id]):
+                        out.append({**base, "rule": "MNQ-004", "taint_step": taint[run_id],
+                                    "detail": f"{call.get('name')} (requested) <- {hit['value']!r} "
+                                              f"(from {','.join(hit['sources'])})"})
+    elif (run_id in taint and kind == "egress" and not _is_local((r.get("egress") or [{}])[0])
+          and not _is_model_api((r.get("egress") or [{}])[0])):
         e = (r.get("egress") or [{}])[0]
         out.append({**base, "rule": "MNQ-003", "taint_step": taint[run_id],
                     "detail": f"{e.get('source_ip', '?')}:{e.get('source_port', '?')} -> "

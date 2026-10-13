@@ -35,6 +35,8 @@ mnestiq:  agent=support-bot run=c7831ff7 step=6 sandbox=container:7f3a9c operato
   before handing evidence to an auditor; the chain still verifies.
 - **Drop-in SDK capture:** wraps the Anthropic and OpenAI clients (sync and async,
   Chat Completions and Responses APIs). Recording fails open: it never breaks the agent.
+- **No code changes needed:** `mnestiq proxy` records an agent's model calls from outside it,
+  whatever language or framework it is written in. Point its base URL at the proxy.
 
 ## Quick start
 
@@ -74,6 +76,18 @@ mnestiq redact evidence.jsonl evidence.redacted.jsonl
 A key file the agent can read is fine for trying it out. In production, keep the key where
 the agent can't read it: `signer=SignerClient.from_env()` with `mnestiq signer serve` running
 under another account, or `signer=AzureKeyVaultSigner(...)`. See [docs/signing.md](docs/signing.md).
+
+### Or record from outside the agent (any language)
+
+```bash
+mnestiq proxy evidence.jsonl --agent support-bot --key keys/signing.key
+export OPENAI_BASE_URL=http://127.0.0.1:8787/openai/v1      # and/or
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic
+```
+
+The agent runs unchanged. Every model call it makes is written to `evidence.jsonl`, signed.
+What the proxy can and cannot see, and how to deploy it so an agent can't go around it:
+[docs/proxy.md](docs/proxy.md).
 
 ### Or try a demo first (no API key)
 
@@ -179,13 +193,14 @@ on the [break-it kit](examples/break-it/README.md).
 v0.2 draft. Done: spec, verifier, Python recorder, Anthropic + OpenAI capture,
 egress identity propagation (httpx, requests, raw TCP), local dashboard, signing outside
 the agent (signing service, Azure Key Vault) with signed key hand-overs, heartbeats,
-RFC 3161 timestamps from public authorities, checked by the verifier.
+RFC 3161 timestamps from public authorities, checked by the verifier, and a model API proxy
+that records agents in any language from outside them.
 
 Next:
 1. External anchoring of checkpoint heads; S3 Object Lock sink.
 2. Automatic run propagation into executors (today: `run.bind`); aiohttp; subprocess egress.
 3. OpenAI Agents SDK and LangGraph capture; streaming output capture.
-4. TypeScript SDK; MCP proxy.
+4. TypeScript SDK, an MCP proxy, and an OpenTelemetry (GenAI) trace receiver.
 5. Evidence test vectors for other implementations; Merkle inclusion proofs for selective disclosure.
 
 ## Development

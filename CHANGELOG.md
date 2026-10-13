@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `mnestiq proxy`: records an agent's model calls from outside the agent, whatever language or
+  framework it is written in. Point the agent's base URL at it. It reads OpenAI Chat Completions
+  and Responses, Anthropic Messages, Azure OpenAI and OpenAI-compatible servers, and records
+  streamed answers whole. The API key passes through and is never written down. Runs are worked
+  out from a header, a trace, tool results or the conversation, and each record says which. See
+  [docs/proxy.md](docs/proxy.md).
+
+### Faster
+
+- Recording an event takes about 0.5 ms instead of 1.2 ms, and `verify` reads about 6 MB a second
+  instead of 2: each record is checked against the schema for its own kind (event or checkpoint)
+  instead of both, which gives the same verdict. An invalid record now names the field that is
+  wrong.
+
+### Detection
+
+- `MNQ-004` also covers sensitive actions the model asked for in evidence from the proxy, which
+  sees the request but not the tool run. These say "requested".
+- `MNQ-003` no longer counts an agent's calls to its own model API (OpenAI, Anthropic, Azure
+  OpenAI, Bedrock and others) as egress after taint. The recorder already leaves those out, but
+  evidence from older versions and other tools may hold them.
+
 ## 0.3.0 (2026-10-10)
 
 Upgrading is recommended for everyone: this release includes security hardening across

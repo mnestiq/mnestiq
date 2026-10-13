@@ -255,3 +255,38 @@ def test_bundled_schema_matches_spec():
     bundled = repo / "python" / "src" / "mnestiq" / "schema" / "record.schema.json"
     hint = "run: cp spec/schema/record.schema.json python/src/mnestiq/schema/"
     assert spec.read_bytes() == bundled.read_bytes(), hint
+
+
+def test_checking_a_record_against_its_own_kind_gives_the_whole_schemas_verdict(key):
+    """verify checks a record only against the kind it names (half the work). Over valid records and
+    hundreds of broken ones, the verdict must be the one the whole schema gives."""
+    from mnestiq import MemorySink, Recorder, Segment
+    from mnestiq.verify import _validator, _validators
+
+    sink = MemorySink()
+    rec = Recorder(sink, agent_id="a", signing_key=key, checkpoint_every=3)
+    with rec.run(effective_permissions={"email": "send"}) as run:
+        run.llm_call(provider="p", model="m", context=[Segment("web", "x")], output=[{"type": "text", "text": "y"}],
+                     tool_calls=[{"id": "t", "name": "send", "arguments": {"to": "a@b.example"}}],
+                     usage={"input_tokens": 3})
+        run.tool_call("send", {"to": "a@b.example"}, {"ok": True}, latency_ms=3)
+        run.approval("send", "approved", "policy", approver_type="policy")
+        run.egress({"egress_id": "e", "protocol": "tcp", "dest_ip": "203.0.113.1", "dest_port": 443})
+        run.note("hello", n=1)
+    rec.heartbeat()
+    rec.close()
+    whole = _validators()[None]
+    variants = []
+    for record in sink.records:
+        variants.append(record)
+        for field in list(record):
+            variants.append({k: v for k, v in record.items() if k != field})  # each field missing
+            for bad in (None, 7, "x", [], {}, -1, 1.5, True):
+                variants.append({**record, field: bad})  # each field of the wrong type or value
+        for kind in ("event", "checkpoint", "other", None, 3):
+            variants.append({**record, "kind": kind})  # a kind that does not match the record
+        variants.append({**record, "unexpected": 1})
+    assert len(variants) > 500
+    disagreements = [v for v in variants if _validator(v).is_valid(v) != whole.is_valid(v)]
+    assert disagreements == []
+    assert sum(whole.is_valid(v) for v in variants) > len(sink.records)  # some variants are still valid
