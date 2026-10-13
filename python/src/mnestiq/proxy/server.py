@@ -294,9 +294,10 @@ class ModelProxy:
                 conn.endheaders(body or None)
                 where = _addresses(conn)
                 return conn, conn.getresponse(), where
-            except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+            except (http.client.RemoteDisconnected, http.client.ImproperConnectionState, ConnectionResetError,
+                    BrokenPipeError):
                 conn.close()
-                if not reused or attempt == 2:  # only a kept connection the provider closed is retried
+                if not reused or attempt == 2:  # only a kept connection that turned out unusable is retried
                     raise
             except BaseException:
                 conn.close()
@@ -577,6 +578,7 @@ class _Handler(BaseHTTPRequestHandler):
                            proxy.max_capture_bytes) if api is not None else None
         error = self._relay(conn, response, capture)
         if error is None and not response.will_close:
+            response.close()  # read to the end, but Python 3.10 leaves it open and the connection unusable
             proxy._pools[up.name].put(conn)
         else:
             conn.close()
