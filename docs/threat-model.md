@@ -99,12 +99,14 @@ These are limits by design. We would rather you hear them from us.
 The findings that flag a hijack in the evidence (MNQ-001 and MNQ-004: an untrusted input that
 leads to an outbound action or a sensitive tool call) were measured on AgentDojo prompt-injection
 runs. Replaying 577 recorded hijacks, they flagged about 97%. Of 52 real hijacks of a local
-model, they caught 50. They also fire on about one in five clean runs,
-where an agent legitimately acts on data that came from outside, such as an email address in
-a customer's message. They miss attacks that need no outside destination and use only values
+model, they caught 50. They also fire on about one in five clean AgentDojo runs. Every one of
+those is a task where the user told the agent to act on data from outside ("pay the bill in this
+file", "her email is on her website"), which looks the same in the evidence as an injected
+instruction. They miss attacks that need no outside destination and use only values
 the user gave, such as persuading the user. MNQ-005, added later, flags data leaked through an
 image or a link in the model's answer. It is checked against scripted attacks, not yet measured
-at scale. Content that a tool labels trusted (`internal`) is never treated as an injection, so a
+at scale. MNQ-006 flags company data sent to an address the company has no record of, with or
+without an injection. Content that a tool labels trusted (`internal`) is never treated as an injection, so a
 tool that returns text a customer can write, such as an order note, should label it
 `tool_output`. Findings are leads for a person to triage, not verdicts.
 

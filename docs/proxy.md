@@ -88,8 +88,9 @@ It does not see:
 
 MNQ-001 (untrusted argument) and MNQ-005 (untrusted link in the answer) work on proxy evidence as
 on the recorder's. MNQ-004 (untrusted sensitive action) looks at the tool calls the model asked
-for, and says "requested". MNQ-002 and MNQ-003 need approvals and egress, which the proxy does not
-see.
+for, and says "requested". MNQ-006 (internal data to a new recipient) does the same, when the
+proxy's tool sources label some tools `internal`. MNQ-002 and MNQ-003 need approvals and egress,
+which the proxy does not see.
 
 ## Deploying it safely
 

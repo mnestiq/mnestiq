@@ -118,16 +118,17 @@ opened it. It live-updates while agents write.
 | Rule | Name | Fires when |
 |---|---|---|
 | `MNQ-001` | untrusted argument | A tool call's arguments carry an email address, URL, account number or long number that appears in untrusted content and nowhere in the system prompt or the user's messages. |
-| `MNQ-002` | auto-approval | An action was approved without a human after untrusted content reached the model. |
+| `MNQ-002` | auto-approval | An action was approved without a human after untrusted content reached the model, and the approved call carries a value from that content. A policy approving a routine reply is not a lead. |
 | `MNQ-003` | egress after taint | An outbound connection (not to loopback) followed untrusted content reaching the model. |
 | `MNQ-004` | untrusted sensitive action | A sensitive action (credentials, permissions, deletion, cancellations, account changes, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words. Mark tools with `@recorder.tool(sensitive=True)`. Unmarked tools are judged by name. |
 | `MNQ-005` | untrusted link in answer | The model's answer carries an image, or a link with data in its query, to a host that appears in untrusted content and not in the user's or system's words. An image is fetched as soon as the answer is shown, so it can carry data out with no tool call. |
+| `MNQ-006` | internal data to new recipient | A tool sent data from the company's own systems (tool output labelled `internal`) to an address or host that appears neither in those systems nor in the system prompt, such as the price list to a "new customer". No injection is needed. |
 
 `MNQ-001` is the signature of a hijack: an injected instruction has to put the attacker's
 address, account or URL into a tool call. `MNQ-004` covers hijacks with no destination, such as
 "change the password to ...", "delete file 13" or "cancel order 4100". `MNQ-005` covers leaks
 through the answer itself, such as an injected image link that carries the customer's email
-address. Findings describe what was observed, not a
+address. `MNQ-006` covers data handed to someone who simply asked for it. Findings describe what was observed, not a
 verdict: an agent that visits a link a colleague posted triggers `MNQ-001` too. The same
 rules are available in Python as `mnestiq.findings`.
 

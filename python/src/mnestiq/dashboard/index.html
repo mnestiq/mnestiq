@@ -262,10 +262,11 @@ const TYPE_COLOR = { llm_call: "--t-llm", tool_call: "--t-tool", egress: "--t-eg
 // on that page. The investigator decides which.
 const RULES = {
   "MNQ-001": { name: "untrusted argument", explain: "A tool call's arguments carry an address, URL or account number that appears in untrusted content and not in the user's or system's words." },
-  "MNQ-002": { name: "auto-approval", explain: "An action was approved without a human after untrusted content reached the model in this run." },
+  "MNQ-002": { name: "auto-approval", explain: "An action was approved without a human after untrusted content reached the model in this run, and the approved call carries a value from that content." },
   "MNQ-003": { name: "egress after taint", explain: "Outbound network connection (not to loopback, and not the agent's own model API) after untrusted content reached the model in this run." },
   "MNQ-004": { name: "untrusted sensitive action", explain: "A sensitive action (credentials, permissions, deletion, cancellations, account changes, payments, bookings) ran with an argument value that appears in untrusted content and not in the user's or system's words." },
   "MNQ-005": { name: "untrusted link in answer", explain: "The model's answer carries an image, or a link with data in it, to a host that appears in untrusted content and not in the user's or system's words. An image is fetched as soon as the answer is shown, so it can carry data out without any tool call." },
+  "MNQ-006": { name: "internal data to new recipient", explain: "A tool sent data from the company's own systems to an address or host that appears neither in those systems nor in the system prompt, such as the price list to a \"new customer\". No injection is needed for this one." },
 };
 // follow: while the newest file/run is selected, move to newer ones as agents write them.
 // MNQ-001: tool-call arguments carrying a destination or identifier (email, URL or host, account
@@ -276,6 +277,9 @@ const IND_RX = [
   /\b[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}\b/g,
 ];
 const LONG_NUM = /\+?[0-9][0-9 -]{7,}[0-9]/g;
+// An IBAN printed in groups of four: "GR96 0810 0010 0000 0123 4567 890".
+const SPACED_ACCOUNT = /\b[A-Z]{2}[0-9]{2}(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{1,3})?\b/gi;
+const ACCOUNT_SHAPE = /^[a-z]{2}[0-9]{2}[a-z0-9]{10,30}$/;
 const DATE = /[0-9]{4}-[0-9]{2}-[0-9]{2}/;  // 2024-03-07 is not a number to trace
 const SEP = /[ -]/g;
 function indicators(text) {
@@ -286,6 +290,7 @@ function indicators(text) {
   // A model may add or drop the scheme or "www." when it copies a link.
   for (const w of words) for (const m of w.matchAll(IND_RX[1])) found.add(m[0].toLowerCase().replace(/^(?:https?:\/\/)?(?:www\.)?/, "").replace(/[.,;:/]+$/, ""));
   for (const m of text.matchAll(LONG_NUM)) if (!DATE.test(m[0])) found.add(m[0].replace(SEP, ""));
+  for (const m of text.matchAll(SPACED_ACCOUNT)) found.add(m[0].replace(SEP, "").toLowerCase());
   // Keep the longest form: an email's domain or an IBAN's digits are not separate indicators.
   const all = [...found].filter((f) => f.length >= 6);
   return all.filter((f) => !all.some((g) => g !== f && g.includes(f))).sort();
@@ -294,11 +299,12 @@ const strings = (v) => (v == null ? [] : Array.isArray(v) ? v.flatMap(strings)
   : typeof v === "object" ? Object.values(v).flatMap(strings) : [String(v)]);
 function corpus(segs) {
   const text = segs.flatMap((s) => strings(s.content)).join("\n").toLowerCase();
-  return { text, compact: text.replace(/(?<=[0-9])[ -](?=[0-9])/g, "") };  // "12 34" is one number, "account 1234" is not
+  return { text, compact: text.replace(/(?<=[0-9])[ -](?=[0-9])/g, ""),  // "12 34" is one number, "account 1234" is not
+           accounts: new Set([...text.matchAll(SPACED_ACCOUNT)].map((m) => m[0].replace(SEP, ""))) };
 }
 const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // Whole matches only: "billing@acme.exam" must not count as present in "billing@acme.example".
-const inCorpus = (c, ind) => new RegExp(`(?<![a-z0-9_-])${escapeRx(ind)}(?![a-z0-9])`)
+const inCorpus = (c, ind) => (ACCOUNT_SHAPE.test(ind) && c.accounts.has(ind)) || new RegExp(`(?<![a-z0-9_-])${escapeRx(ind)}(?![a-z0-9])`)
   .test(/^[0-9]+$/.test(ind) || ind.startsWith("+") ? c.compact : c.text);
 // Loopback traffic never leaves the machine (a local model server, a sidecar): not egress. A request
 // for another host sent to a proxy on this machine does leave it.
@@ -319,7 +325,7 @@ function isModelApi(e) {
 }
 // MNQ-004: a sensitive action whose argument values came from untrusted content. Mirrors
 // mnestiq/findings.py. Sensitive = marked by the recorder, else guessed from the tool's name.
-const SENSITIVE_NAME = /password|passwd|credential|secret|token|api_?key|permission|role|grant|revoke|delete|remove|erase|reset|disable|transfer|refund|payment|send_money|pay_|schedule_transaction|update_scheduled|update_user|update_email|update_account|create_user|reserve|book_|cancel|suspend|deactivate|terminate|close_account|change_|modify_|forward|share_|invite|unsubscribe/i;
+const SENSITIVE_NAME = /password|passwd|credential|secret|token|api_?key|permission|role|grant|revoke|delete|remove|erase|reset|disable|transfer|refund|payment|send_money|pay_|schedule_transaction|update_scheduled|update_user|update_email|update_account|create_user|reserve|book_|cancel|suspend|deactivate|terminate|close_account|change_|modify_|forward|share_|invite|unsubscribe|discount|bank|iban|payout|credit|update_customer|update_supplier|update_vendor|update_payee/i;
 const DESTRUCTIVE_NAME = /delete|remove|erase|revoke|disable|cancel|suspend|deactivate|terminate/i;  // a bare id is the whole payload
 const NUMBER = /^[+-]?[0-9]+(?:\.[0-9]+)?$/;
 const DATE_ONLY = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
@@ -338,8 +344,10 @@ function untrustedValues(tool, args, context) {
   const hits = [];
   for (const value of strings(args)) {
     const v = value.trim().toLowerCase();
-    if (!v || v.length > 200 || ["true", "false", "none", "null"].includes(v) || DATE_ONLY.test(v)) continue;
-    if (NUMBER.test(v) && !destructive) continue;
+    if (v.length > 200 || ["true", "false", "none", "null"].includes(v) || DATE_ONLY.test(v)) continue;
+    // Numbers: any id for a destructive tool, else four digits up (a credit limit, not a quantity).
+    // Other values under three characters ("r" for read access) match by chance.
+    if (NUMBER.test(v) ? !destructive && v.replace(/^[+-]/, "").split(".")[0].length < 4 : v.length < 3) continue;
     const token = new RegExp(`(?<![a-z0-9])${escapeRx(v)}(?![a-z0-9])`);
     if (token.test(untrusted.text) && !token.test(trusted.text))
       hits.push({ value: value.trim(),
@@ -413,6 +421,41 @@ function untrustedArguments(ev, untrustedSegs) {
             sources: [...new Set(untrustedSegs.filter((s) => inCorpus(corpus([s]), found)).map((s) => s.source))].sort() });
       }
   return hits;
+}
+// MNQ-006: data from the company's own systems sent to an address or host they have no record of.
+// Mirrors mnestiq/findings.py.
+const SENDS = /send|mail|post|upload|share|forward|publish|webhook|message|reply|notify/;
+const DESTINATION_KEY = /^(to|cc|bcc|recipients?|emails?|address|url|endpoint|webhook|destination|target)$/i;
+const DATA_TOKEN = /[A-Za-z0-9][A-Za-z0-9._@+-]*[0-9][A-Za-z0-9._@+-]*/g;  // codes, prices, ids: holds a digit
+const MIN_CARRIED = 5;  // a reply about one order carries 2 or 3, a list many more
+function destinations(args) {
+  const named = args && typeof args === "object" && !Array.isArray(args)
+    ? Object.entries(args).filter(([k]) => DESTINATION_KEY.test(k)).map(([, v]) => v) : [];
+  return [...new Set(strings(named.length ? named : args).flatMap(indicators).filter((i) => i.includes("@") || i.includes(".")))].sort();
+}
+function internalDataOut(tool, args, context) {
+  const snake = (tool || "").replace(/(?<=[a-z0-9])(?=[A-Z])/g, "_").toLowerCase();
+  const internal = context.filter((s) => s.source === "internal");
+  if (READ_ONLY.test(snake) || !SENDS.test(snake) || !internal.length) return [];
+  const system = corpus(context.filter((s) => s.source === "system"));
+  const known = corpus([...internal, ...context.filter((s) => s.source === "system")]);
+  const fresh = destinations(args).filter((d) => !inCorpus(known, d)
+    && !domains(hostOf(d.split("@").pop())).some((dom) => inCorpus(system, dom)));  // the company's own domains
+  if (!fresh.length) return [];
+  // What only the company's systems said: not the sender's, the user's or the system prompt's words.
+  const data = corpus(internal);
+  const others = corpus(context.filter((s) => UNTRUSTED.has(s.source) || s.source === "user" || s.source === "system"));
+  const tokens = new Set(strings(args).flatMap((v) => [...v.slice(0, 20000).matchAll(DATA_TOKEN)].map((m) => m[0].toLowerCase().replace(/[.,;:]+$/, ""))));
+  for (const t of [...tokens]) if (/^[0-9]+\.[0-9]*0$/.test(t)) tokens.add(t.replace(/0+$/, "").replace(/\.$/, ""));  // 86.40 for 86.4
+  const carried = [...tokens].filter((t) => t.length >= 4 && inCorpus(data, t) && !inCorpus(others, t)).sort();
+  return carried.length < MIN_CARRIED ? [] : fresh.map((d) => ({ destination: d, carried }));
+}
+// MNQ-002 keeps quiet about routine approvals: only an approved call carrying a value from
+// untrusted content is worth a lead. Mirrors _approval_matters in findings.py.
+function approvalMatters(name, call, context) {
+  if (!call) return isSensitive({}, name);
+  return untrustedValues(name, call.arguments, context).length > 0
+    || untrustedArguments({ context, tool_calls: [call] }, context.filter((s) => UNTRUSTED.has(s.source))).length > 0;
 }
 const state = { files: [], name: null, etag: null, data: null, runId: null, focusSeq: null, open: new Set(), lastOk: 0,
   follow: { file: true, run: true } };
@@ -543,7 +586,9 @@ function derive(payload) {
   for (const run of runs.values()) {
     let taint = null;
     let lastContext = [];
-    for (const ev of run.events) {
+    const calls = [];  // [index, name, call, context]: what each approval approved
+    const approvals = [];  // [index, event, approval, taint step]
+    for (const [i, ev] of run.events.entries()) {
       ev._flags = [];
       if (ev.event_type === "llm_call") {
         lastContext = ev.context || [];
@@ -555,27 +600,40 @@ function derive(payload) {
           for (const link of answerLinks(ev, bad))
             ev._flags.push({ rule: "MNQ-005", finding: `${link.kind} to ${link.host} in the answer (from ${link.sources.join(",")}): ${link.url}`, taint: ev.step_id });
         }
-        // Behind the proxy there are no tool_call events: the sensitive action the model asked for.
-        if (taint && (ev.attributes || {}).captured_by === "proxy")
-          for (const call of ev.tool_calls || [])
-            if (isSensitive(ev, call.name))
+        // Behind the proxy there are no tool_call events: the action the model asked for.
+        if ((ev.attributes || {}).captured_by === "proxy")
+          for (const call of ev.tool_calls || []) {
+            if (taint && isSensitive(ev, call.name))
               for (const hit of untrustedValues(call.name, call.arguments, lastContext))
                 ev._flags.push({ rule: "MNQ-004", finding: `${call.name} (requested) ← "${hit.value}" (from ${hit.sources.join(",")})`, taint: taint.step });
+            for (const out of internalDataOut(call.name, call.arguments, lastContext))
+              ev._flags.push({ rule: "MNQ-006", finding: `${call.name} (requested) → ${out.destination} carrying ${out.carried.slice(0, 3).join(", ")} (from internal)`, taint: taint ? taint.step : ev.step_id });
+          }
       } else if (taint && ev.event_type === "egress" && !isLoopback((ev.egress || [])[0] || {}) && !isModelApi((ev.egress || [])[0] || {})) {
         const e = (ev.egress || [])[0] || {};
         ev._flags.push({ rule: "MNQ-003", finding: `${addr(e.source_ip, e.source_port)} → ${addr(e.dest_ip, e.dest_port)}`, taint: taint.step });
       } else if (taint && ev.event_type === "approval") {
         const a = (ev.approvals || [])[0] || {};
-        if (a.decision === "approved" && a.approver_type !== "human")
-          ev._flags.push({ rule: "MNQ-002", finding: `${a.action} by ${a.approver}`, taint: taint.step });
-      } else if (taint && ev.event_type === "tool_call") {
-        for (const call of ev.tool_calls || [])
-          if (isSensitive(ev, call.name))
+        if (a.decision === "approved" && a.approver_type !== "human") approvals.push([i, ev, a, taint.step]);
+      } else if (ev.event_type === "tool_call") {
+        for (const call of ev.tool_calls || []) {
+          calls.push([i, String(call.name || ""), call, lastContext]);
+          for (const out of internalDataOut(call.name, call.arguments, lastContext))
+            ev._flags.push({ rule: "MNQ-006", finding: `${call.name} → ${out.destination} carrying ${out.carried.slice(0, 3).join(", ")} (from internal)`, taint: taint ? taint.step : ev.step_id });
+          if (taint && isSensitive(ev, call.name))
             for (const hit of untrustedValues(call.name, call.arguments, lastContext))
               ev._flags.push({ rule: "MNQ-004", finding: `${call.name} ← "${hit.value}" (from ${hit.sources.join(",")})`, taint: taint.step });
+        }
       }
-      for (const f of ev._flags) run.flags.push({ seq: ev.seq, step: ev.step_id, ...f });
     }
+    // An approval is judged by the call it approved: the next one of that name, else the latest before it.
+    for (const [i, ev, a, step] of approvals) {
+      const same = calls.filter((c) => c[1] === String(a.action || ""));
+      const match = same.find((c) => c[0] > i) || same[same.length - 1];
+      if (match ? approvalMatters(match[1], match[2], match[3]) : approvalMatters(String(a.action || ""), null, []))
+        ev._flags.push({ rule: "MNQ-002", finding: `${a.action} by ${a.approver}`, taint: step });
+    }
+    for (const ev of run.events) for (const f of ev._flags) run.flags.push({ seq: ev.seq, step: ev.step_id, ...f });
     totals.flags += run.flags.length;
   }
 
