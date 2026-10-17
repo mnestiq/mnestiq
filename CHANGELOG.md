@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.0 (2026-10-17)
+
+### Fewer false alarms
+
+- MNQ-002 (auto-approval) now fires only when the approved call carries a value from untrusted
+  content. An inbox agent always reads an email before it replies, so every reply a policy
+  approved used to be a lead. On a normal day of 14 business emails, runs with a lead went from
+  20 of 28 to 3 of 28, and every harmful run is still flagged.
+- MNQ-004 ignores values under three characters, such as `r` for read access, which matched by
+  chance.
+
+### Catches more
+
+- MNQ-006 (internal data to new recipient): data from the company's own systems (tool output
+  labelled `internal`) sent to an address or host that appears neither in those systems nor in the
+  system prompt, such as the price list sent to a "new customer". No injection is needed.
+- An IBAN printed in groups of four ("GR96 0810 0010 ...") counts as an account number for MNQ-001.
+- MNQ-004 checks numbers of four digits or more in any sensitive action, such as a credit limit of
+  60000 or a refund of 2400. Shorter numbers still count only for destructive actions.
+- Tools named for discounts, bank details, IBANs, payouts, credit and customer, supplier, vendor or
+  payee updates count as sensitive when not marked. This matters most behind the proxy, where
+  tools cannot be marked in code.
+
 ## 0.4.0 (2026-10-14)
 
 ### Added

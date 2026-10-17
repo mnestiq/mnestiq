@@ -6,7 +6,7 @@ from .sinks import FileSink, HeadFile, MemorySink, SinkError
 from .timestamps import Timestamper, TimestampError
 from .verify import Report, verify_file, verify_lines
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 SPEC_VERSION = "0.2"
 
 __all__ = [
