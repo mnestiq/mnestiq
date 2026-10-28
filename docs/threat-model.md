@@ -46,6 +46,11 @@ removed for sharing without breaking the chain. The format is in [SPEC.md](../sp
 | Set the clock back | The signing service refuses times far from its own clock; RFC 3161 timestamps from DigiCert or Sectigo give a time nobody on the machine controls | `test_c1`, `test_c2` |
 | Move a genuine timestamp to another checkpoint | A token covers one signature only | `test_c2` |
 | Stop the recorder | Heartbeats: a gap in the file is reported, and the vault alerts while it happens | `test_d1` |
+| Recover a redacted value by hashing guesses (an amount, an email address) | Since format 1.0 each value has its own random salt, removed with the value | `test_format_v1.py::test_the_same_value_gets_a_different_digest_each_time` |
+| Cover rewritten records with a checkpoint "signed" with an algorithm the verifier doesn't know | Such records count as unsigned, and with a pinned key they are an error. A chain signed by a known key can't switch without a signed hand-over | `test_review_fixes.py::test_an_unknown_algorithm_checkpoint_cannot_hide_a_rewritten_tail` |
+| Point a model call at another call's context, or mix two files so the rules read the wrong one | The verifier checks every `context_base`, and readers look the base up by chain and run | `test_format_v1.py::test_a_wrong_base_is_an_error`, `test_review_fixes.py::test_records_of_two_chains_mixed_keep_their_own_context` |
+| A small file that makes readers copy one large context thousands of times | Carried context is budgeted, and a call cut short is marked, never shown as complete | `test_review_fixes.py::test_a_context_bomb_is_cut_off_not_expanded` |
+| A damaged or crafted file meant to crash the verifier, the rules or the dashboard | Every field of a valid file is tried with values of the wrong type: each is reported, none crashes | `test_hostile_input.py` |
 
 ## The Evidence Vault
 

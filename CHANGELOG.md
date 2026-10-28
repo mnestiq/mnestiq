@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 (not released yet)
+## 1.0.0 (2026-10-28)
 
 The evidence format is now v1.0 and stable: a change older verifiers would get wrong needs a 2.0, and
 a 1.0 verifier reads later 1.x files as far as it understands them. Files written before 1.0 still
