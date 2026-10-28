@@ -6,8 +6,22 @@ decided and did, built for incident response.
 Mnestiq records every model call, tool call, approval and outbound connection an agent
 makes, and tags each piece of model input with its origin: the user, a web page, tool output
 or another agent. Records are hash-chained and sealed with signed checkpoints. When an
-incident occurs, investigators can identify the run, the step and the input that drove it,
-and demonstrate that the record has not been altered since.
+incident occurs, investigators can identify the run and the step, see which untrusted input
+came before it, and demonstrate that the record has not been altered since.
+
+Version 1.0: the evidence format and the documented Python API are stable. A change that would
+break existing evidence, older verifiers or code using the documented API needs a 2.0.
+
+## Try it
+
+```bash
+pip install mnestiq
+mnestiq demo
+```
+
+A scripted support agent reads a poisoned web page and emails customer data out. The demo records
+it, traces a firewall connection back to the agent step, catches a tampered copy, verifies a
+redacted copy and opens the local dashboard. No API key, and nothing leaves your machine.
 
 ## Install
 
@@ -48,6 +62,19 @@ mnestiq verify evidence.jsonl --trusted-key keys/signing.pub
 mnestiq dashboard . --trusted-key keys/signing.pub
 ```
 
+## Record any agent without code changes
+
+`mnestiq proxy` sits between an agent and its model API and records every call, whatever language
+or framework the agent is written in. Point the agent's base URL at it:
+
+```bash
+mnestiq proxy evidence.jsonl --agent my-agent --key keys/signing.key
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic    # or OPENAI_BASE_URL=.../openai/v1
+```
+
+OpenAI, Anthropic, Azure OpenAI and OpenAI-compatible servers (Ollama, vLLM, LiteLLM) are supported.
+See the [proxy guide](https://github.com/mnestiq/mnestiq/blob/main/docs/proxy.md).
+
 ## Production signing
 
 A key file readable by the agent is suitable for evaluation only. In production, keep the
@@ -74,7 +101,8 @@ verifier follows. See the [signing guide](https://github.com/mnestiq/mnestiq/blo
 ## Security model
 
 Evidence is tamper-evident after it is written: edits, insertions, reordering and re-signing with
-another key are detected. Records cut from the end are detected against a head kept elsewhere
+another key are detected. Redacted values keep a salted digest, so they can't be recovered by
+guessing. Records cut from the end are detected against a head kept elsewhere
 (a HeadFile or the Evidence Vault), and backdating against RFC 3161 timestamps. It cannot prove that a compromised agent told the
 truth at the time of writing. The [threat model](https://github.com/mnestiq/mnestiq/blob/main/docs/threat-model.md)
 lists each attack considered, how it is detected, and the automated test that demonstrates it.
@@ -85,6 +113,8 @@ Independent reviewers are invited to try the
 
 - Documentation and examples: https://github.com/mnestiq/mnestiq
 - Evidence format specification: https://github.com/mnestiq/mnestiq/blob/main/spec/SPEC.md
+- Test vectors for other implementations: https://github.com/mnestiq/mnestiq/tree/main/spec/vectors
+- Installation on Windows, macOS and Linux: https://github.com/mnestiq/mnestiq/blob/main/docs/install.md
 - Changelog: https://github.com/mnestiq/mnestiq/blob/main/CHANGELOG.md
 - Security policy and vulnerability reporting: https://github.com/mnestiq/mnestiq/blob/main/SECURITY.md
 

@@ -54,6 +54,14 @@ jobs:
             echo "release tag ${GITHUB_REF_NAME} does not match package version v${version}"
             exit 1
           fi
+      - name: Changelog has a dated entry for this version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -Eq "^## ${version//./\\.} \([0-9]{4}-[0-9]{2}-[0-9]{2}\)$" ../CHANGELOG.md; then
+            echo "CHANGELOG.md has no dated heading for ${version}, such as: ## ${version} (YYYY-MM-DD)"
+            exit 1
+          fi
       - name: Build
         run: |
           python -m pip install build twine

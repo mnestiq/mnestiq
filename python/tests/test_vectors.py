@@ -9,6 +9,8 @@ import pytest
 from mnestiq.verify import verify_file
 
 VECTORS = Path(__file__).resolve().parents[2] / "spec" / "vectors"
+if not (VECTORS / "expected.json").exists():  # the source package on PyPI has no spec folder
+    pytest.skip("needs spec/vectors from the repository", allow_module_level=True)
 EXPECTED = json.loads((VECTORS / "expected.json").read_text("utf-8"))
 
 
