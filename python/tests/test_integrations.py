@@ -70,7 +70,8 @@ def test_anthropic_sync_tags_web_tool_output():
                              "params": {"max_tokens": 100, "stop_sequences": ["END"]}}
     assert call["tool_calls"] == [{"id": "toolu_2", "name": "send_email",
                                    "arguments": {"to": "evil@example.com"},
-                                   "arguments_hash": call["tool_calls"][0]["arguments_hash"]}]
+                                   "arguments_hash": call["tool_calls"][0]["arguments_hash"],
+                                   "arguments_salt": call["tool_calls"][0]["arguments_salt"]}]
     assert call["usage"] == {"input_tokens": 42, "output_tokens": 7}
     assert call["output"]["stop_reason"] == "tool_use"
     assert call["system_prompt_hash"].startswith("sha256:")
@@ -159,7 +160,8 @@ def test_openai_responses_api():
     (call,) = _events(sink, "llm_call")
     assert [s["source"] for s in call["context"]] == ["system", "user", "model", "web"]
     assert call["tool_calls"] == [{"id": "call_2", "name": "lookup", "arguments": {"q": "x"},
-                                   "arguments_hash": call["tool_calls"][0]["arguments_hash"]}]
+                                   "arguments_hash": call["tool_calls"][0]["arguments_hash"],
+                                   "arguments_salt": call["tool_calls"][0]["arguments_salt"]}]
     assert call["usage"] == {"input_tokens": 5, "output_tokens": 6}
     _assert_valid(sink)
 

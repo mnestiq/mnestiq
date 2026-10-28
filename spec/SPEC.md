@@ -1,6 +1,7 @@
-# Mnestiq Evidence Format: v0.2 (draft)
+# Mnestiq Evidence Format: v1.0
 
-Status: **draft**. Breaking changes are possible until v1.0. The machine-readable
+Status: **stable**. A change to hashing, required fields or the meaning of a field needs a new major
+version (section 9). Additions that older verifiers can ignore safely come as minor versions. The machine-readable
 definition is [`schema/record.schema.json`](schema/record.schema.json); where this
 document and the schema disagree, the schema wins for structure and this document
 wins for hashing and verification rules.
@@ -68,7 +69,7 @@ Every record has these chain fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `spec_version` | `"0.2"` | Format version (section 9). |
+| `spec_version` | `"1.0"` | Format version, `major.minor` (section 9). |
 | `kind` | `"event"` \| `"checkpoint"` | Record type. |
 | `chain_id` | string | Identifies the chain. Constant within a file. |
 | `seq` | integer | 0-based position in the chain. Contiguous. |
@@ -88,10 +89,12 @@ A *hash* is the string `sha256:` followed by 64 lowercase hex digits.
 | `step_id` | | Position of the event within its run, from 0. |
 | `agent_id` | yes | Which agent (logical identity, e.g. `support-bot`). |
 | `operator_id` | | Human or service on whose behalf the agent acts. |
+| `agent_identity` | | v1.0. The agent's identity in a directory: `provider` (e.g. `entra` for a Microsoft Entra Agent ID), at least one of `app_id` (application or client id), `object_id` (the agent identity's object id) and `id` (for a directory with one kind of identifier), and optionally `blueprint_id`, `tenant_id` and `name`. Directories log different identifiers for the same agent (Agent 365 records in Microsoft Defender's `CloudAppEvents` carry an agent's app id, Defender's `AgentsInfo` inventory its object id), so each says which it is. Joins evidence to the directory's own logs of that agent. |
 | `sandbox_id` | | Container / VM / sandbox the agent runs in. Joins to infrastructure logs. |
 | `model` | | `provider`, `name` (requested), `version` (as reported by the provider), `params` (sampling). |
 | `system_prompt_hash` | | Digest of the system prompt, for quick comparison across runs. |
-| `context[]` | | Model input segments, each with `source` (section 7), optional `role` / `name`, and redactable `content`. |
+| `context[]` | | Model input segments, each with `source` (section 7), optional `role` / `name`, and redactable `content`. With `context_base`, only the segments added since an earlier call (section 6.10). |
+| `context_base` | | v1.0. `{seq, segments}`: this call's context starts with the first `segments` segments of the full context of the `llm_call` at `seq`, followed by `context[]` (section 6.10). |
 | `output` | | Model output: redactable `content`, `stop_reason`, `response_id`. |
 | `tool_calls[]` | | In `llm_call`: calls the model requested. In `tool_call`: the executed call, with `result`, `result_source`, `error`, `latency_ms`. |
 | `approvals[]` | | `action`, `decision` (`approved`/`denied`), `approver`, `approver_type` (`human`/`policy`/`agent`), `reason`. |
@@ -108,9 +111,9 @@ up to the record immediately before it.
 |---|---|
 | `covers` | `{from_seq, to_seq}`, inclusive. `to_seq` = this `seq - 1`. Non-empty. |
 | `merkle_root` | Section 6.2, over the `record_hash` of each covered record in order. |
-| `sig_alg` | `"ed25519"`, or `"ecdsa-p256-sha256"` (ECDSA over P-256 with SHA-256, for key stores without Ed25519). |
+| `sig_alg` | `"ed25519"`, or `"ecdsa-p256-sha256"` (ECDSA over P-256 with SHA-256, for key stores without Ed25519). A later minor version may add an algorithm (section 9). |
 | `public_key` | Base64 of the raw public key: 32 bytes for Ed25519, the 65-byte uncompressed SEC1 point (`0x04` \|\| X \|\| Y) for P-256. |
-| `key_id` | `ed25519:` or `p256:`, then the first 16 hex digits of SHA-256(raw public key). |
+| `key_id` | `ed25519:` or `p256:`, then the first 16 hex digits of SHA-256(raw public key). A later algorithm uses its own prefix. |
 | `signature` | Signature over the signing payload (section 6.3), base64. Ed25519: 64 bytes. P-256: the 64 bytes r \|\| s, big-endian, with s at most n/2 (section 6.3). |
 | `next_key` | Optional. `{sig_alg, public_key, key_id}`: hands the chain over to this key (section 6.7). |
 | `timestamp_token` | Optional RFC 3161 TimeStampToken (DER, base64) whose message imprint is SHA-256 of the signature bytes. |
@@ -154,7 +157,7 @@ minimal string escaping, UTF-8 output.
 ### 5.2 Record hash
 
 1. Copy the record and remove `record_hash`.
-2. Remove the value of every redactable field (section 5.3), keeping its `*_hash`.
+2. Remove the value and the salt of every redactable field (section 5.3), keeping its `*_hash`.
 3. `record_hash = "sha256:" + hex(SHA-256(JCS(result)))`.
 
 ### 5.3 Redactable fields
@@ -166,12 +169,22 @@ minimal string escaping, UTF-8 output.
 | `tool_calls[i]` | `arguments` | `arguments_hash` |
 | `tool_calls[i]` | `result` | `result_hash` |
 
-`*_hash = "sha256:" + hex(SHA-256(JCS(value)))`. Producers MUST write the digest,
+In v1.0 every value has its own salt: `*_salt` is 16 random bytes, base64 encoded, and
+`*_hash = "sha256:" + hex(SHA-256(salt bytes || JCS(value)))`. Without a salt, a short value (an
+amount, a yes or no, an email address) could be found again from its digest by trying likely values.
+Producers MUST draw a new salt for every value. Before v1.0 the digest was
+`"sha256:" + hex(SHA-256(JCS(value)))`, with no salt, and verifiers MUST still accept it in v0.1 and
+v0.2 records.
+
+Producers MUST write the digest,
 and SHOULD write the value. A producer MAY omit a value it considers too large to
 store; it then MUST list it in the top-level `x-omitted` array (e.g.
 `"context[2].content (5242880 bytes)"`), so an omitted value is distinguishable
 from one redacted later. Anyone holding the evidence MAY later delete the value
-(leaving the digest); the chain still verifies. This allows sharing evidence with
+and its salt, leaving the digest, and the chain still verifies. Whoever redacts MUST delete the salt with the
+value, and a verifier SHOULD warn about a salt left without its value. An omitted value keeps its salt,
+so the holder of the original can still check it: a value too large to store is not one anyone could
+guess. A value disclosed later is checked with its salt, disclosed with it. This allows sharing evidence with
 a third party without disclosing prompts, customer data or tool output, while
 still letting them check the value if it is disclosed separately.
 
@@ -179,9 +192,14 @@ still letting them check the value if it is disclosed separately.
 
 ### 6.1 Chain
 
-For every record: `seq` is the previous `seq + 1` (first is 0); `prev_hash` equals
-the previous record's `record_hash`; `record_hash` recomputes per section 5.2; every
-present redactable value matches its digest; `chain_id` is constant.
+For every record:
+
+- `seq` is the previous `seq + 1` (the first is 0).
+- `prev_hash` equals the previous record's `record_hash`.
+- `record_hash` recomputes per section 5.2.
+- Every present redactable value matches its digest. In a v1.0 record, a redactable value without
+  a salt is an error.
+- `chain_id` is constant.
 
 ### 6.2 Merkle root
 
@@ -279,6 +297,23 @@ proven only from the token on). A verifier that cannot check tokens MUST say so 
 than count them as checked. Every record a timestamped checkpoint covers existed no
 later than the token's time.
 
+### 6.10 Context that records only what changed
+
+A model call usually sends the whole conversation again, so recording each call's full context makes
+a run's evidence grow with the square of its length. In v1.0 a producer MAY record only the segments
+added since an earlier call of the same run: `context_base` names that call by `seq` and says how many
+of its segments come first, and `context[]` holds the rest. The *full context* of a call is the first
+`segments` segments of the base call's full context, followed by its own `context[]`. A call without
+`context_base` is its own full context.
+
+A verifier MUST report an error unless the base is an earlier `llm_call` in the same file, of the same
+`run_id`, whose full context has at least `segments` segments. `context_base` on any other event is an
+error. Readers that analyse context (detection rules, reports) MUST work on the full context, looking the
+base up by chain and `seq`, never by `seq` alone, since records of several chains may be read together.
+A small file can point many calls at one large context, so a reader MAY limit how much context it carries
+over, and MUST then mark each call whose context it cut short rather than present it as complete. Redacting a segment of a base call redacts it in every
+call built on it, as it is one value. `context_base` MUST NOT appear in records before v1.0.
+
 ## 7. Provenance sources
 
 | Source | Trusted? | Meaning |
@@ -304,8 +339,8 @@ ticket queue is not internal, even when it is the deployer's own system.
 ## 8. Relationship to OpenTelemetry
 
 This format complements, not replaces, the OpenTelemetry GenAI semantic
-conventions. Field correspondence (informative; check the current semconv
-version):
+conventions, now kept in the open-telemetry/semantic-conventions-genai repository. Field
+correspondence (informative, check the current version there):
 
 | Evidence field | OTel GenAI attribute |
 |---|---|
@@ -324,8 +359,28 @@ permissions, redactable digests, and the hash chain with signed checkpoints.
 
 ## 9. Versioning
 
-`spec_version` changes on any change to hashing, required fields or semantics.
-Verifiers MUST reject versions they don't implement.
+`spec_version` is `major.minor`. The major version changes on any change that a verifier of the
+previous version would get wrong: hashing, signing, required fields, or the meaning of a field.
+Verifiers MUST reject a major version they don't implement.
+
+A minor version only adds what an older verifier can safely skip: a new top-level field, a new
+`event_type`, or a new signature algorithm. A verifier MUST read a record of a newer minor version of a
+major version it implements, as far as it understands it:
+
+- A field or event type it doesn't know is covered by the record hash, so it can't be changed unseen,
+  but its meaning is not checked. The verifier MUST report it as not checked.
+- A checkpoint signed with an algorithm it doesn't know proves nothing to it: the records it covers
+  MUST count as unsigned, never as valid. When the user pinned trusted keys, the verifier MUST report
+  them as an error: it cannot show that a trusted key vouches for them. A chain signed by a known key
+  moves to a key of another algorithm only by a hand-over (`next_key`) that key signed.
+
+In a record of a version the verifier implements, an unknown field or event type is an error. Fields
+of nested objects (context segments, tool calls, approvals, egress) change only with a major version.
+
+v1.0 adds salted digests (section 5.3), `context_base` (section 6.10) and `agent_identity`, and fixes
+the format: from v1.0 on, the major version changes on any change older verifiers would get wrong.
+A v1.0 verifier verifies v0.1 and v0.2 files as they are. A chain MAY move to v1.0 part-way and MUST
+NOT move back. A record before v1.0 MUST NOT carry a salt, `context_base` or `agent_identity`.
 
 v0.2 adds P-256 signatures, key hand-overs (`next_key`) and `heartbeat` events. Hashing and every v0.1
 field are unchanged, so a v0.2 verifier verifies v0.1 files as they are. A chain MAY

@@ -21,6 +21,7 @@ import os
 import secrets
 import threading
 from collections import OrderedDict, deque
+from collections.abc import Iterator
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from ..canonical import parse_json
+from ..context import expand
 from ..verify import verify_lines
 
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
@@ -110,17 +112,23 @@ class EvidenceStore:
         report = verify_lines(lines, self.trusted_keys)
         records: deque[dict] = deque(maxlen=self.max_records)
         total = 0
-        for line_no, raw in enumerate(lines, start=1):
-            if not raw.strip():
-                continue
-            total += 1
-            try:
-                rec = parse_json(raw)
-                if not isinstance(rec, dict):
-                    raise ValueError
-            except (ValueError, RecursionError):
-                rec = {"_unparseable": True, "_line": line_no, "_raw": raw[:300].decode("utf-8", "replace")}
-            records.append(rec)
+
+        def parsed() -> Iterator[dict]:
+            nonlocal total
+            for line_no, raw in enumerate(lines, start=1):
+                if not raw.strip():
+                    continue
+                total += 1
+                try:
+                    rec = parse_json(raw)
+                    if not isinstance(rec, dict):
+                        raise ValueError
+                except (ValueError, RecursionError):
+                    rec = {"_unparseable": True, "_line": line_no, "_raw": raw[:300].decode("utf-8", "replace")}
+                yield rec
+
+        # Model calls that record only what changed are shown with their full context.
+        records.extend(expand(parsed()))
         summary = {
             "name": self.name(path),
             "size": st.st_size,
@@ -167,7 +175,12 @@ def make_handler(store: EvidenceStore, port: int, key: str) -> type[BaseHTTPRequ
                 if url.path == "/":
                     return self._send(HTTPStatus.OK, page, "text/html; charset=utf-8")
                 if url.path == "/api/files":
-                    files = [store.load(p).summary for p in store.files()]
+                    files = []
+                    for p in store.files():  # one damaged or hostile file must not hide the others
+                        try:
+                            files.append(store.load(p).summary)
+                        except (OSError, ValueError, RecursionError, MemoryError):
+                            files.append({"name": store.name(p), "ok": False, "unreadable": True})
                     body = {"root": str(store.root), "pinned": bool(store.trusted_keys), "files": files}
                     return self._send(HTTPStatus.OK, json.dumps(body).encode(), "application/json")
                 if url.path == "/api/file":

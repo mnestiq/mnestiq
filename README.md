@@ -1,12 +1,20 @@
 # Mnestiq
 
-**A flight recorder for AI agents.** Tamper-evident, signed evidence of what an agent
-saw, decided and did, built for incident response rather than dashboards.
+**A flight recorder for AI agents.** It records what an agent read, decided and did, where each piece
+of its input came from, and signs the record so nobody can quietly change it later. When an agent
+does something it shouldn't, you can show exactly which run and step did it, which untrusted input came
+before it, and who or what approved it.
 
-When an agent emails the customer list to an attacker, observability traces tell you
-*that* it happened. Evidence tells you *which* run and step did it, that the
-instruction came from a web page rather than the user, that an auto-approve policy
-waved it through, and lets you prove none of that was edited after the fact.
+```bash
+pip install mnestiq
+mnestiq demo
+```
+
+The demo records a scripted support agent that reads a poisoned web page and emails customer data
+out, then investigates it: the firewall connection traced to the agent step, a tampered copy caught,
+a redacted copy for an auditor that still verifies. It ends in the dashboard. No API key, and
+everything stays on your machine. Step by step for Windows, macOS and Linux:
+[docs/install.md](docs/install.md).
 
 ```
 firewall: 10.0.4.17:53120 -> 198.51.100.9:25 (50 bytes)   [no agent identity]
@@ -17,6 +25,56 @@ mnestiq:  agent=support-bot run=c7831ff7 step=6 sandbox=container:7f3a9c operato
 ```
 
 ![Mnestiq dashboard showing a prompt-injection incident step by step](docs/dashboard.png)
+
+## Record your own agent
+
+Pick the way that fits. Each one writes the same signed evidence.
+
+**1. No code changes, any language: the proxy.** It sits between your agent and the model API.
+
+```bash
+pip install mnestiq
+mnestiq keygen --out keys
+mnestiq proxy evidence.jsonl --agent my-agent --key keys/signing.key
+```
+
+Then point the agent at it, in the agent's own terminal:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic      # Anthropic SDKs
+export OPENAI_BASE_URL=http://127.0.0.1:8787/openai/v1        # OpenAI SDKs
+```
+
+On Windows PowerShell: `$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787/anthropic"`. Azure OpenAI,
+and local models through Ollama, vLLM or LiteLLM, work too: see [docs/proxy.md](docs/proxy.md).
+
+**2. From inside your Python code**, which also sees tool calls, approvals and network connections:
+
+```python
+import anthropic
+from mnestiq import FileSink, Recorder
+from mnestiq.keys import load_private_key
+from mnestiq.integrations.anthropic import instrument_anthropic
+
+recorder = Recorder(FileSink("evidence.jsonl"), agent_id="support-bot",
+                    signing_key=load_private_key("keys/signing.key"))
+client = instrument_anthropic(anthropic.Anthropic(), recorder)
+
+with recorder.run():
+    client.messages.create(model="claude-sonnet-5-5", max_tokens=200,
+                           messages=[{"role": "user", "content": "Where is order 4711?"}])
+recorder.close()                      # signs everything written so far
+```
+
+(`pip install "mnestiq[anthropic]"`, or `mnestiq[openai]` with `instrument_openai`.) The full example
+below adds tools, their sources and network capture.
+
+**Then look at what was recorded:**
+
+```bash
+mnestiq verify evidence.jsonl --trusted-key keys/signing.pub
+mnestiq dashboard evidence.jsonl --trusted-key keys/signing.pub
+```
 
 ## What it does
 
@@ -38,7 +96,7 @@ mnestiq:  agent=support-bot run=c7831ff7 step=6 sandbox=container:7f3a9c operato
 - **No code changes needed:** `mnestiq proxy` records an agent's model calls from outside it,
   whatever language or framework it is written in. Point its base URL at the proxy.
 
-## Quick start
+## Recording in code, in full
 
 ```bash
 pip install "mnestiq[anthropic]"     # or mnestiq[openai]
@@ -77,32 +135,7 @@ A key file the agent can read is fine for trying it out. In production, keep the
 the agent can't read it: `signer=SignerClient.from_env()` with `mnestiq signer serve` running
 under another account, or `signer=AzureKeyVaultSigner(...)`. See [docs/signing.md](docs/signing.md).
 
-### Or record from outside the agent (any language)
-
-```bash
-mnestiq proxy evidence.jsonl --agent support-bot --key keys/signing.key
-export OPENAI_BASE_URL=http://127.0.0.1:8787/openai/v1      # and/or
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic
-```
-
-The agent runs unchanged. Every model call it makes is written to `evidence.jsonl`, signed.
-What the proxy can and cannot see, and how to deploy it so an agent can't go around it:
-[docs/proxy.md](docs/proxy.md).
-
-### Or try a demo first (no API key)
-
-A scripted support agent reads a poisoned web page and emails customer data out. You then
-investigate the evidence it left behind.
-
-```bash
-git clone https://github.com/mnestiq/mnestiq && cd mnestiq
-python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -e python httpx
-python examples/injection_incident.py --out evidence
-mnestiq dashboard evidence --trusted-key evidence/incident.pub
-```
-
-### Dashboard
+## Dashboard and detection rules
 
 ```bash
 mnestiq dashboard evidence/ --trusted-key keys/signing.pub
@@ -191,18 +224,23 @@ on the [break-it kit](examples/break-it/README.md).
 
 ## Status and roadmap
 
-v0.2 draft. Done: spec, verifier, Python recorder, Anthropic + OpenAI capture,
-egress identity propagation (httpx, requests, raw TCP), local dashboard, signing outside
-the agent (signing service, Azure Key Vault) with signed key hand-overs, heartbeats,
-RFC 3161 timestamps from public authorities, checked by the verifier, and a model API proxy
-that records agents in any language from outside them.
+1.0. The evidence format ([SPEC.md](spec/SPEC.md), with [test vectors](spec/vectors) for other
+implementations) and the documented Python API are stable: a change that would break existing evidence,
+older verifiers or code using the documented API needs a 2.0. Done: verifier, Python
+recorder, Anthropic and OpenAI capture, the model API proxy, egress identity (httpx, requests, raw
+TCP), the local dashboard, signing outside the agent (signing service, Azure Key Vault) with signed key
+hand-overs, heartbeats, RFC 3161 timestamps, salted redaction, and the agent's Entra Agent ID.
+
+Support: best effort through GitHub issues, and security fixes for the latest release. Report
+vulnerabilities privately ([SECURITY.md](SECURITY.md)).
 
 Next:
-1. External anchoring of checkpoint heads; S3 Object Lock sink.
-2. Automatic run propagation into executors (today: `run.bind`); aiohttp; subprocess egress.
-3. OpenAI Agents SDK and LangGraph capture; streaming output capture.
-4. TypeScript SDK, an MCP proxy, and an OpenTelemetry (GenAI) trace receiver.
-5. Evidence test vectors for other implementations; Merkle inclusion proofs for selective disclosure.
+1. A Claude Code plugin that records your coding agent.
+2. Registering checkpoints with a SCITT transparency service ([docs/standards.md](docs/standards.md)), and
+   an S3 Object Lock sink.
+3. OpenAI Agents SDK and LangGraph capture, and an OpenTelemetry (GenAI) trace receiver.
+4. Automatic run propagation into executors (today: `run.bind`), aiohttp, subprocess egress.
+5. A TypeScript SDK and an MCP proxy.
 
 ## Development
 

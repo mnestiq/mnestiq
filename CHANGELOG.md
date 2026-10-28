@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.0.0 (not released yet)
+
+The evidence format is now v1.0 and stable: a change older verifiers would get wrong needs a 2.0, and
+a 1.0 verifier reads later 1.x files as far as it understands them. Files written before 1.0 still
+verify as they are. See [spec/SPEC.md](spec/SPEC.md) section 9.
+
+### Format 1.0
+
+- **Salted digests.** Every redactable value (prompts, tool arguments and results, answers) gets its
+  own random salt, mixed into its digest. A redacted short value, such as an amount or an email
+  address, can no longer be found again by hashing guesses. `mnestiq redact` removes the salt with the
+  value, and `verify` warns about a salt left behind.
+- **Model calls record only what changed.** Most model calls send the whole conversation again. A
+  call now records the segments added since the run's previous call and points back to it
+  (`context_base`), so a long run's evidence grows with its length instead of its square. Detection
+  rules, the dashboard and `inspect` read the full context, and `mnestiq.context.expand` gives it to
+  your own code. Turn it off with `Recorder(context_delta=False)`.
+- **The agent's directory identity.** `Recorder(agent_identity={"provider": "entra", "app_id": ...,
+  "object_id": ...})`, or `MNESTIQ_ENTRA_AGENT_APP_ID` and `MNESTIQ_ENTRA_AGENT_OBJECT_ID`, puts the
+  agent's Microsoft Entra Agent ID on every event, the key that joins evidence to Microsoft's own logs
+  of that agent. Each identifier says which it is: Agent 365 records in Defender's `CloudAppEvents`
+  carry the agent's app id, Defender's `AgentsInfo` inventory its object id.
+- **Room to grow.** A later 1.x version may add top-level fields, event types and signature
+  algorithms (a post-quantum one, say). A 1.0 verifier reports what it could not check, and counts
+  records under a checkpoint it cannot verify as unsigned, never as valid.
+
+### Safer with hostile files
+
+- Every field of a file replaced with a value of the wrong type is reported, never a crash, in the
+  verifier, the context reader and the detection rules (a test now tries each one).
+- A checkpoint signed with an algorithm this version doesn't know never hides records: they count in
+  the unsigned tail, and a chain signed by a known key can move to another only by a signed hand-over.
+- Readers carry earlier context within a budget, so a small file can't make the dashboard or the rules
+  copy one large context thousands of times. A call cut short is marked `x-context-truncated`.
+- The dashboard lists the other files when one can't be read.
+
+### Added
+
+- `mnestiq demo`: records a prompt-injection incident and walks through the investigation (the
+  firewall connection traced to the agent step, a tampered copy caught, a redacted copy verified),
+  then opens the dashboard. No API key, nothing beyond `pip install mnestiq`.
+- Test vectors in [spec/vectors](spec/vectors): evidence files with the verdict each must get, and a
+  worked example of the hashing, for anyone writing a verifier in another language.
+- [docs/standards.md](docs/standards.md): how the format relates to SCITT (RFC 9943) and the agent
+  receipt drafts, and how checkpoints can be registered with a SCITT transparency service.
+
 ## 0.5.0 (2026-10-17)
 
 ### Fewer false alarms

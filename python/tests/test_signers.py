@@ -68,7 +68,7 @@ def test_p256_chain_verifies_and_pins(tmp_path):
     assert report.ok, report.errors
     records = load(path)
     assert {r["sig_alg"] for r in records if r["kind"] == "checkpoint"} == {P256}
-    assert {r["spec_version"] for r in records} == {"0.2"}
+    assert {r["spec_version"] for r in records} == {mnestiq.recorder.SPEC_VERSION}
     other = public_key_b64(generate_private_key(P256))
     assert "untrusted_key" in codes(verify_file(path, [other]))
 

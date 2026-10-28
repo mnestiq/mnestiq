@@ -1,6 +1,7 @@
 import json
 
 from mnestiq.cli import main
+from mnestiq.verify import verify_file
 
 from conftest import record_demo
 
@@ -72,3 +73,17 @@ def test_a_redacted_file_says_so_when_verified(tmp_path, key, pub):
     report = verify_file(tmp_path / "r.jsonl", [pub])
     assert report.ok and "redacted" in {w.code for w in report.warnings}
     assert "redacted" not in {w.code for w in verify_file(src, [pub]).warnings}
+
+
+def test_demo_records_and_investigates_an_incident(tmp_path, capsys):
+    out = tmp_path / "demo"
+    assert main(["demo", "--out", str(out), "--no-dashboard"]) == 0
+    said = capsys.readouterr().out
+    assert "VALID" in said and "INVALID" in said and "record_hash" in said
+    pub = (out / "incident.pub").read_text("ascii").strip()
+    assert verify_file(out / "incident.jsonl", [pub]).ok
+    assert not verify_file(out / "tampered.jsonl", [pub]).ok
+    assert verify_file(out / "redacted.jsonl", [pub]).ok
+    calls = [json.loads(line) for line in (out / "incident.jsonl").read_text("utf-8").splitlines()
+             if '"llm_call"' in line]
+    assert "context_base" in calls[1]  # the second call records only what changed

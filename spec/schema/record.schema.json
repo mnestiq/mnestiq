@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://mnestiq.com/spec/0.2/record.schema.json",
-  "title": "Mnestiq Evidence Record v0.2",
-  "description": "One line of an agent evidence chain (JSON Lines). A record is either an event or a signed checkpoint. Also validates v0.1 records.",
+  "$id": "https://mnestiq.com/spec/1.0/record.schema.json",
+  "title": "Mnestiq Evidence Record v1.0",
+  "description": "One line of an agent evidence chain (JSON Lines). A record is either an event or a signed checkpoint. Also validates v0.1 and v0.2 records.",
   "oneOf": [
     { "$ref": "#/$defs/event" },
     { "$ref": "#/$defs/checkpoint" }
@@ -11,6 +11,11 @@
     "hash": {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "salt": {
+      "description": "v1.0: 16 random bytes, base64, mixed into a redactable value's digest. Removed with the value.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]{21}[AQgw]==$"
     },
     "safeInt": {
       "type": "integer",
@@ -36,10 +41,11 @@
       }
     },
     "sigAlg": {
-      "description": "ed25519, or (v0.2) ECDSA over P-256 with SHA-256 for key stores without Ed25519.",
-      "enum": ["ed25519", "ecdsa-p256-sha256"]
+      "description": "ed25519, or (v0.2) ecdsa-p256-sha256: ECDSA over P-256 with SHA-256, for key stores without Ed25519. Open so a later minor version can add an algorithm: a verifier treats one it doesn't know as unverifiable, never as valid.",
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,64}$"
     },
-    "keyId": { "type": "string", "pattern": "^(ed25519|p256):[0-9a-f]{16}$" },
+    "keyId": { "type": "string", "pattern": "^[a-z0-9-]{1,32}:[0-9a-f]{16}$" },
     "source": {
       "description": "Provenance of a piece of model context. Anything other than system, user, internal and model is untrusted input for taint analysis (see SPEC section 7).",
       "enum": ["system", "user", "internal", "model", "tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"]
@@ -48,7 +54,7 @@
       "type": "object",
       "required": ["spec_version", "kind", "chain_id", "seq", "ts", "prev_hash", "record_hash"],
       "properties": {
-        "spec_version": { "enum": ["0.1", "0.2"] },
+        "spec_version": { "description": "0.1, 0.2, or 1.<minor>. A verifier reads a newer minor version as far as it understands it.", "type": "string", "pattern": "^(0\\.[12]|1\\.(0|[1-9][0-9]{0,3}))$" },
         "chain_id": { "type": "string", "minLength": 1, "maxLength": 128 },
         "seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
         "ts": { "$ref": "#/$defs/timestamp" },
@@ -64,7 +70,8 @@
         "role": { "type": "string" },
         "name": { "description": "Tool name, document id, URL, or agent id the segment came from.", "type": "string" },
         "content": { "description": "Redactable. Any JSON value." },
-        "content_hash": { "$ref": "#/$defs/hash" }
+        "content_hash": { "$ref": "#/$defs/hash" },
+        "content_salt": { "$ref": "#/$defs/salt" }
       },
       "additionalProperties": false
     },
@@ -76,8 +83,10 @@
         "name": { "type": "string" },
         "arguments": { "description": "Redactable." },
         "arguments_hash": { "$ref": "#/$defs/hash" },
+        "arguments_salt": { "$ref": "#/$defs/salt" },
         "result": { "description": "Redactable." },
         "result_hash": { "$ref": "#/$defs/hash" },
+        "result_salt": { "$ref": "#/$defs/salt" },
         "result_source": { "$ref": "#/$defs/source" },
         "error": { "type": ["string", "null"] },
         "latency_ms": { "$ref": "#/$defs/safeInt" }
@@ -133,7 +142,7 @@
         "ts": true,
         "prev_hash": true,
         "record_hash": true,
-        "event_type": { "enum": ["run_start", "run_end", "llm_call", "tool_call", "approval", "egress", "note", "heartbeat"] },
+        "event_type": { "description": "run_start, run_end, llm_call, tool_call, approval, egress, note or heartbeat. Open so a later minor version can add one.", "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
         "run_id": { "type": "string", "minLength": 1 },
         "parent_run_id": { "type": ["string", "null"] },
         "step_id": { "type": "integer", "minimum": 0 },
@@ -152,12 +161,39 @@
         },
         "system_prompt_hash": { "$ref": "#/$defs/hash" },
         "context": { "type": "array", "items": { "$ref": "#/$defs/contextSegment" } },
+        "context_base": {
+          "description": "v1.0: this call's context starts with the first `segments` segments of the full context of the llm_call at `seq` (same run, earlier in the chain), followed by `context`.",
+          "type": "object",
+          "required": ["seq", "segments"],
+          "properties": {
+            "seq": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            "segments": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+          },
+          "additionalProperties": false
+        },
+        "agent_identity": {
+          "description": "v1.0: the agent's identity in a directory, e.g. a Microsoft Entra Agent ID. Each identifier says what it is: an app (client) id, an object id, a blueprint id, or `id` for a directory with one kind.",
+          "type": "object",
+          "required": ["provider"],
+          "anyOf": [{ "required": ["id"] }, { "required": ["app_id"] }, { "required": ["object_id"] }],
+          "properties": {
+            "provider": { "type": "string", "minLength": 1 },
+            "id": { "type": "string", "minLength": 1 },
+            "app_id": { "type": "string", "minLength": 1 },
+            "object_id": { "type": "string", "minLength": 1 },
+            "blueprint_id": { "type": "string", "minLength": 1 },
+            "tenant_id": { "type": "string", "minLength": 1 },
+            "name": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
         "output": {
           "type": "object",
           "required": ["content_hash"],
           "properties": {
             "content": { "description": "Redactable." },
             "content_hash": { "$ref": "#/$defs/hash" },
+            "content_salt": { "$ref": "#/$defs/salt" },
             "stop_reason": { "type": ["string", "null"] },
             "response_id": { "type": ["string", "null"] }
           },
@@ -181,7 +217,7 @@
         "attributes": { "description": "Free-form producer metadata.", "type": "object" }
       },
       "patternProperties": { "^x-": true },
-      "additionalProperties": false
+      "$comment": "Open at this level so a later minor version can add a field. The verifier rejects a field it doesn't know in a record of a version it implements, and reports one in a newer minor version as not checked."
     },
     "checkpoint": {
       "allOf": [{ "$ref": "#/$defs/chainFields" }],
@@ -228,7 +264,7 @@
         }
       },
       "patternProperties": { "^x-": true },
-      "additionalProperties": false
+      "$comment": "Open at this level so a later minor version can add a field (see the event)."
     }
   }
 }
