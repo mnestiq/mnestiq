@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .canonical import canonical_json, parse_json
+from .context import expand
 from .hashing import redact
 from .keys import ED25519, SIG_ALGS, generate_private_key, key_id, load_public_key_b64, public_key_b64, save_keypair
 from .verify import verify_file
@@ -60,6 +61,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-key", action="append", default=[], metavar="KEY")
     p.add_argument("--no-open", action="store_true", help="don't open a browser")
 
+    p = sub.add_parser("demo", help="record a prompt-injection incident and investigate it (no API key)")
+    p.add_argument("--out", default="mnestiq-demo", help="folder for the evidence (default: ./mnestiq-demo)")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-dashboard", action="store_true", help="stop after the walkthrough")
+    p.add_argument("--no-open", action="store_true", help="start the dashboard without opening a browser")
+
     p = sub.add_parser("signer", help="a signing service that keeps the key away from the agent")
     signer = p.add_subparsers(dest="signer_command", required=True)
     s = signer.add_parser("init", help="create a key and an access token in a folder only the service can read")
@@ -103,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(errors="replace")  # type: ignore[union-attr]
     try:
         return {"verify": _verify, "keygen": _keygen, "inspect": _inspect, "redact": _redact,
-                "dashboard": _dashboard, "signer": _signer, "proxy": _proxy}[args.command](args)
+                "dashboard": _dashboard, "signer": _signer, "proxy": _proxy, "demo": _demo}[args.command](args)
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
@@ -255,10 +262,7 @@ def _stop_cleanly_on_signals() -> None:
 
 def _inspect(args: argparse.Namespace) -> int:
     with open(args.file, "rb") as fh:
-        for raw in fh:
-            if not raw.strip():
-                continue
-            rec = parse_json(raw)
+        for rec in expand(parse_json(raw) for raw in fh if raw.strip()):
             if args.run and rec.get("run_id") != args.run:
                 continue
             ts = rec.get("ts", {}).get("wall", "?")
@@ -314,6 +318,20 @@ def _dashboard(args: argparse.Namespace) -> int:
         raise ValueError(f"{args.path} does not exist")
     serve(args.path, trusted_keys=[load_public_key_b64(k) for k in args.trusted_key],
           port=args.port, open_browser=not args.no_open)
+    return EXIT_OK
+
+
+def _demo(args: argparse.Namespace) -> int:
+    from . import demo
+
+    result = demo.run(Path(args.out), say=_say)
+    if args.no_dashboard:
+        _say(f"\nOpen it later with: mnestiq dashboard {args.out} --trusted-key {args.out}/incident.pub")
+        return EXIT_OK
+    _say("\n== The dashboard: every step, where its input came from, and what the rules found ==")
+    from .dashboard import serve
+
+    serve(result["folder"], trusted_keys=[result["public_key"]], port=args.port, open_browser=not args.no_open)
     return EXIT_OK
 
 

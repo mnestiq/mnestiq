@@ -9,6 +9,7 @@ keys/
 *.jsonl
 !python/tests/data/*.jsonl
 !examples/break-it/*.jsonl
+!spec/vectors/*.jsonl
 evidence/
 
 .mypy_cache/

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import functools
+import hashlib
 import inspect
 import logging
 import os
@@ -25,9 +26,11 @@ from .canonical import CanonicalizationError, canonical_json
 from .hashing import (
     GENESIS_HASH,
     REDACTABLE_FIELDS,
-    digest,
+    SALT_SUFFIX,
     digest_bytes,
+    new_salt,
     record_hash,
+    salted_digest,
     signing_payload,
     value_digest,
 )
@@ -39,7 +42,7 @@ from .signers import Signer, SignerError, as_signer
 from .sinks import Sink
 from .verify import schema_problem
 
-SPEC_VERSION = "0.2"
+SPEC_VERSION = "1.0"
 _log = logging.getLogger("mnestiq")
 
 SOURCES = frozenset(
@@ -47,6 +50,7 @@ SOURCES = frozenset(
 )
 
 _MISSING = object()
+_MAX_CONTEXTS = 10_000  # runs whose last model call is kept for context_delta
 TIMESTAMP_RETRY_S = 300  # after a failed timestamp, checkpoints skip it this long
 _current_run: contextvars.ContextVar[Run | None] = contextvars.ContextVar("mnestiq_run", default=None)
 
@@ -123,6 +127,15 @@ class Recorder:
     if nothing was signed for that long, it writes a ``heartbeat`` event and signs it. A
     stopped recorder then shows as a gap in the file (``verify`` warns) and as a chain that
     went quiet wherever its checkpoints are sent.
+
+    ``context_delta`` (on by default) keeps files small for long runs: a model call whose context
+    starts with the previous call's context, as most do, records only the new segments and points
+    back to that call (``context_base``). ``mnestiq.context.expand`` puts the full context back.
+
+    ``agent_identity`` names the agent in a directory, for example its Microsoft Entra Agent ID:
+    ``{"provider": "entra", "app_id": "<app id>", "object_id": "<object id>", "tenant_id": "<tenant>"}``.
+    Every event carries it. Without it, ``MNESTIQ_ENTRA_AGENT_APP_ID``, ``MNESTIQ_ENTRA_AGENT_OBJECT_ID``,
+    ``MNESTIQ_ENTRA_BLUEPRINT_ID`` and ``MNESTIQ_ENTRA_TENANT_ID`` fill it in.
     """
 
     def __init__(
@@ -143,6 +156,8 @@ class Recorder:
         on_checkpoint: Callable[[dict], None] | None = None,
         retry_after: float = 30.0,
         checkpoint_interval: float | None = None,
+        context_delta: bool = True,
+        agent_identity: dict | None = None,
     ) -> None:
         if checkpoint_every < 1:
             raise ValueError("checkpoint_every must be >= 1")
@@ -163,6 +178,12 @@ class Recorder:
         # The NAT / gateway address the outside world sees. Not auto-detected: that
         # would mean the recorder making its own network calls.
         self.public_ip = public_ip or os.environ.get("MNESTIQ_PUBLIC_IP") or None
+        self.agent_identity = agent_identity if agent_identity is not None else _identity_from_env()
+        if self.agent_identity is not None:
+            _check_identity(self.agent_identity)  # a bad one would make every event fail the schema
+        self._context_delta = context_delta
+        # run_id -> (seq of its last recorded model call, fingerprints of that call's full context)
+        self._contexts: dict[str, tuple[int, list[bytes]]] = {}
         if signing_key is not None and signer is not None:
             raise ValueError("pass signing_key or signer, not both")
         self._signer: Signer | None = as_signer(signing_key) if signing_key is not None else signer
@@ -340,14 +361,39 @@ class Recorder:
             return dict(body)
         record = self._header("event")
         record.update({k: v for k, v in body.items() if v is not None})
+        v1 = _writes_v1()
+        if not v1:
+            record.pop("agent_identity", None)
+        remember = (v1 and self._context_delta and record.get("event_type") == "llm_call"
+                    and isinstance(record.get("context"), list))
+        if remember:
+            full = record["context"]
+            prints = [hashlib.sha256(canonical_json(seg)).digest() for seg in full]
+            known = self._contexts.get(record["run_id"])
+            if known is not None:
+                base_seq, base_prints = known
+                same = 0
+                while same < min(len(prints), len(base_prints)) and prints[same] == base_prints[same]:
+                    same += 1
+                if same:
+                    record["context_base"] = {"seq": base_seq, "segments": same}
+                    record["context"] = full[same:]
         self._hash_and_cap(record)
         self._write(record)
         self._pending.append(record["record_hash"])
+        if remember:
+            self._contexts.pop(record["run_id"], None)
+            self._contexts[record["run_id"]] = (record["seq"], prints)
+            if len(self._contexts) > _MAX_CONTEXTS:  # forget the run that went longest without a model call
+                self._contexts.pop(next(iter(self._contexts)))
+        elif record.get("event_type") == "run_end":
+            self._contexts.pop(record["run_id"], None)
         return record
 
     def _hash_and_cap(self, record: dict) -> None:
         """Set ``<field>_hash`` for redactable values and drop values over the size cap."""
         omitted = []
+        salted = _writes_v1()
         for container_key, field in REDACTABLE_FIELDS:
             container = record.get(container_key)
             objects = container if isinstance(container, list) else [container]
@@ -355,8 +401,15 @@ class Recorder:
                 if not isinstance(obj, dict) or field not in obj:
                     continue
                 encoded = canonical_json(obj[field])
-                obj[f"{field}_hash"] = digest(encoded)
+                if salted:
+                    salt = new_salt()
+                    obj[field + SALT_SUFFIX] = salt
+                    obj[f"{field}_hash"] = salted_digest(salt, obj[field])
+                else:
+                    obj[f"{field}_hash"] = value_digest(obj[field])
                 if len(encoded) > self.max_content_bytes:
+                    # The salt stays: whoever holds the original can still check it against the digest,
+                    # and a value this large can't be found by guessing.
                     del obj[field]
                     where = f"{container_key}[{i}]" if isinstance(container, list) else container_key
                     omitted.append(f"{where}.{field} ({len(encoded)} bytes)")
@@ -690,6 +743,7 @@ class Run:
             "agent_id": self.agent_id,
             "operator_id": self.operator_id,
             "sandbox_id": self.recorder.sandbox_id,
+            "agent_identity": self.recorder.agent_identity,
         }
         body.update(fields)
         try:
@@ -801,3 +855,38 @@ def _tool_call_dict(tc: dict) -> dict:
     if "result" in tc:
         out["result"] = to_jsonable(tc["result"])
     return out
+
+
+_IDENTITY_FIELDS = frozenset({"provider", "id", "app_id", "object_id", "blueprint_id", "tenant_id", "name"})
+
+
+def _check_identity(identity: Any) -> None:
+    if not isinstance(identity, dict):
+        raise ValueError("agent_identity must be a dict")
+    unknown = sorted(set(identity) - _IDENTITY_FIELDS)
+    if unknown:
+        raise ValueError(f"agent_identity has unknown field(s) {', '.join(unknown)}; "
+                         f"expected {', '.join(sorted(_IDENTITY_FIELDS))}")
+    if not isinstance(identity.get("provider"), str) or not identity["provider"]:
+        raise ValueError("agent_identity needs a provider, such as \"entra\"")
+    if not any(isinstance(identity.get(k), str) and identity[k] for k in ("id", "app_id", "object_id")):
+        raise ValueError("agent_identity needs at least one of id, app_id or object_id")
+    if not all(isinstance(v, str) for v in identity.values()):
+        raise ValueError("agent_identity values must be strings")
+
+
+def _writes_v1() -> bool:
+    """Whether this recorder writes spec 1.0 records (salted digests, context_base, agent_identity)."""
+    return SPEC_VERSION not in ("0.1", "0.2")
+
+
+_ENTRA_ENV = {"app_id": "MNESTIQ_ENTRA_AGENT_APP_ID", "object_id": "MNESTIQ_ENTRA_AGENT_OBJECT_ID",
+              "blueprint_id": "MNESTIQ_ENTRA_BLUEPRINT_ID", "tenant_id": "MNESTIQ_ENTRA_TENANT_ID"}
+
+
+def _identity_from_env() -> dict | None:
+    """The agent's Entra Agent ID from the environment: its app id or object id at least."""
+    found = {field: os.environ[name] for field, name in _ENTRA_ENV.items() if os.environ.get(name)}
+    if not ({"app_id", "object_id"} & found.keys()):
+        return None
+    return {"provider": "entra", **found}

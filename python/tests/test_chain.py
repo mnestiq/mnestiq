@@ -6,7 +6,7 @@ import pytest
 from mnestiq import FileSink, MemorySink, Recorder, Segment, verify_file, verify_lines
 from mnestiq.canonical import canonical_json
 from mnestiq.cli import main
-from mnestiq.hashing import digest_bytes, record_hash, redact, signing_payload, value_digest
+from mnestiq.hashing import digest_bytes, record_hash, redact, signing_payload, slot_digest
 from mnestiq.keys import generate_private_key, key_id, public_key_b64
 from mnestiq.merkle import merkle_root
 
@@ -96,7 +96,7 @@ def test_edit_content_and_its_digest_detected(tmp_path, key, pub):
     i = _find(records, "tool_call")
     tc = records[i]["tool_calls"][0]
     tc["result"] = "harmless page"
-    tc["result_hash"] = value_digest(tc["result"])
+    tc["result_hash"] = slot_digest(tc, "result")  # recomputed with the record's own salt, as an attacker could
     dump(path, records)
     assert codes(verify_file(path, [pub])) == {"record_hash"}
 

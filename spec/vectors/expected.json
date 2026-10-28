@@ -1,0 +1,100 @@
+{
+  "spec_version": "1.0",
+  "trusted_key": "A+eaJp6Rn1ixqhYt0Iotd8lZn2xJw2924hNdHiiQaP4=",
+  "trusted_key_id": "ed25519:2bd07145a1ffd794",
+  "vectors": {
+    "valid.jsonl": {
+      "about": "A complete signed chain. The second model call records only what changed.",
+      "ok": true,
+      "errors": [],
+      "warnings": []
+    },
+    "redacted.jsonl": {
+      "about": "Every redactable value removed with its salt. Still verifies.",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "redacted"
+      ]
+    },
+    "edited-content.jsonl": {
+      "about": "A tool result edited after the fact, its digest left as it was.",
+      "ok": false,
+      "errors": [
+        "content_hash"
+      ],
+      "warnings": []
+    },
+    "edited-record.jsonl": {
+      "about": "An approval rewritten to blame a person, record_hash left as it was.",
+      "ok": false,
+      "errors": [
+        "record_hash"
+      ],
+      "warnings": []
+    },
+    "rewritten-chain.jsonl": {
+      "about": "The same edit with every hash recomputed: the signed Merkle root no longer matches, and the signature no longer covers the new link.",
+      "ok": false,
+      "errors": [
+        "merkle_root",
+        "signature"
+      ],
+      "warnings": []
+    },
+    "deleted-record.jsonl": {
+      "about": "The tool call that sent the email removed.",
+      "ok": false,
+      "errors": [
+        "link",
+        "merkle_root",
+        "seq"
+      ],
+      "warnings": []
+    },
+    "bad-context-base.jsonl": {
+      "about": "A model call that points back to a record that is not a model call. Signed, so only the base is wrong.",
+      "ok": false,
+      "errors": [
+        "context_base"
+      ],
+      "warnings": []
+    },
+    "missing-salt.jsonl": {
+      "about": "A 1.0 value with an unsalted digest, which could be guessed.",
+      "ok": false,
+      "errors": [
+        "salt"
+      ],
+      "warnings": []
+    },
+    "other-key.jsonl": {
+      "about": "A consistent chain signed by a key that is not pinned.",
+      "ok": false,
+      "errors": [
+        "untrusted_key"
+      ],
+      "warnings": []
+    },
+    "newer-minor.jsonl": {
+      "about": "Written by a later minor version (1.1) with a field 1.0 doesn't know. Verifies, with the field reported as not checked.",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "newer_version"
+      ]
+    }
+  },
+  "worked_example": {
+    "record_seq": 1,
+    "salted_digest": {
+      "salt_base64": "bB4y2t4l3U+6KeAgcCiXkQ==",
+      "value_jcs": "\"Where is my order 4711?\"",
+      "digest": "sha256:cc727194f447d2fdde3fa56abe11d42c84d7b591d8f5217e6f0427161251ccbb",
+      "rule": "sha256(base64decode(salt) || JCS(value))"
+    },
+    "hashed_form_jcs": "{\"agent_id\":\"support-bot\",\"agent_identity\":{\"app_id\":\"00000000-0000-4000-8000-000000000001\",\"object_id\":\"00000000-0000-4000-8000-000000000002\",\"provider\":\"entra\",\"tenant_id\":\"contoso.example\"},\"chain_id\":\"vectors-1.0\",\"context\":[{\"content_hash\":\"sha256:125a5b0cdecb085bbd60458323ee60d98e7360e113220e658ef1e51644841911\",\"source\":\"system\"},{\"content_hash\":\"sha256:cc727194f447d2fdde3fa56abe11d42c84d7b591d8f5217e6f0427161251ccbb\",\"source\":\"user\"}],\"event_type\":\"llm_call\",\"kind\":\"event\",\"model\":{\"name\":\"m\",\"provider\":\"anthropic\"},\"operator_id\":\"helpdesk\",\"output\":{\"content_hash\":\"sha256:00415629db9c14f86b450ec8d156c45e0b202fa99b2d5c98c130ba245892e9d1\",\"stop_reason\":\"tool_use\"},\"prev_hash\":\"sha256:0f3126bd62923997fff7a7c4ab08d5c0c0b0d366ace2e8dab9cc98cc5d401e96\",\"run_id\":\"run-a\",\"sandbox_id\":\"container:7f3a9c\",\"seq\":1,\"spec_version\":\"1.0\",\"step_id\":1,\"tool_calls\":[{\"arguments_hash\":\"sha256:9ca7b3d72657c8e1a73c74a16ab49a67d645fd90536d5c1fdfba447fdd55d739\",\"id\":\"c1\",\"name\":\"fetch_page\"}],\"ts\":{\"mono_us\":2000000,\"wall\":\"2026-10-26T12:00:01.000000Z\"}}",
+    "record_hash": "sha256:03d147e9236448ecdea7bfa3f6245b091e3ec5fe13908908763d7071d45c1870",
+    "rule": "record_hash = sha256(JCS(record without record_hash, without every redactable value and salt))"
+  }
+}

@@ -6,6 +6,7 @@ import base64
 import copy
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -21,13 +22,14 @@ from jsonschema.exceptions import best_match
 from .canonical import CanonicalizationError, canonical_json, parse_json
 from .hashing import (
     GENESIS_HASH,
+    SALT_SUFFIX,
     digest_bytes,
-    iter_redactable,
+    iter_redactable_paths,
     record_hash,
     signing_payload,
-    value_digest,
+    slot_digest,
 )
-from .keys import ED25519, key_id, verify_signature
+from .keys import ED25519, SIG_ALGS, key_id, verify_signature
 from .merkle import merkle_root
 
 if TYPE_CHECKING:
@@ -70,7 +72,42 @@ class Report:
         return asdict(self)
 
 
-SUPPORTED_VERSIONS = ("0.1", "0.2")
+SUPPORTED_VERSIONS = ("0.1", "0.2", "1.0")  # the versions this verifier implements in full
+EVENT_TYPES = frozenset({"run_start", "run_end", "llm_call", "tool_call", "approval", "egress", "note", "heartbeat"})
+
+
+def version_key(version: Any) -> tuple[int, int] | None:
+    """(major, minor) of a version this verifier can read: 0.1, 0.2 and any 1.x. A newer minor version
+    of 1 adds only what older verifiers can skip, so it is read as far as this verifier understands it."""
+    if version in ("0.1", "0.2"):
+        return (0, int(version[2]))
+    if isinstance(version, str) and _MINOR.fullmatch(version):
+        return (1, int(version[2:]))
+    return None
+
+
+_MINOR = re.compile(r"1\.(0|[1-9][0-9]{0,3})")
+
+
+def _unknown_fields(rec: dict) -> list[str]:
+    """Top-level fields, and an event type, that this verifier's version does not define."""
+    kind = rec.get("kind")
+    if kind not in ("event", "checkpoint"):
+        return []
+    unknown = sorted(k for k in rec if not k.startswith("x-") and k not in known_fields()[kind])
+    event_type = rec.get("event_type")
+    if kind == "event" and isinstance(event_type, str) and event_type not in EVENT_TYPES:
+        unknown.append(f"event_type {event_type}")
+    return unknown
+
+
+@lru_cache(maxsize=1)
+def known_fields() -> dict[str, frozenset[str]]:
+    """The top-level fields of each kind of record, as this verifier's schema defines them."""
+    schema = json.loads(resources.files("mnestiq.schema").joinpath("record.schema.json").read_text("utf-8"))
+    defs = schema["$defs"]
+    chain = set(defs["chainFields"]["properties"])
+    return {kind: frozenset(chain | set(defs[kind]["properties"])) for kind in ("event", "checkpoint")}
 
 
 @dataclass
@@ -113,7 +150,10 @@ def schema_problem(record: dict, show_value: bool = True) -> str | None:
     instance = json.loads(canonical_json(record))
     error = best_match(_validator(instance).iter_errors(instance))
     if error is None:
-        return None
+        # The schema leaves room for what later minor versions add. A record of a version this verifier
+        # implements may hold only what that version defines.
+        unknown = _unknown_fields(instance) if (version_key(instance.get("spec_version")) or (9, 9)) <= (1, 0) else []
+        return f"unknown field(s): {', '.join(unknown)}" if unknown else None
     where = "/".join(map(str, error.absolute_path)) or "record"
     if show_value:
         return f"{where}: {error.message}"
@@ -157,6 +197,11 @@ class ChainVerifier:
         self.last_seq: int | None = None
         self.last_wall: str | None = None
         self.heartbeat_s: float | None = None  # set once the chain has heartbeats on
+        self.model_calls: dict[int, tuple[Any, int]] = {}  # seq -> (run_id, full context length), for context_base
+        self.not_checked: set[str] = set()  # fields and kinds of a newer minor version this verifier doesn't know
+        self.newest: str | None = None  # the newest minor version seen, when newer than this verifier's
+        self.unverifiable = 0  # records covered only by checkpoints signed with an algorithm this verifier lacks
+        self.unverified_tail = 0  # of those, the ones after the last checkpoint this verifier could check
         self.lines = 0  # lines read so far, blank ones included: error line numbers count on from here
 
     def feed(self, lines: Iterable[bytes | str]) -> None:
@@ -194,13 +239,17 @@ class ChainVerifier:
 
             # A chain may move to a newer version (a recorder upgraded mid-chain), never back.
             record_version = rec.get("spec_version")
-            if record_version in SUPPORTED_VERSIONS:
-                if self.version is not None and \
-                        SUPPORTED_VERSIONS.index(record_version) < SUPPORTED_VERSIONS.index(self.version):
+            vkey = version_key(record_version)
+            if vkey is not None:
+                if self.version is not None and vkey < (version_key(self.version) or (0, 0)):
                     report.error("spec_version", f"spec_version went back from {self.version} to {record_version}",
                                  line_no, seq)
                 else:
                     self.version = record_version
+            newer = vkey is not None and vkey > (1, 0)
+            if vkey is not None and newer and (self.newest is None or vkey > (version_key(self.newest) or (0, 0))):
+                self.newest = record_version
+            self._check_fields(rec, newer, report, line_no, seq)
 
             # Chain identity and ordering.
             if report.chain_id is None:
@@ -227,12 +276,21 @@ class ChainVerifier:
             # Link onward from the *stored* hash so one tampered record yields one error, not a cascade.
             self.prev_hash = stored
 
-            # Redactable content must match its committed digest when present.
-            for obj, fld in iter_redactable(rec):
+            # Redactable content must match its committed digest when present. Since 1.0 every value
+            # has its own salt, so a short value can't be found again from its digest by guessing.
+            v1 = vkey is None or vkey >= (1, 0)
+            omitted = {str(o).split(" (")[0] for o in rec.get("x-omitted") or [] if isinstance(o, str)}
+            for obj, fld, path in iter_redactable_paths(rec):
                 committed = obj.get(f"{fld}_hash")
+                has_salt = fld + SALT_SUFFIX in obj
+                if has_salt and not v1:
+                    report.error("spec_version", f"{fld}{SALT_SUFFIX} needs spec_version 1.0", line_no, seq)
                 if fld in obj:
+                    if v1 and not has_salt:
+                        report.error("salt", f"{fld} has no {fld}{SALT_SUFFIX}: its digest could be guessed",
+                                     line_no, seq)
                     try:
-                        ok = committed == value_digest(obj[fld])
+                        ok = committed == slot_digest(obj, fld)
                     except (CanonicalizationError, ValueError, RecursionError):
                         ok = False
                     if not ok:
@@ -242,8 +300,18 @@ class ChainVerifier:
                     report.error("content_hash", f"{fld}_hash missing", line_no, seq)
                 else:
                     self.redacted += 1
+                    if has_salt and path not in omitted:
+                        report.warn("salt", f"{path} was redacted but its salt was kept, so its digest can be "
+                                            "checked against guesses. Remove the salt too", line_no, seq)
+            if rec.get("event_type") == "llm_call" and seq is not None:
+                self._check_context_base(rec, v1, report, line_no, seq)
+            elif "context_base" in rec:
+                report.error("context_base", "context_base belongs to model calls (llm_call) only", line_no, seq)
+            if "agent_identity" in rec and not v1:
+                report.error("spec_version", "agent_identity needs spec_version 1.0", line_no, seq)
 
-            wall = (rec.get("ts") or {}).get("wall")
+            ts = rec.get("ts")
+            wall = ts.get("wall") if isinstance(ts, dict) else None
             if isinstance(wall, str):
                 if self.last_wall is not None and wall < self.last_wall:
                     report.warn("clock", f"wall clock went backwards ({self.last_wall} -> {wall})", line_no, seq)
@@ -260,21 +328,84 @@ class ChainVerifier:
             if seq is not None:
                 self.last_seq = seq
             if rec.get("kind") == "checkpoint":
-                report.checkpoints += 1
-                _check_checkpoint(rec, self.pending, keys, report, line_no, seq)
+                if newer and rec.get("sig_alg") not in SIG_ALGS:
+                    # A later minor version may sign with an algorithm this verifier lacks: what it covers
+                    # counts as unsigned here, never as valid, and stays in the unsigned tail.
+                    _check_range(rec, self.pending, report, line_no, seq)
+                    _check_unknown_signer(rec, keys, report, line_no, seq)
+                    self.not_checked.add(f"signatures with {rec.get('sig_alg')}")
+                    self.unverifiable += len(self.pending)
+                    self.unverified_tail += len(self.pending)
+                else:
+                    report.checkpoints += 1
+                    _check_checkpoint(rec, self.pending, keys, report, line_no, seq, newer)
+                    self.unverified_tail = 0
+                    if seq is not None:
+                        report.signed_through_seq = seq
                 if seq is not None:
-                    report.signed_through_seq = seq
                     self.checkpoint_hashes[seq] = stored
                 self.pending = []
             else:
                 report.events += 1
                 self.pending.append((seq if seq is not None else -1, stored))
 
+    def _check_fields(self, rec: dict, newer: bool, report: Report, line_no: int, seq: int | None) -> None:
+        """A field or event type this verifier doesn't know is an error in a version it implements. In a
+        newer minor version it is covered by the record hash but not checked, and the report says so."""
+        unknown = _unknown_fields(rec)
+        if not unknown:
+            return
+        if newer:
+            self.not_checked.update(unknown)
+        else:
+            report.error("schema", f"unknown field(s) for spec_version {rec.get('spec_version')}: "
+                                   f"{', '.join(unknown)}", line_no, seq)
+
+    def _check_context_base(self, rec: dict, v1: bool, report: Report, line_no: int, seq: int) -> None:
+        """A call that records only what changed must point back to an earlier model call of the same run
+        that had at least that many segments. Every such call is noted so later ones can point to it."""
+        context = rec.get("context")
+        own = len(context) if isinstance(context, list) else 0
+        base = rec.get("context_base")
+        carried = 0
+        if base is not None:
+            base_seq, segments = (base.get("seq"), base.get("segments")) if isinstance(base, dict) else (None, None)
+            known = self.model_calls.get(base_seq) if isinstance(base_seq, int) else None
+            if not v1:
+                report.error("spec_version", "context_base needs spec_version 1.0", line_no, seq)
+            elif not isinstance(base_seq, int) or base_seq >= seq:
+                report.error("context_base", "context_base must point to an earlier record", line_no, seq)
+            elif known is None:
+                report.error("context_base", f"context_base points to seq {base_seq}, which is not a model call "
+                                             "in this file", line_no, seq)
+            elif known[0] != rec.get("run_id"):
+                report.error("context_base", f"context_base points to seq {base_seq}, a model call of another run",
+                             line_no, seq)
+            elif not isinstance(segments, int) or segments > known[1]:
+                report.error("context_base", f"context_base takes {segments} segments from seq {base_seq}, which "
+                                             f"had {known[1]}", line_no, seq)
+            else:
+                carried = segments
+        self.model_calls[seq] = (rec.get("run_id"), carried + own)
+
     def result(self, head: dict | None = None) -> Report:
         """The report for the lines fed so far. Feeding can go on afterwards: the verifier keeps its own
         state, and each result is a separate copy."""
         report = copy.deepcopy(self.report)
-        report.unsigned_tail = len(self.pending)
+        report.unsigned_tail = len(self.pending) + self.unverified_tail
+        if self.not_checked:
+            report.warn("newer_version", f"written by a newer minor version ({self.newest or 'later than 1.0'}): "
+                                         f"not checked by this verifier: {', '.join(sorted(self.not_checked))}. "
+                                         "Upgrade mnestiq to check them")
+        if self.unverifiable and self.pins:
+            # The user asked for proof by a trusted key, and this verifier cannot give it for these records:
+            # that is a failure to verify, not a detail, whatever newer version wrote them.
+            report.error("unverifiable", f"{self.unverifiable} record(s) are covered only by checkpoints signed with "
+                                         "an algorithm this verifier cannot check, so the trusted key does not vouch "
+                                         "for them here. Upgrade mnestiq to verify them")
+        elif self.unverifiable:
+            report.warn("unverifiable", f"{self.unverifiable} record(s) are covered only by checkpoints this verifier "
+                                        "cannot check, so they count as unsigned")
         if self.redacted:  # still verifies, by design: but the content, and what rules find in it, is gone
             report.warn("redacted", f"{self.redacted} field(s) are redacted: their content cannot be checked, and "
                                     "detection rules cannot see it")
@@ -287,9 +418,10 @@ class ChainVerifier:
         elif report.checkpoints == 0:
             report.warn("unsigned", "chain has no signed checkpoints. The hash chain alone does not stop someone "
                                     "from rewriting the entire file consistently")
-        elif self.pending:
-            report.warn("unsigned_tail", f"{len(self.pending)} record(s) after the last checkpoint are not signed; "
-                                         "deletion of trailing records cannot be detected")
+        elif report.unsigned_tail:
+            report.warn("unsigned_tail", f"{report.unsigned_tail} record(s) after the last checkpoint this verifier "
+                                         "could check are not signed. Changes to them, and deletion of trailing "
+                                         "records, cannot be detected")
         if report.checkpoints and not self.pins:
             report.warn("untrusted_key", "no --trusted-key given; signatures prove internal consistency only, "
                                          "not who signed. Pin the recorder's public key.")
@@ -329,12 +461,14 @@ def _check_head(head: Any, report: Report, checkpoint_hashes: dict[int, str | No
         report.head_seq = seq
 
 
-def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _Keys,
-                      report: Report, line_no: int, seq: int | None) -> None:
-    covers = rec.get("covers") or {}
+def _check_range(rec: dict, pending: list[tuple[int, str | None]], report: Report, line_no: int,
+                 seq: int | None) -> bool:
+    """The checkpoint covers exactly the records since the last one, and its Merkle root matches them."""
+    raw_covers = rec.get("covers")
+    covers: dict = raw_covers if isinstance(raw_covers, dict) else {}
     if not pending:
         report.error("checkpoint_range", "checkpoint covers no records", line_no, seq)
-        return
+        return False
     want_from, want_to = pending[0][0], pending[-1][0]
     if covers.get("from_seq") != want_from or covers.get("to_seq") != want_to:
         report.error("checkpoint_range",
@@ -346,7 +480,40 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _K
         root = None
     if root != rec.get("merkle_root"):
         report.error("merkle_root", "merkle_root does not match the covered records", line_no, seq)
+    return True
 
+
+def _check_unknown_signer(rec: dict, keys: _Keys, report: Report, line_no: int, seq: int | None) -> None:
+    """A checkpoint signed with an algorithm this verifier lacks must still be by the key the chain expects:
+    a chain signed by a known key moves to another only by a hand-over (next_key) that key signed."""
+    full = _generic_id(rec.get("key_id"), rec.get("public_key"))
+    if full is None:
+        report.error("signature", "key_id does not match public_key", line_no, seq)
+        return
+    if keys.expected is not None and full != keys.expected:
+        report.error("signer_changed", f"checkpoint signed with {rec.get('sig_alg')} by {rec.get('key_id')}, but the "
+                                       f"chain is signed by {_short(keys.expected)} and no checkpoint handed it "
+                                       "over (next_key)", line_no, seq)
+    keys.expected = full
+
+
+def _generic_id(kid: Any, public_b64: Any) -> str | None:
+    """The whole-key id of a key of any algorithm, from its key_id prefix and the SHA-256 of its raw bytes,
+    when the key_id matches the key. The same form as ``_full_id`` for the algorithms this verifier knows."""
+    if not isinstance(kid, str) or not isinstance(public_b64, str) or kid.count(":") != 1:
+        return None
+    try:
+        digest = hashlib.sha256(base64.b64decode(public_b64, validate=True)).hexdigest()
+    except ValueError:
+        return None
+    prefix, short = kid.split(":")
+    return f"{prefix}:{digest}" if short == digest[:16] else None
+
+
+def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _Keys,
+                      report: Report, line_no: int, seq: int | None, newer: bool = False) -> None:
+    if not _check_range(rec, pending, report, line_no, seq):
+        return
     pub = str(rec.get("public_key") or "")
     sig_alg = rec.get("sig_alg")
     v01 = rec.get("spec_version") == "0.1"
@@ -362,9 +529,9 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _K
     full = _full_id(pub)  # trust is decided on the whole key: a 64-bit key_id could be matched by another key
     signed = True
     try:
-        verify_signature(str(sig_alg), pub, base64.b64decode(rec.get("signature", ""), validate=True),
+        verify_signature(str(sig_alg), pub, base64.b64decode(str(rec.get("signature", "")), validate=True),
                          signing_payload(rec))
-    except (InvalidSignature, ValueError):
+    except (InvalidSignature, ValueError, TypeError):
         signed = False
         report.error("signature", "checkpoint signature is invalid", line_no, seq)
     if kid not in report.signer_keys:
@@ -382,7 +549,17 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _K
     keys.expected = full
 
     nxt = rec.get("next_key")
-    if isinstance(nxt, dict):
+    if isinstance(nxt, dict) and newer and nxt.get("sig_alg") not in SIG_ALGS:
+        # A hand-over to an algorithm a later minor version added: checked by its key_id alone.
+        next_full = _generic_id(nxt.get("key_id"), nxt.get("public_key"))
+        if next_full is None:
+            report.error("next_key", "next_key is not a valid key (key_id must match public_key)", line_no, seq)
+        elif signed:
+            keys.expected = next_full
+            report.rotations.append({"seq": seq, "from_key": kid, "to_key": nxt.get("key_id")})
+            if full in keys.trusted:
+                keys.trusted.add(next_full)
+    elif isinstance(nxt, dict):
         try:
             next_kid = key_id(str(nxt.get("public_key") or ""))
         except (ValueError, KeyError):
@@ -417,8 +594,8 @@ def _check_timestamp(rec: dict, keys: _Keys, report: Report, line_no: int, seq: 
 
     try:
         roots = keys.tsa_roots if keys.tsa_roots is not None else default_roots()
-        when = verify_token(base64.b64decode(rec["timestamp_token"], validate=True),
-                            base64.b64decode(rec.get("signature", ""), validate=True), roots)
+        when = verify_token(base64.b64decode(str(rec["timestamp_token"]), validate=True),
+                            base64.b64decode(str(rec.get("signature", "")), validate=True), roots)
     except TimestampError as exc:
         if "pip install" in str(exc):
             report.warn("timestamp_unverified", f"RFC 3161 timestamp token not checked: {exc}", line_no, seq)

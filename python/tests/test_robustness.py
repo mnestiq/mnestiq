@@ -9,7 +9,7 @@ import warnings
 import pytest
 
 from mnestiq import FileSink, MemorySink, Recorder, RecorderError, Segment, SinkError, current_run, verify_file
-from mnestiq.hashing import value_digest
+from mnestiq.hashing import salted_digest
 
 from conftest import load
 
@@ -150,7 +150,9 @@ def test_oversized_content_is_hashed_not_stored(tmp_path):
         run.tool_call("dump", {"q": 1}, big)
     events = _events(path)
     llm = next(e for e in events if e["event_type"] == "llm_call")
-    assert "content" not in llm["context"][1] and llm["context"][1]["content_hash"] == value_digest(big)
+    omitted = llm["context"][1]
+    # The salt stays, so whoever holds the original can still check it.
+    assert "content" not in omitted and omitted["content_hash"] == salted_digest(omitted["content_salt"], big)
     assert llm["context"][0]["content"] == "small"
     assert llm["x-omitted"] == ["context[1].content (5002 bytes)"]
     tool = next(e for e in events if e["event_type"] == "tool_call")

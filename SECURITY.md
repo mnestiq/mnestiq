@@ -11,6 +11,11 @@ Include what you found, how to reproduce it, and the version affected. You will 
 acknowledgement within a few days, and we will agree on a disclosure date once a fix is
 ready.
 
+## Supported versions
+
+Security fixes go into the latest release. From 1.0 on, the evidence format is stable: a fix never
+makes existing evidence stop verifying, unless the fix is that it should not have verified.
+
 ## Scope
 
 In scope: the recorder, verifier, CLI and dashboard in this repository, and the evidence

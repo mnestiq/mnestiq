@@ -55,8 +55,8 @@ def _records(path, event_type=None):
 
 
 def _calls(record):
-    """A record's tool calls without the hashes the recorder adds (for redaction)."""
-    return [{k: v for k, v in c.items() if not k.endswith("_hash")} for c in record.get("tool_calls") or []]
+    """A record's tool calls without the hashes and salts the recorder adds (for redaction)."""
+    return [{k: v for k, v in c.items() if not k.endswith(("_hash", "_salt"))} for c in record.get("tool_calls") or []]
 
 
 def _finish(proxy, rec):
@@ -228,7 +228,8 @@ def test_the_api_key_is_never_written_down(setup, fake, caplog):
     _finish(proxy, rec)
     assert API_KEY.encode() not in path.read_bytes()
     assert API_KEY not in caplog.text
-    assert fake.seen[1].headers["x-api-key"] == API_KEY  # passed on, only not written down
+    sent = fake.seen[1].headers  # the Anthropic SDK sends x-api-key before 2.0, a bearer token since
+    assert API_KEY in (sent.get("x-api-key"), sent.get("authorization", "").removeprefix("Bearer "))  # passed on
 
 
 def test_other_requests_are_passed_on_and_noted(setup, fake):
@@ -465,6 +466,7 @@ def test_a_provider_whose_certificate_is_not_trusted_is_refused(tmp_path):
 
     server = HTTPServer(("127.0.0.1", 0), Handler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(tmp_path / "c.pem", tmp_path / "k.pem")
     server.socket = context.wrap_socket(server.socket, server_side=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -53,6 +53,8 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from .context import expand
+
 UNTRUSTED = frozenset({"tool_output", "retrieved_doc", "web", "agent_msg", "memory", "unknown"})
 TRUSTED = frozenset({"system", "user", "internal"})
 
@@ -363,14 +365,15 @@ class _State:
 
 
 def findings(records: Iterable[dict]) -> list[dict]:
-    """All findings in a sequence of records (any mix of runs), in record order."""
+    """All findings in a sequence of records (any mix of runs), in record order. Model calls that
+    record only what changed are read with their full context (``mnestiq.context.expand``)."""
     st = _State()
-    for i, r in enumerate(records):
+    for i, r in enumerate(expand(records)):
         if not isinstance(r, dict):
             continue
         try:
             _one(i, r, st)
-        except (TypeError, AttributeError, ValueError):  # shaped as the recorder never writes it: skipped
+        except (TypeError, AttributeError, ValueError, KeyError, IndexError):  # never written so: skipped
             continue
     for run_id, pending in st.approvals.items():
         for i, finding, a in pending:
@@ -380,7 +383,7 @@ def findings(records: Iterable[dict]) -> list[dict]:
             match = next((c for c in calls if c[0] > i), calls[-1] if calls else None)
             try:
                 matters = _approval_matters(name, match[3], match[4]) if match else _approval_matters(name, None, [])
-            except (TypeError, AttributeError, ValueError):
+            except (TypeError, AttributeError, ValueError, KeyError, IndexError):
                 continue
             if matters:
                 st.out.append((i, finding))
