@@ -252,6 +252,8 @@ def test_segment_rejects_unknown_source():
 def test_bundled_schema_matches_spec():
     repo = Path(__file__).resolve().parents[2]
     spec = repo / "spec" / "schema" / "record.schema.json"
+    if not spec.exists():
+        pytest.skip("needs spec/ from the repository")
     bundled = repo / "python" / "src" / "mnestiq" / "schema" / "record.schema.json"
     hint = "run: cp spec/schema/record.schema.json python/src/mnestiq/schema/"
     assert spec.read_bytes() == bundled.read_bytes(), hint

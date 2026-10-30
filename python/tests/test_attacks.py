@@ -283,6 +283,8 @@ def test_the_break_it_kit_verifies():
     from pathlib import Path
 
     kit = Path(__file__).resolve().parents[2] / "examples" / "break-it"
+    if not kit.exists():
+        pytest.skip("needs examples/break-it from the repository")
     head = json.loads((kit / "head.json").read_text("utf-8"))
     report = verify_file(kit / "evidence.jsonl", [(kit / "recorder.pub").read_text().strip()], head=head)
     assert report.ok and report.head_seq == head["seq"], report.errors
@@ -298,6 +300,8 @@ def test_the_break_it_readme_lists_the_real_checksums():
     from pathlib import Path
 
     kit = Path(__file__).resolve().parents[2] / "examples" / "break-it"
+    if not kit.exists():
+        pytest.skip("needs examples/break-it from the repository")
     readme = (kit / "README.md").read_text("utf-8")
     for name in ("recorder.pub", "head.json"):
         assert hashlib.sha256((kit / name).read_bytes()).hexdigest() in readme, name
