@@ -120,7 +120,8 @@ Independent reviewers are invited to try the
 
 ## Citing
 
-If you use the recorder or refer to it in your work, please cite it: "Cite this repository" on
-https://github.com/mnestiq/mnestiq gives APA and BibTeX entries.
+If you use the recorder or refer to it in your work, please cite it, with the DOI
+[10.5281/zenodo.23800724](https://doi.org/10.5281/zenodo.23800724). "Cite this repository" on https://github.com/mnestiq/mnestiq
+gives APA and BibTeX entries.
 
 Licensed under Apache-2.0.

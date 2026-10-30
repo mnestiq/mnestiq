@@ -1,5 +1,7 @@
 # Mnestiq
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23800724.svg)](https://doi.org/10.5281/zenodo.23800724)
+
 **A flight recorder for AI agents.** It records what an agent read, decided and did, where each piece
 of its input came from, and signs the record so nobody can quietly change it later. When an agent
 does something it shouldn't, you can show exactly which run and step did it, which untrusted input came
@@ -263,8 +265,9 @@ Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## Citing
 
-If you use the recorder or refer to it in your work, please cite it. "Cite this repository" in the
-sidebar gives APA and BibTeX entries, from [CITATION.cff](CITATION.cff).
+If you use the recorder or refer to it in your work, please cite it. The DOI
+[10.5281/zenodo.23800724](https://doi.org/10.5281/zenodo.23800724) always points to the latest release, and "Cite this repository"
+in the sidebar gives APA and BibTeX entries.
 
 ## License
 

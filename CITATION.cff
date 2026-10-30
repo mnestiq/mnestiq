@@ -1,6 +1,7 @@
 cff-version: 1.2.0
 message: "If you use the Mnestiq recorder, please cite it as below."
 type: software
+doi: 10.5281/zenodo.23800724
 title: "Mnestiq: tamper-evident flight recorder for AI agents"
 abstract: "Hash-chained, signed evidence logs of what an AI agent saw, decided and did, with the origin of every input to the model."
 authors:
