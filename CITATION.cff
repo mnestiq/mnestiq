@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use the Mnestiq recorder, please cite it as below."
+type: software
+title: "Mnestiq: tamper-evident flight recorder for AI agents"
+abstract: "Hash-chained, signed evidence logs of what an AI agent saw, decided and did, with the origin of every input to the model."
+authors:
+  - given-names: Alexander
+    family-names: Retsis
+version: 1.0.0
+date-released: 2026-10-28
+license: Apache-2.0
+repository-code: "https://github.com/mnestiq/mnestiq"
+url: "https://mnestiq.com"
+keywords:
+  - ai-agents
+  - forensics
+  - incident-response
+  - provenance
+  - audit-log
