@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 (2026-10-30)
+
+- `CITATION.cff`: GitHub shows "Cite this repository" with APA and BibTeX entries, and each release
+  is archived on Zenodo with a DOI.
+- The tests that read the break-it kit or the spec folder skip in the source package, which has
+  neither, instead of failing. Nothing else changes: same format, same API.
+
 ## 1.0.0 (2026-10-28)
 
 The evidence format is now v1.0 and stable: a change older verifiers would get wrong needs a 2.0, and

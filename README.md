@@ -261,6 +261,11 @@ fail rather than quietly reach the internet.
 
 Please report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
+## Citing
+
+If you use the recorder or refer to it in your work, please cite it. "Cite this repository" in the
+sidebar gives APA and BibTeX entries, from [CITATION.cff](CITATION.cff).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

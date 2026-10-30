@@ -6,8 +6,8 @@ abstract: "Hash-chained, signed evidence logs of what an AI agent saw, decided a
 authors:
   - given-names: Alexander
     family-names: Retsis
-version: 1.0.0
-date-released: 2026-10-28
+version: 1.0.1
+date-released: 2026-10-30
 license: Apache-2.0
 repository-code: "https://github.com/mnestiq/mnestiq"
 url: "https://mnestiq.com"

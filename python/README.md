@@ -118,4 +118,9 @@ Independent reviewers are invited to try the
 - Changelog: https://github.com/mnestiq/mnestiq/blob/main/CHANGELOG.md
 - Security policy and vulnerability reporting: https://github.com/mnestiq/mnestiq/blob/main/SECURITY.md
 
+## Citing
+
+If you use the recorder or refer to it in your work, please cite it: "Cite this repository" on
+https://github.com/mnestiq/mnestiq gives APA and BibTeX entries.
+
 Licensed under Apache-2.0.
