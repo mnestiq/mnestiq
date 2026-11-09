@@ -134,7 +134,7 @@ These are limits by design. We would rather you hear them from us.
 10. **Capture runs inside the agent's Python process,** and code in that process can work against it.
    Native extensions with their own sockets, `uvloop`, and the network traffic of child processes that are
    not Python are not seen. A secret passed as a bare positional argument to a process is not masked, because
-   nothing tells it from any other argument.
+   nothing tells it from any other argument. On Python 3.10 and 3.11, a socket call within two frames of the recursion limit can raise `RecursionError` or go unrecorded.
 11. **Emptying or replacing a whole file** starts a chain that looks clean, unless a head or the vault says
    otherwise. `--witness` cannot show it, because the log is picked by the chain id in the file. A file with a new
    chain id has no log to differ from, and `verify` only warns `witness_none`.

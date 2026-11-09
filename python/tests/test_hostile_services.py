@@ -1905,7 +1905,8 @@ def test_a_compressed_stream_that_cannot_be_read_reaches_the_agent_and_is_marked
     assert call["attributes"]["output_captured"] is False
 
 
-def test_an_event_over_the_size_limit_reaches_the_agent_and_is_not_recorded_as_whole(air):
+def test_an_event_over_the_size_limit_reaches_the_agent_and_is_not_recorded_as_whole(air, monkeypatch):
+    monkeypatch.setattr(air.proxy, "client_timeout", 30.0)  # a busy machine can take over a second to read this much
     events = STREAMS["chat"]
     huge = b"data: " + b"x" * (EventStream.MAX_BUFFER + 1024) + b"\n\n"
     stream = _sse(events[:3]) + huge + _sse(events[3:])
@@ -2020,7 +2021,7 @@ def test_a_hostile_client_gets_an_answer_or_a_hang_up_and_the_proxy_goes_on(air,
 
 def test_the_answer_to_a_malformed_request_is_json_and_does_not_repeat_it(air):
     reply = _exchange(air, b"GET /x?key=SECRETWORD HTTP/1.1 extra\r\n\r\n")
-    answer = json.loads(reply)["error"]
+    answer = json.loads(reply.split(b"\r\n\r\n", 1)[-1])["error"]  # from Python 3.13 the headers come first
     assert answer["type"] == "mnestiq_proxy" and answer["message"].startswith("400") and b"SECRETWORD" not in reply
 
 
