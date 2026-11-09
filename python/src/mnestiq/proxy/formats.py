@@ -15,6 +15,7 @@ from ..recorder import Segment
 OPENAI, ANTHROPIC = "openai", "anthropic"
 CHAT, RESPONSES, MESSAGES = "chat", "responses", "messages"
 _DEPLOYMENT = re.compile(r"/deployments/([^/]+)/")  # Azure OpenAI names the model in the path
+REPEATED_KEY = "an object repeats a key, so another JSON parser may read it differently from this record"
 
 
 def model_api(family: str, method: str, path: str) -> str | None:
@@ -32,7 +33,10 @@ def model_api(family: str, method: str, path: str) -> str | None:
 
 
 def request_fields(api: str, body: dict, path: str, sources: dict[str, str]) -> dict[str, Any]:
-    """What a request says, as keyword arguments for ``Run.llm_call`` (without the answer)."""
+    """What a request says, as keyword arguments for ``Run.llm_call`` (without the answer). Raises on a
+    request shaped as no SDK sends it, for the caller to keep whole."""
+    if set(body) == {"unparsed"}:
+        raise ValueError("the body is not a JSON object")
     model = body.get("model")
     if model is None:
         found = _DEPLOYMENT.search(path)
@@ -40,10 +44,10 @@ def request_fields(api: str, body: dict, path: str, sources: dict[str, str]) -> 
     fields: dict[str, Any] = {"model": str(model), "params": sampling_params(body)}
     if api == MESSAGES:
         system = body.get("system")
-        fields["context"] = context_segments(system, _dicts(body.get("messages")), sources)
+        fields["context"] = context_segments(system, _messages(body), sources)
         fields["system_prompt"] = system
     elif api == CHAT:
-        messages = _dicts(body.get("messages"))
+        messages = _messages(body)
         system = [m.get("content") for m in messages if m.get("role") in ("system", "developer")]
         fields["context"] = chat_segments(messages, sources)
         fields["system_prompt"] = system or None
@@ -133,6 +137,30 @@ def _dicts(value: Any) -> list[dict]:
     return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
 
+def _messages(body: dict) -> list[dict]:
+    """A request's messages. Any other shape raises: leaving out what is not understood would hide it."""
+    messages = body.get("messages")
+    if messages is None:
+        return []
+    if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+        raise ValueError("messages is not a list of objects")
+    return messages
+
+
+def read_json(data: str | bytes) -> tuple[Any, bool]:
+    """``json.loads``, and whether an object in it repeats a key. Python keeps the last of two equal keys
+    and other parsers the first, so the agent and this record could disagree on what was said."""
+    repeated = False
+
+    def build(pairs: list[tuple[str, Any]]) -> dict:
+        nonlocal repeated
+        built = dict(pairs)
+        repeated = repeated or len(built) != len(pairs)
+        return built
+
+    return json.loads(data, object_pairs_hook=build), repeated
+
+
 # Streamed answers
 
 
@@ -167,17 +195,44 @@ class EventStream:
         return events
 
 
-class AnthropicStream:
+class _StreamReader:
+    """What the three stream readers share: reading one event, and counting those that could not be read."""
+
+    def __init__(self) -> None:
+        self.error: Any = None
+        self.unreadable = 0
+        self.repeated = False
+
+    def _read(self, data: str) -> dict | None:
+        try:
+            value, repeated = read_json(data)
+        except (ValueError, RecursionError):
+            value, repeated = None, False
+        self.repeated = self.repeated or repeated
+        if isinstance(value, dict):
+            return value
+        self.unreadable += 1
+        return None
+
+
+class AnthropicStream(_StreamReader):
     """Rebuilds a Messages API answer from its stream."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.message: dict | None = None
         self.blocks: dict[Any, dict] = {}
         self.partial_json: dict[Any, str] = {}
-        self.error: Any = None
+        self.stopped = False
+
+    @property
+    def finished(self) -> bool:
+        return self.stopped or bool(self.message and self.message.get("stop_reason"))
 
     def feed(self, event: str | None, data: str) -> None:
-        item = _json(data)
+        item = self._read(data)
+        if item is None:
+            return
         kind = item.get("type")
         index = item.get("index")
         if kind == "message_start":
@@ -204,6 +259,8 @@ class AnthropicStream:
             usage = self.message.setdefault("usage", {})
             if isinstance(usage, dict):
                 usage.update(item.get("usage") or {})
+        elif kind == "message_stop":
+            self.stopped = True
         elif kind == "error":
             self.error = item.get("error") or item
 
@@ -220,21 +277,29 @@ class AnthropicStream:
         return {**self.message, "content": [self.blocks[i] for i in sorted(self.blocks, key=_order)]}
 
 
-class ChatStream:
+class ChatStream(_StreamReader):
     """Rebuilds a Chat Completions answer from its stream of chunks."""
 
     def __init__(self) -> None:
+        super().__init__()
         self.answer: dict[str, Any] = {}
         self.messages: dict[Any, dict] = {}
         self.finish: dict[Any, Any] = {}
         self.calls: dict[Any, dict[Any, dict]] = {}
-        self.error: Any = None
         self.seen = False
+        self.done = False
+
+    @property
+    def finished(self) -> bool:
+        return self.done or (bool(self.messages) and all(index in self.finish for index in self.messages))
 
     def feed(self, event: str | None, data: str) -> None:
         if data.strip() == "[DONE]":
+            self.done = True
             return
-        chunk = _json(data)
+        chunk = self._read(data)
+        if chunk is None:
+            return
         if "error" in chunk:
             self.error = chunk["error"]
             return
@@ -279,19 +344,25 @@ class ChatStream:
         return {**self.answer, "choices": choices}
 
 
-class ResponsesStream:
+class ResponsesStream(_StreamReader):
     """Rebuilds a Responses API answer: the final event carries the whole response."""
 
     FINAL = ("response.completed", "response.incomplete", "response.failed")
 
     def __init__(self) -> None:
+        super().__init__()
         self.response: dict | None = None
         self.started: dict | None = None
         self.items: dict[Any, Any] = {}
-        self.error: Any = None
+
+    @property
+    def finished(self) -> bool:
+        return self.response is not None
 
     def feed(self, event: str | None, data: str) -> None:
-        item = _json(data)
+        item = self._read(data)
+        if item is None:
+            return
         kind = item.get("type") or event
         if kind in self.FINAL and isinstance(item.get("response"), dict):
             self.response = item["response"]
@@ -315,14 +386,6 @@ def stream_reader(api: str) -> AnthropicStream | ChatStream | ResponsesStream:
     if api == MESSAGES:
         return AnthropicStream()
     return ChatStream() if api == CHAT else ResponsesStream()
-
-
-def _json(data: str) -> dict:
-    try:
-        value = json.loads(data)
-    except (ValueError, RecursionError):
-        return {}
-    return value if isinstance(value, dict) else {}
 
 
 def _order(key: Any) -> tuple[int, str]:

@@ -18,3 +18,4 @@ real-run/
 live-runs/
 .coverage
 htmlcov/
+fuzz-found

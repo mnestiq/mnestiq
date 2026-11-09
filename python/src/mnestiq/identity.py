@@ -22,7 +22,10 @@ def detect_sandbox_id() -> str:
     explicit = os.environ.get("MNESTIQ_SANDBOX_ID")
     if explicit:
         return explicit
-    hostname = socket.gethostname()
+    try:
+        hostname = socket.gethostname()
+    except (OSError, UnicodeError):  # the sandbox id is best effort: it must not stop the agent starting
+        hostname = "unknown"
     if os.environ.get("KUBERNETES_SERVICE_HOST"):
         namespace = _read(_K8S_NAMESPACE) or "default"
         return f"k8s:{namespace}/{hostname}"

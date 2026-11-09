@@ -8,13 +8,15 @@ import json
 import os
 import re
 import sys
+from collections.abc import Iterable, Iterator
 from pathlib import Path
+from typing import Any
 
 from .canonical import canonical_json, parse_json
 from .context import expand
-from .hashing import redact
+from .hashing import iter_redactable_paths, redact, slot_digest
 from .keys import ED25519, SIG_ALGS, generate_private_key, key_id, load_public_key_b64, public_key_b64, save_keypair
-from .verify import verify_file
+from .verify import _unknown_fields, is_blank, schema_problem, verify_file
 
 EXIT_OK, EXIT_INVALID, EXIT_USAGE = 0, 1, 2
 
@@ -28,6 +30,15 @@ def _say(text: str) -> None:
     print(_CONTROL.sub("?", text))
 
 
+_LINE_BREAKING = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _one_line(text: str) -> str:
+    """Text from an evidence file, shown on one line. A newline in a tool's error must not start what looks
+    like another record of the listing, so control characters are escaped."""
+    return _LINE_BREAKING.sub(lambda m: m.group().encode("unicode_escape").decode("ascii"), text)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mnestiq", description="Agent evidence chain tools.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -38,6 +49,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="public key (base64 or path to .pub) allowed to sign checkpoints; repeatable")
     p.add_argument("--head", metavar="FILE",
                    help="latest checkpoint kept elsewhere (HeadFile); detects a file cut back to an earlier one")
+    p.add_argument("--witness", metavar="PATH",
+                   help="a signing service's witness log, or its folder. Detects a file rewritten or cut back after "
+                        "the last send the service received")
     p.add_argument("--tsa-root", action="append", default=[], metavar="PEM",
                    help="certificate(s) trusted for RFC 3161 timestamps, instead of the built-in roots; repeatable")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -72,11 +86,19 @@ def main(argv: list[str] | None = None) -> int:
     s = signer.add_parser("init", help="create a key and an access token in a folder only the service can read")
     s.add_argument("dir")
     s.add_argument("--alg", choices=SIG_ALGS, default=ED25519)
+    s.add_argument("--no-key", action="store_true", help="create only the token, for a key held in Azure Key Vault")
     s = signer.add_parser("serve", help="sign checkpoints for agents that hold the token")
     s.add_argument("dir")
     s.add_argument("--listen", default="127.0.0.1:8741", help="127.0.0.1:<port>, or a Unix socket path")
     s.add_argument("--max-skew", type=float, default=300.0,
                    help="refuse checkpoints whose time is further than this from the signer's clock (seconds)")
+    s.add_argument("--allow-handover", action="store_true",
+                   help="let holders of the token hand a chain over to another key (off by default)")
+    s.add_argument("--azure-key", metavar="URL",
+                   help="sign with this Azure Key Vault key, the full URL of one version, not the folder's own key")
+    s.add_argument("--max-chains", type=int, metavar="N",
+                   help="keep at most this many chains (default 10000). Beyond it new chains are refused, and chains "
+                        "already held keep working")
 
     p = sub.add_parser("proxy", help="record an agent's model calls from outside the agent")
     p.add_argument("evidence", help="evidence file to write (continued if it exists)")
@@ -111,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return {"verify": _verify, "keygen": _keygen, "inspect": _inspect, "redact": _redact,
                 "dashboard": _dashboard, "signer": _signer, "proxy": _proxy, "demo": _demo}[args.command](args)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:  # a head or key file can hold anything too
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
@@ -128,7 +150,9 @@ def _verify(args: argparse.Namespace) -> int:
         from cryptography import x509
 
         roots = [c for path in args.tsa_root for c in x509.load_pem_x509_certificates(Path(path).read_bytes())]
-    report = verify_file(args.file, keys, head, roots)
+    if args.witness and not Path(args.witness).exists():  # a mistyped path must not quietly turn the check off
+        raise ValueError(f"{args.witness} does not exist")
+    report = verify_file(args.file, keys, head, roots, args.witness)
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
         return EXIT_OK if report.ok else EXIT_INVALID
@@ -146,11 +170,22 @@ def _verify(args: argparse.Namespace) -> int:
         _say(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
     if report.head_seq is not None:
         _say(f"  head      matches the checkpoint at seq {report.head_seq} kept elsewhere")
+    if report.witness is not None:
+        _say(f"  witness   {_witness_reach(report.witness)}")
     for issue in report.errors:
         _say(f"  ERROR   {_where(issue)}{issue.code}: {issue.message}")
     for issue in report.warnings:
         _say(f"  warning {_where(issue)}{issue.code}: {issue.message}")
     return EXIT_OK if report.ok else EXIT_INVALID
+
+
+def _witness_reach(witness: dict) -> str:
+    if witness.get("highest_seq") is None:
+        return "nothing to compare"
+    matched = witness.get("matched_through")
+    agreed = f"the file agrees with it through seq {matched}" if matched is not None else "nothing in the file agrees"
+    return (f"saw this chain up to seq {witness['highest_seq']} ({witness['entries']} entries), {agreed}. "
+            "Records written after the last send were not witnessed")
 
 
 def _where(issue) -> str:
@@ -172,10 +207,14 @@ def _keygen(args: argparse.Namespace) -> int:
 
 
 def _signer(args: argparse.Namespace) -> int:
-    from .signer_service import SignerService, init_signer
+    from .signer_service import DEFAULT_MAX_CHAINS, SignerService, init_signer, init_token, key_vault_signer
     from .signers import SignerError
 
     try:
+        if args.signer_command == "init" and args.no_key:
+            print(f"token created in {init_token(args.dir)}   (give it to the agent)")
+            print("Run `mnestiq signer serve --azure-key <url>` under the account that owns this folder.")
+            return EXIT_OK
         if args.signer_command == "init":
             signer = init_signer(args.dir, args.alg)
             print(f"signer created in {args.dir}")
@@ -184,11 +223,15 @@ def _signer(args: argparse.Namespace) -> int:
             print(f"  token       {Path(args.dir) / 'signer.token'}   (give it to the agent, never the key)")
             print("Run `mnestiq signer serve` under the account that owns this folder.")
             return EXIT_OK
-        service = SignerService(args.dir, max_skew=args.max_skew)
+        backend = key_vault_signer(args.azure_key) if args.azure_key else None
+        service = SignerService(args.dir, max_skew=args.max_skew, allow_handover=args.allow_handover, signer=backend,
+                                max_chains=DEFAULT_MAX_CHAINS if args.max_chains is None else args.max_chains)
         server = service.start(args.listen)
     except SignerError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    if backend is not None:  # signer init printed the folder's own key, not this one
+        print(f"public key  {backend.public_key}   (pin this with verify --trusted-key)")
     print(f"signing as {service.key_id} on {server.address}; every signature is logged in "
           f"{Path(args.dir) / 'signatures.jsonl'}. Ctrl+C stops.", flush=True)
     try:
@@ -261,19 +304,40 @@ def _stop_cleanly_on_signals() -> None:
 
 
 def _inspect(args: argparse.Namespace) -> int:
+    unreadable = 0
     with open(args.file, "rb") as fh:
-        for rec in expand(parse_json(raw) for raw in fh if raw.strip()):
-            if args.run and rec.get("run_id") != args.run:
-                continue
-            ts = rec.get("ts", {}).get("wall", "?")
-            if rec.get("kind") == "checkpoint":
-                c = rec.get("covers", {})
-                _say(f"{ts}  #{rec['seq']:<5} ---- checkpoint seq {c.get('from_seq')}..{c.get('to_seq')} "
-                      f"signed by {rec.get('key_id')}")
-                continue
-            _say(f"{ts}  #{rec['seq']:<5} {rec.get('run_id', '')[:8]}/{rec.get('step_id', '-'):<3} "
-                  f"{rec.get('event_type', '?'):<10} {_summary(rec)}")
-    return EXIT_OK
+        for rec in expand(_parsed_lines(fh)):
+            try:
+                if args.run and rec.get("run_id") != args.run:
+                    continue
+                _say(_one_line(_inspect_line(rec)))
+            except Exception:  # a line of a file can hold anything: the rest of the listing still comes
+                unreadable += 1
+                seq = rec.get("seq") if isinstance(rec, dict) else None
+                _say(f"?  #{seq if isinstance(seq, int) else '?':<5} could not be read: not what the recorder writes")
+    if unreadable:
+        _say(f"{unreadable} record(s) could not be read. Run `mnestiq verify` on this file.")
+    return EXIT_INVALID if unreadable else EXIT_OK
+
+
+def _parsed_lines(lines: Iterable[bytes]) -> Iterator[Any]:
+    """Each line parsed. A line that does not parse comes through as None, in its place."""
+    for raw in lines:
+        if not is_blank(raw):
+            try:
+                yield parse_json(raw)
+            except (ValueError, RecursionError):
+                yield None
+
+
+def _inspect_line(rec: dict) -> str:
+    ts = rec.get("ts", {}).get("wall", "?")
+    if rec.get("kind") == "checkpoint":
+        c = rec.get("covers", {})
+        return (f"{ts}  #{rec['seq']:<5} ---- checkpoint seq {c.get('from_seq')}..{c.get('to_seq')} "
+                f"signed by {rec.get('key_id')}")
+    return (f"{ts}  #{rec['seq']:<5} {rec.get('run_id', '')[:8]}/{rec.get('step_id', '-'):<3} "
+            f"{rec.get('event_type', '?'):<10} {_summary(rec)}")
 
 
 def _summary(rec: dict) -> str:
@@ -343,16 +407,44 @@ def _redact(args: argparse.Namespace) -> int:
     partial = dst.with_name(dst.name + ".partial")
     try:
         with open(src, "rb") as fin, open(partial, "wb") as fout:
-            for raw in fin:
-                if raw.strip():
-                    # parse_json keeps numbers exactly as the hashes saw them (json.loads would not)
-                    fout.write(canonical_json(redact(parse_json(raw))) + b"\n")
+            for line_no, raw in enumerate(fin, start=1):
+                if not is_blank(raw):
+                    fout.write(_redacted_line(raw, line_no))
                     count += 1
         os.replace(partial, dst)
     finally:  # a failure leaves no half-written file in the way of the next try
         partial.unlink(missing_ok=True)
     print(f"wrote {count} redacted records to {dst}")
     return EXIT_OK
+
+
+def _redacted_line(raw: bytes, line_no: int) -> bytes:
+    """One line, redacted. A line that isn't a well-formed record stops the whole redaction: content in
+    a shape the redactor doesn't expect would pass through it and reach whoever gets the copy."""
+    try:
+        # parse_json keeps numbers exactly as the hashes saw them (json.loads would not)
+        rec = parse_json(raw)
+        problem = schema_problem(rec, show_value=False) if isinstance(rec, dict) else "not a JSON object"
+        problem = problem or _not_redactable(rec)
+        if problem is None:
+            return canonical_json(redact(rec)) + b"\n"
+    except Exception as exc:  # a line of a file can hold anything
+        problem = type(exc).__name__
+    raise ValueError(f"line {line_no} cannot be redacted safely ({problem}), so no copy was written")
+
+
+def _not_redactable(rec: dict) -> str | None:
+    """What stops a well-formed record being redacted, or None. A field this version knows nothing about could
+    hold anything, and would reach whoever gets the copy. A value that doesn't match its digest would
+    disappear with the evidence that it was changed, and the copy would verify."""
+    unknown = _unknown_fields(rec) + sorted(k for k in rec if k.startswith("x-") and k != "x-omitted")
+    if unknown:
+        names = _one_line(", ".join(unknown))[:200]
+        return f"it holds what this version does not know: {names}. Upgrade mnestiq to redact it"
+    for obj, field, path in iter_redactable_paths(rec):
+        if field in obj and obj.get(f"{field}_hash") != slot_digest(obj, field):
+            return f"{path} does not match its committed digest: the value was changed"
+    return None
 
 
 if __name__ == "__main__":

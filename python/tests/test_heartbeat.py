@@ -35,7 +35,7 @@ def test_a_busy_recorder_needs_no_heartbeat(key):
         run.note("busy")
     rec.close()
     # One beat at the start, which puts the interval in the evidence, and none while busy.
-    beats = [r for r in rec._sink.records if r.get("event_type") == "heartbeat"]
+    beats = [r for r in rec._sink.records if r.get("event_type") == "heartbeat" and "interval_s" in r["attributes"]]
     assert len(beats) == 1 and beats[0]["seq"] == 0
 
 

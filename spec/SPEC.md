@@ -41,8 +41,11 @@ Does **not** protect against:
   (e.g. S3 Object Lock).
 - Theft of the signing key. Keep it out of reach of the agent process: in a key store
   such as Azure Key Vault, or in a signing service under another account (section 6.7).
-  Then someone who takes over the agent can obtain signatures only while in control,
-  and cannot take the key away to re-sign history later.
+  Then someone who takes over the agent cannot take the key away, and can obtain signatures
+  only while in control. While in control, they can have records signed that are not signed
+  yet, including records after the last checkpoint that they rewrote. Used directly, a key store
+  signs a hand-over to their own key, as does a service with hand-overs enabled, and then this
+  limit no longer holds.
 
 ## 3. Encoding
 
@@ -114,9 +117,9 @@ up to the record immediately before it.
 | `sig_alg` | `"ed25519"`, or `"ecdsa-p256-sha256"` (ECDSA over P-256 with SHA-256, for key stores without Ed25519). A later minor version may add an algorithm (section 9). |
 | `public_key` | Base64 of the raw public key: 32 bytes for Ed25519, the 65-byte uncompressed SEC1 point (`0x04` \|\| X \|\| Y) for P-256. |
 | `key_id` | `ed25519:` or `p256:`, then the first 16 hex digits of SHA-256(raw public key). A later algorithm uses its own prefix. |
-| `signature` | Signature over the signing payload (section 6.3), base64. Ed25519: 64 bytes. P-256: the 64 bytes r \|\| s, big-endian, with s at most n/2 (section 6.3). |
+| `signature` | Signature over the signing payload (section 6.3), base64 with padding and with any unused bits of the last character zero. Verifiers MUST reject any other spelling, which would change `record_hash` without the key. Ed25519: 64 bytes. P-256: the 64 bytes r \|\| s, big-endian, with s at most n/2 (section 6.3). |
 | `next_key` | Optional. `{sig_alg, public_key, key_id}`: hands the chain over to this key (section 6.7). |
-| `timestamp_token` | Optional RFC 3161 TimeStampToken (DER, base64) whose message imprint is SHA-256 of the signature bytes. |
+| `timestamp_token` | Optional RFC 3161 TimeStampToken (DER, base64 spelled as for `signature`) whose message imprint is SHA-256 of the signature bytes. |
 
 ### 4.3 Egress and identity propagation
 
@@ -254,7 +257,9 @@ The signing key SHOULD be out of the agent's reach: in a hardware-backed key sto
 running under another account. Such a service SHOULD sign only checkpoints for its own
 key, only with a `ts.wall` close to its own clock, and per chain only the checkpoint
 that starts right after the last one it signed, and SHOULD log every signature. Then
-someone who controls the agent cannot have earlier checkpoints signed again.
+someone who controls the agent cannot have different records signed for a range that was already signed.
+They can still have new checkpoints signed while in control, over records that are not signed
+yet, and a key store used directly applies none of these rules.
 
 A chain is signed by one key at a time. To change keys, the producer writes a
 checkpoint signed by the current key with `next_key` naming the new one. Every later

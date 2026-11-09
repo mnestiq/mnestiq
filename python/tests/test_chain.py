@@ -29,7 +29,7 @@ def test_valid_signed_chain(tmp_path, key, pub):
 
 def test_records_capture_identity_and_provenance(tmp_path, key):
     records = load(record_demo(tmp_path / "e.jsonl", key))
-    events = [r for r in records if r["kind"] == "event"]
+    events = [r for r in records if r["kind"] == "event" and not r["run_id"].startswith("recorder-")]
     assert [e["event_type"] for e in events] == [
         "run_start", "llm_call", "tool_call", "llm_call", "approval", "tool_call", "run_end"]
     assert len({e["run_id"] for e in events}) == 1

@@ -1,5 +1,86 @@
 # Changelog
 
+## 1.1.0 (2026-11-09)
+
+Security fixes for crafted evidence files, reported by Agentic Thinking, and for what our own testing then
+found. See the [security note](docs/security-notes/1.1.0.md). In our tests, without the signing key or a
+signing identity, no change to a value in a signed record stayed VALID under a pinned key. Respelling a number
+or changing JSON spacing does not change a record's hash, and the last checkpoint's timestamp can be removed
+(see the note). The record format and spec version are unchanged. One rule for reading checkpoints is stricter:
+a signature or timestamp token must be spelled as a recorder writes it. An empty or null `timestamp_token`, or
+bytes after the token, are errors too.
+
+### Changes you may notice
+
+- A record the rules cannot fully read is returned as `MNQ-000`, a new entry in `mnestiq.findings.RULES`.
+- `mnestiq redact` refuses a malformed record, a value that does not match its digest, a field this version
+  does not know, and any `x-` field other than `x-omitted`.
+- The signing service refuses a hand-over to another key unless started with `--allow-handover`, and a repeat
+  must be identical.
+- `SinkError` is now a kind of `RecorderError`, so `except RecorderError` catches it too.
+- A recorder refuses to carry on from a file whose chain or signatures do not verify, whether or not `strict` is
+  set. Timestamp tokens and key pinning are checked only by `mnestiq verify`.
+- `FileSink` refuses anything at the evidence path that is not a regular file: a symbolic link, FIFO, device or
+  directory. Give it the real file. A link higher up the path still works. It also refuses to cut a torn line from
+  a file that has another hard link.
+- `mnestiq verify` warns `signed_after_restart` when records were signed only after a recorder restarted.
+- `mnestiq verify` warns `resumed_without_clean_close` when a recorder resumed without a signed clean close.
+  A file from an older recorder warns once.
+- `findings()` returns `MNQ-000` for a model call whose output was not captured, or only partly captured.
+- With a signer, a close that wrote records adds a `clean_close` heartbeat just before the last checkpoint.
+- With `instrument_egress()`, threads and thread pool tasks started during a run belong to it, and `urllib` and
+  `urllib3` are recorded. They are stamped only for hosts in `stamp_hosts`.
+- Python audit hooks record connections the patches missed, and datagrams, name lookups and process launches as
+  notes. Through a proxy, `host` is the real destination.
+- `MNQ-003` also fires on a datagram or raw socket noted after untrusted content reached the model. Name lookups
+  do not count. Each destination is noted once before and once after untrusted content first reaches the model, up
+  to 256 per kind each time. Past the limit after that point, the rules report `MNQ-000` rather than naming the
+  destination.
+- The signing service limits how many chains it holds. See `--max-chains` in [docs/signing.md](docs/signing.md).
+- The `error` field follows `max_content_bytes`.
+- A line that is not valid JSON or JSON whitespace is an error, as is a number too large to keep.
+
+### Fixed
+
+- `mnestiq verify` reports any bad record as an error and keeps what it found, instead of crashing.
+- The rules no longer lose findings in silence, read a number the same however it is spelled, and take bounded
+  time on a crafted file. The dashboard page is in step.
+- The dashboard shows malformed records as unreadable, and one bad file no longer stops the folder listing.
+- `mnestiq inspect` carries on past a bad line and prints one line per record.
+- Unless `strict` is set, recording does not raise into the agent once it is running, and an event that cannot be
+  recorded in full is recorded and marked.
+- The API proxy records a call it used to lose, or counts the failure if nothing can be written, and marks what it
+  could not capture.
+- The signing service and its client answer bad input with an error.
+- The signing service, API proxy and dashboard no longer drop connections in a burst on Linux.
+- `mnestiq verify` refuses a signature or timestamp token in any base64 spelling other than the one a recorder
+  writes. An empty or null `timestamp_token`, or bytes after the token, are errors too.
+- Crash recovery no longer mistakes a record whose own data has a `prev_hash` key for a damaged file.
+- `HeadFile` no longer follows a link at its temporary name.
+
+### Added
+
+- `mnestiq.instrument_models(recorder)` records calls through the Anthropic and OpenAI Python SDKs without
+  wrapping each client.
+- `mnestiq signer serve --azure-key` puts the signing service's rules in front of Azure Key Vault. The service
+  in front of it has been tested against a stand-in only.
+- `mnestiq verify --witness` compares a file with the record the signing service keeps of each chain, and
+  reports a rewritten or cut-back file as INVALID, as far as the witness reached.
+- `Recorder(checkpoint_on=...)` signs right after chosen event types. `Recorder(on_damaged="new_file")` sets a
+  damaged file aside and starts a new chain.
+- `create(stream=True)` and the OpenAI stream helpers record their output. With `instrument_models`,
+  `client.post()` to a model endpoint is recorded too, and `post(cast_to=httpx.Response, stream=True)` is recorded
+  without its output. `responses.stream(response_id=...)` and a model call made inside another SDK call are not
+  seen.
+
+### Tests and documents
+
+- New: fuzzing of evidence files through every reader (`tests/test_fuzz.py`, with a long tier in
+  `tests/fuzz/run_long.py`), and hostile-input tests for every surface.
+- New: `docs/claims-map.md`, the security claims we listed from our documents and the test behind each one. It
+  does not cover every sentence.
+- Claims the tests did not support are corrected.
+
 ## 1.0.1 (2026-10-30)
 
 - `CITATION.cff`: GitHub shows "Cite this repository" with APA and BibTeX entries, and each release

@@ -3,13 +3,14 @@
 **A flight recorder for AI agents.** Tamper-evident, signed evidence of what an agent saw,
 decided and did, built for incident response.
 
-Mnestiq records every model call, tool call, approval and outbound connection an agent
-makes, and tags each piece of model input with its origin: the user, a web page, tool output
+Mnestiq records the model calls, tool calls, approvals and outbound connections it is set up to
+capture, and tags each piece of model input with its origin: the user, a web page, tool output
 or another agent. Records are hash-chained and sealed with signed checkpoints. When an
 incident occurs, investigators can identify the run and the step, see which untrusted input
-came before it, and demonstrate that the record has not been altered since.
+came before it, and, for records under a signed checkpoint, demonstrate that the record has not
+been altered since.
 
-Version 1.0: the evidence format and the documented Python API are stable. A change that would
+Version 1.1: the evidence format and the documented Python API are stable. A change that would
 break existing evidence, older verifiers or code using the documented API needs a 2.0.
 
 ## Try it
@@ -62,10 +63,10 @@ mnestiq verify evidence.jsonl --trusted-key keys/signing.pub
 mnestiq dashboard . --trusted-key keys/signing.pub
 ```
 
-## Record any agent without code changes
+## Record an agent without code changes
 
-`mnestiq proxy` sits between an agent and its model API and records every call, whatever language
-or framework the agent is written in. Point the agent's base URL at it:
+`mnestiq proxy` sits between an agent and its model API and records every call sent through it,
+whatever language or framework the agent is written in. Point the agent's base URL at it:
 
 ```bash
 mnestiq proxy evidence.jsonl --agent my-agent --key keys/signing.key
@@ -78,13 +79,13 @@ See the [proxy guide](https://github.com/mnestiq/mnestiq/blob/main/docs/proxy.md
 ## Production signing
 
 A key file readable by the agent is suitable for evaluation only. In production, keep the
-signing key out of the agent's reach, so that a compromised agent cannot copy it or re-sign
-earlier evidence:
+signing key out of the agent's reach, so that a compromised agent cannot copy it. The signing
+service also refuses to sign earlier evidence again:
 
 ```python
 from mnestiq import AzureKeyVaultSigner, FileSink, Recorder, SignerClient, Timestamper
 
-# Azure Key Vault: the key never leaves the vault; only a SHA-256 digest is sent.
+# Azure Key Vault: the key is held by Key Vault, and only a SHA-256 digest is sent.
 signer = AzureKeyVaultSigner("https://<vault>.vault.azure.net/keys/<name>/<version>")
 
 # Or a local signing service running under a separate account (`mnestiq signer serve`).
@@ -96,16 +97,20 @@ recorder = Recorder(FileSink("evidence.jsonl"), agent_id="support-bot", signer=s
 ```
 
 Keys are rotated with a signed hand-over (`recorder.rotate_signer(new_signer)`), which the
-verifier follows. See the [signing guide](https://github.com/mnestiq/mnestiq/blob/main/docs/signing.md).
+verifier follows. The signing service signs a hand-over only if it was started with
+`--allow-handover`. See the [signing guide](https://github.com/mnestiq/mnestiq/blob/main/docs/signing.md).
 
 ## Security model
 
-Evidence is tamper-evident after it is written: edits, insertions, reordering and re-signing with
-another key are detected. Redacted values keep a salted digest, so they can't be recovered by
-guessing. Records cut from the end are detected against a head kept elsewhere
-(a HeadFile or the Evidence Vault), and backdating against RFC 3161 timestamps. It cannot prove that a compromised agent told the
+Evidence is tamper-evident after it is written: with a pinned key, edits, insertions, reordering and
+re-signing of records under a checkpoint are detected. Redacted values keep a salted digest, so they
+can't be recovered by guessing. The exception is `system_prompt_hash`, a plain digest that redaction
+leaves in place, so a guessed system prompt can be confirmed from it. Records cut back past a head kept elsewhere
+(a HeadFile or the Evidence Vault) are detected, and backdating is detected against RFC 3161 timestamps. It cannot
+prove that a compromised agent told the
 truth at the time of writing. The [threat model](https://github.com/mnestiq/mnestiq/blob/main/docs/threat-model.md)
 lists each attack considered, how it is detected, and the automated test that demonstrates it.
+What it says about the Evidence Vault, a separate service, has no test in this repository.
 Independent reviewers are invited to try the
 [break-it challenge](https://github.com/mnestiq/mnestiq/blob/main/examples/break-it/README.md).
 

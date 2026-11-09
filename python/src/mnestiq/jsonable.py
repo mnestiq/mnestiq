@@ -14,6 +14,7 @@ _MAX_NODES = 100_000  # an object graph with shared references can be exponentia
 
 
 def to_jsonable(obj: Any, _depth: int = 0, _budget: list[int] | None = None) -> Any:
+    """``obj`` as JSON. Never raises: whatever can't be read becomes a marker, in the place of that value only."""
     if _budget is None:
         _budget = [_MAX_NODES]
     _budget[0] -= 1
@@ -22,31 +23,53 @@ def to_jsonable(obj: Any, _depth: int = 0, _budget: list[int] | None = None) -> 
     if _budget[0] < 0:
         return "<too large>"
     d = _depth + 1
-    if obj is None or isinstance(obj, bool):
-        return obj
-    if isinstance(obj, str):
-        return valid_text(obj)
-    if isinstance(obj, int):
-        return obj if abs(obj) <= MAX_SAFE_INTEGER else str(obj)
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else str(obj)
-    if isinstance(obj, dict):
-        return {valid_text(str(k)): to_jsonable(v, d, _budget) for k, v in obj.items() if not is_not_given(v)}
-    if isinstance(obj, (list, tuple, set, frozenset)):
-        return [to_jsonable(v, d, _budget) for v in obj]
-    if isinstance(obj, (bytes, bytearray)):
-        return {"$base64": base64.b64encode(bytes(obj)).decode("ascii")}
-    if hasattr(obj, "model_dump"):  # pydantic v2 (Anthropic and OpenAI SDK types)
-        try:
-            return to_jsonable(obj.model_dump(mode="json", exclude_unset=True), d, _budget)
-        except Exception:
-            pass
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        # Field by field: dataclasses.asdict deep-copies, which fails on locks, clients and sockets.
-        return {f.name: to_jsonable(getattr(obj, f.name, None), d, _budget) for f in dataclasses.fields(obj)}
-    if hasattr(obj, "__dict__") and not isinstance(obj, type):
-        return to_jsonable({k: v for k, v in vars(obj).items() if not k.startswith("_")}, d, _budget)
-    return repr(obj)
+    try:
+        if obj is None or isinstance(obj, bool):
+            return obj
+        if isinstance(obj, str):
+            return valid_text(obj)
+        if isinstance(obj, int):
+            return obj if abs(obj) <= MAX_SAFE_INTEGER else str(obj)
+        if isinstance(obj, float):
+            return obj if math.isfinite(obj) else str(obj)
+        if isinstance(obj, dict):
+            return {_key_text(k): to_jsonable(v, d, _budget) for k, v in obj.items() if not is_not_given(v)}
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return [to_jsonable(v, d, _budget) for v in obj]
+        if isinstance(obj, (bytes, bytearray)):
+            return {"$base64": base64.b64encode(bytes(obj)).decode("ascii")}
+        if hasattr(obj, "model_dump"):  # pydantic v2 (Anthropic and OpenAI SDK types)
+            try:
+                return to_jsonable(obj.model_dump(mode="json", exclude_unset=True, warnings=False), d, _budget)
+            except Exception:
+                pass
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            # Field by field: dataclasses.asdict deep-copies, which fails on locks, clients and sockets.
+            return {f.name: to_jsonable(getattr(obj, f.name, None), d, _budget) for f in dataclasses.fields(obj)}
+        if hasattr(obj, "__dict__") and not isinstance(obj, type):
+            public = {k: v for k, v in vars(obj).items() if not k.startswith("_")}
+            if public:  # with nothing public, an empty object would read as an empty result
+                return to_jsonable(public, d, _budget)
+        return repr(obj)
+    except Exception:  # the agent's own objects can raise from anything above
+        return f"<unreadable {type(obj).__name__}>"
+
+
+def _key_text(key: Any) -> str:
+    try:
+        return valid_text(str(key))
+    except Exception:
+        return f"<unreadable {type(key).__name__}>"
+
+
+def exception_text(exc: BaseException) -> str:
+    """``Type: message`` for the ``error`` field. An exception's ``__str__`` is the agent's code: if it fails
+    here, the agent must still get its own exception."""
+    name = type(exc).__name__
+    try:
+        return f"{name}: {exc}"
+    except Exception:
+        return f"{name}: <message could not be read>"
 
 
 def valid_text(text: str) -> str:
@@ -80,4 +103,7 @@ def get(obj: Any, key: str, default: Any = None) -> Any:
     """Read ``key`` from a dict or attribute from an object."""
     if isinstance(obj, dict):
         return obj.get(key, default)
-    return getattr(obj, key, default)
+    try:
+        return getattr(obj, key, default)
+    except Exception:  # a property of an SDK object that raises is a value we did not get
+        return default

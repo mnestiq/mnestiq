@@ -13,7 +13,7 @@ import hashlib
 import os
 from pathlib import Path
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -110,7 +110,10 @@ def verify_signature(sig_alg: str, public_b64: str, signature: bytes, payload: b
 def p256_raw_signature(der: bytes) -> bytes:
     """A DER ECDSA signature as the 64 bytes r || s, with s in its low form."""
     r, s = decode_dss_signature(der)
-    return normalize_p256(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+    try:
+        return normalize_p256(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+    except OverflowError:
+        raise ValueError("a P-256 signature holds numbers of at most 32 bytes") from None
 
 
 def normalize_p256(signature: bytes) -> bytes:
@@ -152,7 +155,12 @@ def save_keypair(key: PrivateKey, directory: str | Path, name: str = "signing") 
 
 
 def load_private_key(path: str | Path) -> PrivateKey:
-    key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    try:
+        key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    except TypeError:  # what the library raises for a key that has a passphrase
+        raise ValueError(f"{path} is protected by a passphrase: use a key file without one") from None
+    except UnsupportedAlgorithm:
+        raise ValueError(f"{path} uses an algorithm this installation cannot read") from None
     if not isinstance(key, (Ed25519PrivateKey, ec.EllipticCurvePrivateKey)):
         raise ValueError(f"{path} is not an Ed25519 or P-256 private key")
     sig_alg_of(key)  # rejects other curves
