@@ -45,7 +45,9 @@ def expand(records: Iterable[dict]) -> Iterator[dict]:
         base = rec.get("context_base")
         context, totals = own, _running(sizes, 0)
         out = rec
-        if isinstance(base, dict):
+        # A context of the wrong type stays as it is: filling it in from the base would hide what is wrong
+        # with it, and the segments it should have held, from whoever reads the result.
+        if isinstance(base, dict) and ("context" not in rec or isinstance(raw, list)):
             out = {k: v for k, v in rec.items() if k != "context_base"}
             base_seq, wanted = base.get("seq"), base.get("segments")
             segments = wanted if isinstance(wanted, int) and not isinstance(wanted, bool) else 0

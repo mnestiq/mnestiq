@@ -74,6 +74,11 @@ handed back) and what the model asked for (tool calls, answers, token use), with
 latency, the provider's request id and the connection's addresses. Streamed answers are recorded
 whole.
 
+A call that was not captured in full says so in its `attributes`. `output_captured` is `false` when the
+record holds no complete answer, with the reason in `capture_note` when the proxy knows it.
+`request_understood` is `false` for a request the proxy could not read as a model call, which is then
+kept whole as untrusted, with the reason in `request_note` when there is one.
+
 It does not see:
 
 - **whether a tool really ran**, or what it did. It sees the model ask for it, and on the next
@@ -103,9 +108,9 @@ which the proxy does not see.
 - **It listens on this machine only** unless you pass `--allow-network` and at least one
   `--allow-client` address range. Between the agent and the proxy the traffic is plain HTTP and
   carries the API key: keep it on the same host, or on a network you trust, or put TLS in front.
-- **The API key passes through and is never written down.** Only an allowlist of request
+- **The API key in the request passes through and is not written down.** Only an allowlist of request
   headers is recorded (the client and API version), and any key a provider echoes in an error is
-  masked. Keys in a query string are masked in the evidence and the logs.
+  masked. A key a provider echoes in a normal answer is recorded with that answer. Keys in a query string are masked in the evidence and the logs.
 - **Recording never stops a call.** If writing evidence fails, the call goes through, and the
   failure is counted and logged.
 - **Limits:** request bodies up to 64 MiB, answers kept up to 64 MiB, 256 connections at once.

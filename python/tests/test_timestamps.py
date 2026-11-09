@@ -235,8 +235,43 @@ def test_without_the_library_tokens_are_reported_unchecked(monkeypatch):
     import mnestiq.timestamps
 
     def missing():
-        raise TimestampError("timestamps need: pip install mnestiq[timestamps]")
+        raise mnestiq.timestamps.TimestampsNotInstalled("timestamps need: pip install mnestiq[timestamps]")
 
     monkeypatch.setattr(mnestiq.timestamps, "_rfc3161", missing)
     report = verify_file(EVIDENCE, [PUB])
     assert report.ok and "timestamp_unverified" in {w.code for w in report.warnings}
+
+
+def _last_token_changed(tmp_path, change):
+    """The last checkpoint changed and its record_hash redone, as anyone can do with no key."""
+    records = load(EVIDENCE)
+    assert records[-1]["kind"] == "checkpoint"
+    change(records[-1])
+    records[-1]["record_hash"] = record_hash(records[-1])
+    path = tmp_path / "e.jsonl"
+    dump(path, records)
+    return verify_file(path, [PUB])
+
+
+def test_bytes_after_the_token_are_an_error(tmp_path):
+    def add_bytes(cp):
+        cp["timestamp_token"] = base64.b64encode(base64.b64decode(cp["timestamp_token"]) + b"\x00\x00").decode()
+
+    report = _last_token_changed(tmp_path, add_bytes)
+    assert not report.ok and "timestamp" in {i.code for i in report.errors}
+
+
+def test_a_token_with_bytes_after_its_end_is_not_a_token():
+    token, signature = token_of(checkpoints()[-1])
+    verify_token(token, signature, default_roots())
+    with pytest.raises(TimestampError, match="after its end"):
+        verify_token(token + b"\x00\x00", signature, default_roots())
+
+
+@pytest.mark.parametrize("empty", [None, "", 0, False, [], {}], ids=repr)
+def test_a_token_field_that_is_present_but_empty_is_an_error(tmp_path, empty):
+    def blank(cp):
+        cp["timestamp_token"] = empty
+
+    report = _last_token_changed(tmp_path, blank)
+    assert not report.ok and "timestamp" in {i.code for i in report.errors}

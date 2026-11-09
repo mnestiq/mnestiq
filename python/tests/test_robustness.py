@@ -196,10 +196,11 @@ def test_concurrent_writers_keep_a_valid_chain(tmp_path, key, pub):
         t.join()
     rec.close()
     report = verify_file(path, [pub])
-    assert report.ok and report.events == 8 * 27 and report.unsigned_tail == 0
+    assert report.ok and report.events == 8 * 27 + 1 and report.unsigned_tail == 0  # +1: the clean-close heartbeat
     per_run = {}
     for e in _events(path):
-        per_run.setdefault(e["run_id"], []).append(e["step_id"])
+        if not e["run_id"].startswith("recorder-"):  # the recorder's own heartbeat has no step
+            per_run.setdefault(e["run_id"], []).append(e["step_id"])
     assert all(steps == list(range(27)) for steps in per_run.values())
 
 

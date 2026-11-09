@@ -127,7 +127,11 @@ def _digests(elements: list[Any]) -> list[str]:
 
 
 def _next(previous: str, element: Any) -> str:
-    return hashlib.sha256((previous + json.dumps(_essence(element), sort_keys=True, ensure_ascii=False,
+    try:
+        essence = _essence(element)
+    except RecursionError:  # nested too deep to walk: grouping is a guess, and this message adds nothing to it
+        essence = []
+    return hashlib.sha256((previous + json.dumps(essence, sort_keys=True, ensure_ascii=False,
                                                  default=str)).encode("utf-8", "replace")).hexdigest()
 
 

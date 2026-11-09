@@ -302,9 +302,13 @@ def test_a_stream_finished_in_another_task_does_not_raise():
     sink = MemorySink()
     rec = Recorder(sink, agent_id="a")
     scope = rec.ensure_run()
-    scope.__enter__()
-    other = contextvars.copy_context()
-    other.run(scope.__exit__, None, None, None)  # finished elsewhere: no exception
+
+    def opened_here():  # in a context of its own, so that the run this leaves open does not reach later tests
+        scope.__enter__()
+        other = contextvars.copy_context()
+        other.run(scope.__exit__, None, None, None)  # finished elsewhere: no exception
+
+    contextvars.copy_context().run(opened_here)
     assert [r["event_type"] for r in sink.records if r.get("kind") == "event"] == ["run_start", "run_end"]
 
 

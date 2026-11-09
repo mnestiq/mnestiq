@@ -13,8 +13,8 @@ ready.
 
 ## Supported versions
 
-Security fixes go into the latest release. From 1.0 on, the evidence format is stable: a fix never
-makes existing evidence stop verifying, unless the fix is that it should not have verified.
+Security fixes go into the latest release. From 1.0 on, the evidence format is stable: we treat a
+fix that makes valid evidence stop verifying as a bug.
 
 ## Scope
 
@@ -44,7 +44,3 @@ Publishing: no person holds a PyPI token, and a maintainer approves each publish
   Without the last two options it checks only that some workflow in this repository built it.
 - Every action in the workflows is pinned to a commit, and Dependabot proposes updates.
   CI checks dependencies for known vulnerabilities (`pip-audit`).
-
-## Supported versions
-
-Mnestiq is pre-1.0. Fixes are made on the latest release only.

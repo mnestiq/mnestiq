@@ -25,9 +25,11 @@ from ..recorder import Recorder, Run
 from .formats import (
     ANTHROPIC,
     OPENAI,
+    REPEATED_KEY,
     EventStream,
     answer_fields,
     model_api,
+    read_json,
     request_fields,
     stream_reader,
     unreadable_request,
@@ -211,6 +213,7 @@ class ModelProxy:
         self._server = _Server((self.host, self.port), self)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, name="mnestiq-proxy", daemon=True)
+        self._thread.__dict__["_mnestiq_own"] = True  # the egress hooks leave it alone, and its handlers start from it
         self._thread.start()
         return self.host, self.port
 
@@ -308,44 +311,82 @@ class ModelProxy:
 
     def record_call(self, run: Run, how: str, api: str, up: Upstream, rest: str, body: Any, status: int | None,
                     capture: _Capture | None, error: str | None, latency_ms: int, where: dict,
-                    request_headers: Any, response_headers: dict[str, str], client: str) -> None:
+                    request_headers: Any, response_headers: dict[str, str], client: str,
+                    repeated_key: bool = False) -> None:
+        """Write the call down. No call goes unrecorded: if the record cannot be written whole, what can be
+        written is, and it says so."""
+        fields: dict[str, Any] = {}
+        written = None
         try:
-            fields: dict[str, Any] = {"provider": up.name, "latency_ms": latency_ms}
-            attributes: dict[str, Any] = {
-                "captured_by": "proxy", "upstream": up.name, "api": api, "grouping": how,
-                "streaming": bool(capture and capture.streaming), "http_status": status,
-                "url": sanitize_url(up.url(rest)), "client": client,
-                "request_headers": {k: request_headers[k] for k in _KEPT_HEADERS if request_headers.get(k)},
-            }
-            provider_id = next((response_headers[k] for k in _PROVIDER_IDS if response_headers.get(k)), None)
-            if provider_id:
-                attributes["upstream_request_id"] = provider_id
-            if where:
-                attributes["connection"] = where
-            try:
-                fields.update(request_fields(api, body, rest, self.tool_sources))
-            except Exception:  # shaped as no SDK sends it: kept whole, as untrusted
-                fields.update(unreadable_request(body))
-                attributes["request_understood"] = False
-            answer = capture.answer() if capture is not None else None
-            if capture is not None and capture.stream_error is not None:  # the cause, before what followed
-                error = "the provider reported an error in the stream: " + _short(capture.stream_error) + (
-                    f" ({error})" if error else "")
-            if status is not None and status >= 400 and error is None:
-                error = f"HTTP {status}" + (f": {_error_message(answer)}" if answer else "")
-            if answer is not None and (status or 0) < 400:
-                try:
-                    fields.update(answer_fields(api, answer))
-                except Exception:
-                    attributes["output_captured"] = False
-            else:
-                attributes["output_captured"] = False
-            if error:
-                fields["error"] = _without(error, _credentials(request_headers))
-            fields["attributes"] = attributes
-            run.llm_call(**fields)
+            fields = self._call_fields(how, api, up, rest, body, status, capture, error, latency_ms, where,
+                                       request_headers, response_headers, client, repeated_key)
+            written = run.llm_call(**fields)
+        except Exception as exc:
+            self.recorder._record_failure(exc)
+        if written is None:
+            self._record_what_is_left(run, up, status, error, latency_ms, client, fields)
+            return
+        try:
             if "output" in fields:
                 self.runs.learn(run, api, body, fields)
+        except Exception as exc:
+            self.recorder._record_failure(exc)
+
+    def _call_fields(self, how: str, api: str, up: Upstream, rest: str, body: Any, status: int | None,
+                     capture: _Capture | None, error: str | None, latency_ms: int, where: dict,
+                     request_headers: Any, response_headers: dict[str, str], client: str,
+                     repeated_key: bool) -> dict[str, Any]:
+        fields: dict[str, Any] = {"provider": up.name, "latency_ms": latency_ms}
+        attributes: dict[str, Any] = {
+            "captured_by": "proxy", "upstream": up.name, "api": api, "grouping": how,
+            "streaming": bool(capture and capture.streaming), "http_status": status,
+            "url": sanitize_url(up.url(rest)), "client": client,
+            "request_headers": {k: request_headers[k] for k in _KEPT_HEADERS if request_headers.get(k)},
+        }
+        provider_id = next((response_headers[k] for k in _PROVIDER_IDS if response_headers.get(k)), None)
+        if provider_id:
+            attributes["upstream_request_id"] = provider_id
+        if where:
+            attributes["connection"] = where
+        try:
+            fields.update(request_fields(api, body, rest, self.tool_sources))
+        except Exception:  # shaped as no SDK sends it: kept whole, as untrusted
+            fields.update(unreadable_request(body))
+            attributes["request_understood"] = False
+        if repeated_key:
+            attributes["request_understood"] = False
+            attributes["request_note"] = REPEATED_KEY
+        answer = capture.answer() if capture is not None else None
+        if capture is not None and capture.stream_error is not None:  # the cause, before what followed
+            error = "the provider reported an error in the stream: " + _short(capture.stream_error) + (
+                f" ({error})" if error else "")
+        if status is not None and status >= 400 and error is None:
+            error = f"HTTP {status}" + (f": {_error_message(answer)}" if answer else "")
+        if answer is not None and (status or 0) < 400:
+            try:
+                fields.update(answer_fields(api, answer))
+            except Exception:
+                attributes["output_captured"] = False
+        else:
+            attributes["output_captured"] = False
+        problem = capture.problem if capture is not None else None
+        if problem is not None:  # what was read stays in the record, marked as not the whole answer
+            attributes["output_captured"] = False
+            attributes["capture_note"] = problem
+        if error:
+            fields["error"] = _without(error, _credentials(request_headers))
+        fields["attributes"] = attributes
+        return fields
+
+    def _record_what_is_left(self, run: Run, up: Upstream, status: int | None, error: str | None, latency_ms: int,
+                             client: str, fields: dict[str, Any]) -> None:
+        """The record of the call was refused: the fact of the call is still written, without its content."""
+        attributes = {"captured_by": "proxy", "upstream": up.name, "http_status": status, "client": client,
+                      "request_understood": False, "output_captured": False,
+                      "capture_note": "the full record of this call could not be written"}
+        try:
+            run.llm_call(provider=up.name, model=str(fields.get("model", "unknown")), context=[], latency_ms=latency_ms,
+                         error=fields.get("error", error), attributes=attributes)
         except Exception as exc:
             self.recorder._record_failure(exc)
 
@@ -401,6 +442,8 @@ class _Capture:
         self.api, self.streaming, self.limit = api, streaming and api is not None, limit
         self.raw = bytearray()
         self.complete = True
+        self._taken = 0  # bytes read so far, after unpacking
+        self._repeated = False
         self._inflate = zlib.decompressobj(16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS) \
             if encoding in ("gzip", "deflate") else None
         self._unreadable = encoding not in ("", "identity", "gzip", "deflate")
@@ -408,17 +451,19 @@ class _Capture:
         self._reader = stream_reader(api) if self.streaming and api else None
 
     def feed(self, piece: bytes) -> None:
-        if self._unreadable or self.api is None:
+        if self._unreadable or self.api is None or not self.complete:
             return
         try:
-            data = self._inflate.decompress(piece) if self._inflate is not None else piece
-            if self._events is not None and self._reader is not None:
+            # A small body can unpack to gigabytes, so no more than the limit is ever unpacked.
+            data = self._inflate.decompress(piece, self.limit - self._taken + 1) if self._inflate is not None else piece
+            self._taken += len(data)
+            if self._taken > self.limit:
+                self.complete = False
+            elif self._events is not None and self._reader is not None:
                 for event, payload in self._events.feed(data):
                     self._reader.feed(event, payload)
-            elif len(self.raw) + len(data) <= self.limit:
-                self.raw += data
             else:
-                self.complete = False
+                self.raw += data
         except Exception:  # an answer the proxy cannot read is still passed on whole
             self._unreadable = True
 
@@ -426,15 +471,34 @@ class _Capture:
     def stream_error(self) -> Any:
         return getattr(self._reader, "error", None)
 
+    @property
+    def problem(self) -> str | None:
+        """Why what was read is not the whole answer as the agent got it, if so. Asked after ``answer``."""
+        if self._repeated or (self._reader is not None and self._reader.repeated):
+            return REPEATED_KEY
+        if not self.complete:
+            return "the answer was larger than the capture limit"
+        if self._reader is None or self._events is None or self._unreadable:
+            return None
+        if self._events.broken:
+            return "an event was too large to read, and nothing after it was read"
+        if self._reader.unreadable:
+            return f"{self._reader.unreadable} event(s) could not be read"
+        return None if self._reader.finished else "the stream ended before its last event"
+
     def answer(self) -> dict | None:
         if self._unreadable:
             return None
         if self._reader is not None:
-            return self._reader.result()
+            try:
+                return self._reader.result()
+            except Exception:  # what was fed cannot be put back together
+                self._unreadable = True
+                return None
         if not self.complete or not self.raw:
             return None
         try:
-            value = json.loads(bytes(self.raw))
+            value, self._repeated = read_json(bytes(self.raw))
         except (ValueError, RecursionError):
             return None
         return value if isinstance(value, dict) else None
@@ -446,6 +510,7 @@ class _TooLarge(Exception):
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 128  # the default of 5 drops calls in a burst on Linux
 
     def __init__(self, address: tuple[str, int], proxy: ModelProxy) -> None:
         self.proxy = proxy
@@ -510,9 +575,12 @@ class _Handler(BaseHTTPRequestHandler):
         if status in (400, 413, 502):
             self.send_header("Connection", "close")
             self.close_connection = True
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except OSError:  # the agent has gone: what is recorded next must still be recorded
+            self.close_connection = True
 
     def _proxy(self) -> None:
         proxy = self.server.proxy
@@ -535,9 +603,10 @@ class _Handler(BaseHTTPRequestHandler):
         method = self.command
         api = model_api(up.family, method, rest)
         parsed: Any = None
+        repeated_key = False
         if api is not None:
             try:
-                parsed = json.loads(body)
+                parsed, repeated_key = read_json(body)
             except (ValueError, RecursionError):  # not JSON, or nested too deep to read: passed on unread
                 parsed = None
             if not isinstance(parsed, dict):
@@ -552,7 +621,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._refuse(502, refused)
             if run is not None:
                 proxy.record_call(run, how, api or "", up, rest, parsed, None, None, refused, _ms(start), {},
-                                  self.headers, {}, client)
+                                  self.headers, {}, client, repeated_key)
             else:
                 proxy.record_other(up, method, rest, None, refused, client)
             return
@@ -561,14 +630,14 @@ class _Handler(BaseHTTPRequestHandler):
             if run is not None:
                 proxy.record_call(run, how, api or "", up, rest, parsed, None, None,
                                   "refused: a header or path the proxy cannot pass on", _ms(start), {},
-                                  self.headers, {}, client)
+                                  self.headers, {}, client, repeated_key)
             return
         except (OSError, http.client.HTTPException) as exc:
             unreachable = f"the upstream {up.name} could not be reached: {type(exc).__name__}"
             self._refuse(502, unreachable)
             if run is not None:
                 proxy.record_call(run, how, api or "", up, rest, parsed, None, None, unreachable, _ms(start), {},
-                                  self.headers, {}, client)
+                                  self.headers, {}, client, repeated_key)
             else:
                 proxy.record_other(up, method, rest, None, unreachable, client)
             return
@@ -584,7 +653,7 @@ class _Handler(BaseHTTPRequestHandler):
             conn.close()
         if run is not None:
             proxy.record_call(run, how, api or "", up, rest, parsed, response.status, capture, error, _ms(start),
-                              where, self.headers, response_headers, client)
+                              where, self.headers, response_headers, client, repeated_key)
         else:
             proxy.record_other(up, method, rest, response.status, error, client)
 
@@ -609,7 +678,11 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self.send_header("Connection", "close")
             self.close_connection = True
-        self.end_headers()
+        try:
+            self.end_headers()
+        except OSError:  # gone before the answer started: the provider did the work, and it is still recorded
+            self.close_connection = True
+            return "the agent closed the connection before the answer ended"
         if no_body:
             response.read()
             return None

@@ -261,6 +261,7 @@ const TYPE_COLOR = { llm_call: "--t-llm", tool_call: "--t-tool", egress: "--t-eg
 // web page is consistent with prompt injection, but also with an agent legitimately acting
 // on that page. The investigator decides which.
 const RULES = {
+  "MNQ-000": { name: "record not evaluated", explain: "Not an observation about the agent: the rules could not read all of this record, so findings that depend on it, here or later in the run, may be missing." },
   "MNQ-001": { name: "untrusted argument", explain: "A tool call's arguments carry an address, URL or account number that appears in untrusted content and not in the user's or system's words." },
   "MNQ-002": { name: "auto-approval", explain: "An action was approved without a human after untrusted content reached the model in this run, and the approved call carries a value from that content." },
   "MNQ-003": { name: "egress after taint", explain: "Outbound network connection (not to loopback, and not the agent's own model API) after untrusted content reached the model in this run." },
@@ -271,9 +272,11 @@ const RULES = {
 // follow: while the newest file/run is selected, move to newer ones as agents write them.
 // MNQ-001: tool-call arguments carrying a destination or identifier (email, URL or host, account
 // or long number) that untrusted content introduced. Mirrors mnestiq/findings.py.
+// Every pattern takes time in proportion to its text, however hostile, as in findings.py: a repeat that can
+// fail and start again from the next character is bounded, or the match takes the text it read with it.
 const IND_RX = [
-  /[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g,
-  /(?:https?:\/\/|www\.)[^\s"'<>)\]]+|\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:com|org|net|io|co|ai|dev|app|info|biz|xyz|me|us|uk|de|eu|ly|gl|link|site|online)\b(?:\/[^\s"'<>)\]]*)?/gi,
+  /[A-Za-z0-9_.+-]{1,254}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,16}/g,
+  /(?:https?:\/\/|www\.)[^\s"'<>)\]]+|\b[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,6}\.(?:com|org|net|io|co|ai|dev|app|info|biz|xyz|me|us|uk|de|eu|ly|gl|link|site|online)\b(?:\/[^\s"'<>)\]]*)?/gi,
   /\b[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}\b/g,
 ];
 const LONG_NUM = /\+?[0-9][0-9 -]{7,}[0-9]/g;
@@ -282,37 +285,126 @@ const SPACED_ACCOUNT = /\b[A-Z]{2}[0-9]{2}(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{1,3}
 const ACCOUNT_SHAPE = /^[a-z]{2}[0-9]{2}[a-z0-9]{10,30}$/;
 const DATE = /[0-9]{4}-[0-9]{2}-[0-9]{2}/;  // 2024-03-07 is not a number to trace
 const SEP = /[ -]/g;
+const MAX_REDUCED = 128;  // past this many indicators in one value, the longest-form reduction is skipped
+// The work one pass over a file may do looking things up in context, in characters scanned, as in findings.py.
+// What the limit stops is reported as MNQ-000 on the record it stopped.
+const MAX_NAME = 1024;  // a tool's name is matched against many patterns, and no real one is this long
+const MAX_EFFORT = 1000000000;
+const EFFORT_PER_RECORD = 100000;
+const EFFORT_PER_CHARACTER = 16;
+const EFFORT_PER_MATCH = 500;
+let effort = null;  // set while derive() runs
+function spend(amount) {
+  if (!effort) return true;
+  if (amount > effort.left) { effort.cut = true; return false; }
+  effort.left -= amount;
+  return true;
+}
+function overLimit() {
+  if (!effort || !effort.cut) return false;
+  effort.cut = false;
+  return true;
+}
+// As str.rstrip: a pattern ending in +$ would try again from every character of a long run.
+function trimEnd(text, chars) {
+  let end = text.length;
+  while (end > 0 && chars.includes(text[end - 1])) end--;
+  return text.slice(0, end);
+}
 function indicators(text) {
   const found = new Set();
-  // Word by word, each cut at 2048 characters: hostile text cannot make the patterns take quadratic time.
-  const words = text.split(/\s+/).filter(Boolean).map((w) => w.slice(0, 2048));
-  for (const w of words) for (const rx of [IND_RX[0], IND_RX[2]]) for (const m of w.matchAll(rx)) found.add(m[0].toLowerCase().replace(/[.,;:/]+$/, ""));
+  for (const rx of [IND_RX[0], IND_RX[2]]) for (const m of text.matchAll(rx)) found.add(trimEnd(m[0].toLowerCase(), ".,;:/"));
   // A model may add or drop the scheme or "www." when it copies a link.
-  for (const w of words) for (const m of w.matchAll(IND_RX[1])) found.add(m[0].toLowerCase().replace(/^(?:https?:\/\/)?(?:www\.)?/, "").replace(/[.,;:/]+$/, ""));
+  for (const m of text.matchAll(IND_RX[1])) found.add(trimEnd(m[0].toLowerCase().replace(/^(?:https?:\/\/)?(?:www\.)?/, ""), ".,;:/"));
   for (const m of text.matchAll(LONG_NUM)) if (!DATE.test(m[0])) found.add(m[0].replace(SEP, ""));
   for (const m of text.matchAll(SPACED_ACCOUNT)) found.add(m[0].replace(SEP, "").toLowerCase());
   // Keep the longest form: an email's domain or an IBAN's digits are not separate indicators.
   const all = [...found].filter((f) => f.length >= 6);
+  if (all.length > MAX_REDUCED) return all.sort();  // a form that is also part of a longer one only costs a lookup
   return all.filter((f) => !all.some((g) => g !== f && g.includes(f))).sort();
 }
 const strings = (v) => (v == null ? [] : Array.isArray(v) ? v.flatMap(strings)
   : typeof v === "object" ? Object.values(v).flatMap(strings) : [String(v)]);
-function corpus(segs) {
-  const text = segs.flatMap((s) => strings(s.content)).join("\n").toLowerCase();
-  return { text, compact: text.replace(/(?<=[0-9])[ -](?=[0-9])/g, ""),  // "12 34" is one number, "account 1234" is not
-           accounts: new Set([...text.matchAll(SPACED_ACCOUNT)].map((m) => m[0].replace(SEP, ""))) };
+// A carried segment is read only once.
+const SEGMENTS = new WeakMap();
+function readSegment(s) {
+  let known = SEGMENTS.get(s);
+  if (!known) {
+    const text = strings(s.content).join("\n").toLowerCase();
+    known = { text, compact: text.replace(/(?<=[0-9])[ -](?=[0-9])/g, ""),  // "12 34" is one number, "account 1234" is not
+              accounts: [...text.matchAll(SPACED_ACCOUNT)].map((m) => m[0].replace(SEP, "")) };
+    SEGMENTS.set(s, known);
+    if (effort) effort.left += EFFORT_PER_CHARACTER * text.length;
+  }
+  return known;
 }
-const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function corpus(segs) {
+  const parts = segs.map(readSegment);
+  const whole = spend(2 * parts.reduce((n, p) => n + p.text.length + 16, 0));
+  return { text: whole ? parts.map((p) => p.text).join("\n") : "", compact: whole ? parts.map((p) => p.compact).join("\n") : "",
+           accounts: new Set(whole ? parts.flatMap((p) => p.accounts) : []) };
+}
+const ALNUM = new Set("abcdefghijklmnopqrstuvwxyz0123456789");
+const WORD = new Set("abcdefghijklmnopqrstuvwxyz0123456789_-");
+// Whether needle is in text as a whole match: no letter or digit after it, and nothing of "before" in front of it.
+function present(text, needle, before) {
+  if (!spend(text.length + 16)) return false;
+  for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + 1)) {
+    if (!before.has(text[at - 1]) && !ALNUM.has(text[at + needle.length])) return true;
+    if (!spend(EFFORT_PER_MATCH)) return false;
+  }
+  return false;
+}
 // Whole matches only: "billing@acme.exam" must not count as present in "billing@acme.example".
-const inCorpus = (c, ind) => (ACCOUNT_SHAPE.test(ind) && c.accounts.has(ind)) || new RegExp(`(?<![a-z0-9_-])${escapeRx(ind)}(?![a-z0-9])`)
-  .test(/^[0-9]+$/.test(ind) || ind.startsWith("+") ? c.compact : c.text);
+const inCorpus = (c, ind) => (ACCOUNT_SHAPE.test(ind) && c.accounts.has(ind))
+  || present(/^[0-9]+$/.test(ind) || ind.startsWith("+") ? c.compact : c.text, ind, WORD);
+const holds = (c, value) => present(c.text, value, ALNUM);
 // Loopback traffic never leaves the machine (a local model server, a sidecar): not egress. A request
 // for another host sent to a proxy on this machine does leave it.
-function loopbackHost(value) {
-  const host = String(value || "").replace(/^\[|\]$/g, "").split("%")[0].toLowerCase();
-  return host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+// An address is read as Python's ipaddress reads it, so that the two agree on every spelling. Mirrors mnestiq/findings.py.
+function ipv4Octets(text) {
+  const parts = text.split(".");
+  if (parts.length !== 4 || parts.some((p) => !/^[0-9]{1,3}$/.test(p) || (p !== "0" && p[0] === "0") || Number(p) > 255)) return null;
+  return parts.map(Number);
 }
-function isLoopback(e) {
+function ipv6Hextets(text) {
+  const parts = text.split(":");
+  if (parts.length < 3) return null;
+  if (parts[parts.length - 1].includes(".")) {
+    const octets = ipv4Octets(parts.pop());
+    if (!octets) return null;
+    parts.push(((octets[0] << 8) | octets[1]).toString(16), ((octets[2] << 8) | octets[3]).toString(16));
+  }
+  if (parts.length > 9) return null;
+  const gaps = parts.slice(1, -1).flatMap((p, i) => (p ? [] : [i + 1]));  // "::", where a run of zeros was left out
+  if (gaps.length > 1) return null;
+  let high = parts.length, low = 0, skipped = 0;
+  if (gaps.length) {
+    high = gaps[0];
+    low = parts.length - high - 1;
+    if (!parts[0] && --high) return null;
+    if (!parts[parts.length - 1] && --low) return null;
+    skipped = 8 - (high + low);
+    if (skipped < 1) return null;
+  } else if (parts.length !== 8 || !parts[0] || !parts[7]) return null;
+  const used = [...parts.slice(0, high), ...parts.slice(parts.length - low)];
+  if (used.some((p) => !/^[0-9a-f]{1,4}$/i.test(p))) return null;
+  const numbers = used.map((p) => parseInt(p, 16));
+  return [...numbers.slice(0, high), ...new Array(skipped).fill(0), ...numbers.slice(high)];
+}
+function loopbackHost(value) {
+  const host = String(value || "");
+  const bare = host.replace(/^[\[\]]+|[\[\]]+$/g, "").split("%")[0];
+  const v4 = ipv4Octets(bare);
+  if (v4) return v4[0] === 127;
+  const v6 = ipv6Hextets(bare);
+  if (!v6) return host.toLowerCase() === "localhost";
+  const zeros = (n) => v6.slice(0, n).every((h) => h === 0);
+  return (zeros(7) && v6[7] === 1) || (zeros(5) && v6[5] === 0xffff && v6[6] >> 8 === 127);
+}
+function isLoopback(ev, e) {
+  const via = viaProxy(ev);
+  if (via && !loopbackHost(via)) return false;
   return loopbackHost(e.dest_ip || e.host) && (!e.host || loopbackHost(e.host));
 }
 // The agent's own model API is a model call, not egress after taint. Mirrors mnestiq/findings.py.
@@ -323,6 +415,33 @@ function isModelApi(e) {
   const host = String(e.host || "").toLowerCase().replace(/\.$/, "");
   return MODEL_API_HOSTS.has(host) || MODEL_API_HOST.test(host);
 }
+// A model API's name in a request sent through a proxy no one vouched for says nothing about who reads it.
+function isOwnModelApi(ev, e) {
+  return isModelApi(e) && !viaProxy(ev);
+}
+// MNQ-003 counts a datagram or raw socket the audit hooks noted. Mirrors mnestiq/findings.py.
+const SOCKET_NOTES = ["udp_connect", "udp_send", "raw_connect", "raw_send"];
+function socketNote(ev) {
+  const attributes = ev.attributes;
+  const note = attributes && typeof attributes === "object" && !Array.isArray(attributes) ? attributes.network : null;
+  if (!note || typeof note !== "object" || Array.isArray(note) || !SOCKET_NOTES.includes(note.kind)) return null;
+  return ["dest_ip", "host"].some((f) => f in note && typeof note[f] !== "string") ? null : note;
+}
+// Past the note limits, further datagram or raw socket destinations go unnamed, and MNQ-003 cannot see them.
+// A limit on loopback alone leaves nothing out that it would count. Mirrors mnestiq/findings.py.
+function socketNotesRanOut(ev) {
+  const attributes = ev.attributes;
+  const note = attributes && typeof attributes === "object" && !Array.isArray(attributes) ? attributes.network : null;
+  if (!note || typeof note !== "object" || Array.isArray(note)) return false;
+  if (note.kind === "limit_reached") return SOCKET_NOTES.includes(note.of) && note.loopback !== true;
+  const byKind = note.by_kind;
+  return note.kind === "dropped_summary" && !!byKind && typeof byKind === "object" && !Array.isArray(byKind)
+    && Object.keys(byKind).some((k) => SOCKET_NOTES.includes(k));
+}
+function viaProxy(ev) {
+  const via = (ev.attributes || {}).via_proxy;
+  return typeof via === "string" ? via : "";
+}
 // MNQ-004: a sensitive action whose argument values came from untrusted content. Mirrors
 // mnestiq/findings.py. Sensitive = marked by the recorder, else guessed from the tool's name.
 const SENSITIVE_NAME = /password|passwd|credential|secret|token|api_?key|permission|role|grant|revoke|delete|remove|erase|reset|disable|transfer|refund|payment|send_money|pay_|schedule_transaction|update_scheduled|update_user|update_email|update_account|create_user|reserve|book_|cancel|suspend|deactivate|terminate|close_account|change_|modify_|forward|share_|invite|unsubscribe|discount|bank|iban|payout|credit|update_customer|update_supplier|update_vendor|update_payee/i;
@@ -330,6 +449,11 @@ const DESTRUCTIVE_NAME = /delete|remove|erase|revoke|disable|cancel|suspend|deac
 const NUMBER = /^[+-]?[0-9]+(?:\.[0-9]+)?$/;
 const DATE_ONLY = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
 const READ_ONLY = /^(get|list|read|search|find|fetch|lookup|query|describe|view|show|check)_/;
+// What makes a tool call the one a model asked for: its name and argument values. Mirrors mnestiq/findings.py.
+function requestKey(call) {
+  try { return [String(call.name || ""), ...strings(call.arguments).sort()].join("\0"); }
+  catch { return null; }  // too deep to read here: it counts as asked for by no one
+}
 function isSensitive(ev, name) {
   const marked = (ev.attributes || {}).sensitive;
   if (typeof marked === "boolean") return marked;
@@ -348,22 +472,35 @@ function untrustedValues(tool, args, context) {
     // Numbers: any id for a destructive tool, else four digits up (a credit limit, not a quantity).
     // Other values under three characters ("r" for read access) match by chance.
     if (NUMBER.test(v) ? !destructive && v.replace(/^[+-]/, "").split(".")[0].length < 4 : v.length < 3) continue;
-    const token = new RegExp(`(?<![a-z0-9])${escapeRx(v)}(?![a-z0-9])`);
-    if (token.test(untrusted.text) && !token.test(trusted.text))
+    if (holds(untrusted, v) && !holds(trusted, v))
       hits.push({ value: value.trim(),
-        sources: [...new Set(segs.filter((s) => token.test(corpus([s]).text)).map((s) => s.source))].sort() });
+        sources: [...new Set(segs.filter((s) => holds(corpus([s]), v)).map((s) => s.source))].sort() });
   }
   return hits;
 }
 // MNQ-005: images, and links carrying data, that untrusted content put in the model's answer.
 // Mirrors mnestiq/findings.py.
-const IMAGE_RX = /!\[[^\]]*\]\(\s*<?([^)\s>]+)|<img\b[^>]*?\bsrc\s*=\s*["']?([^"'\s>]+)/gi;
+// Each matches as soon as it has read to the closing bracket, whether or not what follows makes it an image:
+// the text it read is not read again from the next "![" inside it.
+const IMAGE_RX = /!\[[^\]]*(?:\]\(\s*<?([^)\s>]+))?|<img\b([^>]*)/gi;
+const IMAGE_SRC_RX = /\bsrc\s*=\s*["']?([^"'\s>]+)/i;
 const LINK_RX = /https?:[\/\\]*[^\s"'<>)\]]+/gi;
-const REF_IMAGE_RX = /!\[[^\]]*\]\[([^\]]+)\]/g;
-const REF_DEF_RX = /^\s*\[([^\]]+)\]:\s*<?(\S+?)>?(?:\s|$)/gm;
+const REF_IMAGE_RX = /!\[[^\]]*(?:\]\[([^\]]+)\])?/g;
+const REF_DEF_RX = /^[ \t]*\[([^\]]*)(?:\]:\s*<?(\S+?)>?(?:\s|$))?/gm;
+const MAX_LABELS = 16;  // a host and its parents, from the end: the end of a longer name is what its owner controls
+function images(text) {
+  const found = new Set();
+  for (const m of text.matchAll(IMAGE_RX)) {
+    const source = m[1] || (m[2] ? (IMAGE_SRC_RX.exec(m[2]) || [])[1] : null);
+    if (source) found.add(source);
+  }
+  const refs = new Map([...text.matchAll(REF_DEF_RX)].filter((m) => m[1] && m[2]).map((m) => [m[1].toLowerCase(), m[2]]));
+  for (const m of text.matchAll(REF_IMAGE_RX)) if (m[1] && refs.has(m[1].toLowerCase())) found.add(refs.get(m[1].toLowerCase()));
+  return found;
+}
 // The host and its parent domains of two labels or more: img.evil.example loads from evil.example's owner too.
 function domains(host) {
-  const labels = host.split(".");
+  const labels = host.split(".").slice(-MAX_LABELS);
   const out = [];
   for (let i = 0; i < labels.length - 1; i++) out.push(labels.slice(i).join("."));
   return out.length ? out : [host];
@@ -385,13 +522,10 @@ function answerLinks(ev, untrustedSegs) {
   if (!untrustedSegs.length || !text) return [];
   const untrusted = corpus(untrustedSegs);
   const trusted = corpus((ev.context || []).filter((s) => TRUSTED.has(s.source)));
-  const images = new Set();
-  for (const m of text.matchAll(IMAGE_RX)) for (const u of [m[1], m[2]]) if (u) images.add(u);
-  const refs = new Map([...text.matchAll(REF_DEF_RX)].map((m) => [m[1].toLowerCase(), m[2]]));
-  for (const m of text.matchAll(REF_IMAGE_RX)) if (refs.has(m[1].toLowerCase())) images.add(refs.get(m[1].toLowerCase()));
-  const candidates = [...images].sort().map((u) => [u, "image"]);
+  const pictures = images(text);
+  const candidates = [...pictures].sort().map((u) => [u, "image"]);
   for (const m of text.matchAll(LINK_RX))
-    if (!images.has(m[0]) && m[0].includes("?") && m[0].split("?").slice(1).join("?").includes("=")) candidates.push([m[0], "link"]);
+    if (!pictures.has(m[0]) && m[0].includes("?") && m[0].split("?").slice(1).join("?").includes("=")) candidates.push([m[0], "link"]);
   const hits = [];
   const seen = new Set();
   for (const [url, kind] of candidates) {
@@ -426,7 +560,7 @@ function untrustedArguments(ev, untrustedSegs) {
 // Mirrors mnestiq/findings.py.
 const SENDS = /send|mail|post|upload|share|forward|publish|webhook|message|reply|notify/;
 const DESTINATION_KEY = /^(to|cc|bcc|recipients?|emails?|address|url|endpoint|webhook|destination|target)$/i;
-const DATA_TOKEN = /[A-Za-z0-9][A-Za-z0-9._@+-]*[0-9][A-Za-z0-9._@+-]*/g;  // codes, prices, ids: holds a digit
+const DATA_TOKEN = /[A-Za-z0-9][A-Za-z0-9._@+-]*/g;  // codes, prices, ids: those with a digit after the first character
 const MIN_CARRIED = 5;  // a reply about one order carries 2 or 3, a list many more
 function destinations(args) {
   const named = args && typeof args === "object" && !Array.isArray(args)
@@ -445,8 +579,8 @@ function internalDataOut(tool, args, context) {
   // What only the company's systems said: not the sender's, the user's or the system prompt's words.
   const data = corpus(internal);
   const others = corpus(context.filter((s) => UNTRUSTED.has(s.source) || s.source === "user" || s.source === "system"));
-  const tokens = new Set(strings(args).flatMap((v) => [...v.slice(0, 20000).matchAll(DATA_TOKEN)].map((m) => m[0].toLowerCase().replace(/[.,;:]+$/, ""))));
-  for (const t of [...tokens]) if (/^[0-9]+\.[0-9]*0$/.test(t)) tokens.add(t.replace(/0+$/, "").replace(/\.$/, ""));  // 86.40 for 86.4
+  const tokens = new Set(strings(args).flatMap((v) => [...v.matchAll(DATA_TOKEN)].filter((m) => /[0-9]/.test(m[0].slice(1))).map((m) => trimEnd(m[0].toLowerCase(), ".,;:"))));
+  for (const t of [...tokens]) if (/^[0-9]+\.[0-9]*0$/.test(t)) tokens.add(trimEnd(t, "0").replace(/\.$/, ""));  // 86.40 for 86.4
   const carried = [...tokens].filter((t) => t.length >= 4 && inCorpus(data, t) && !inCorpus(others, t)).sort();
   return carried.length < MIN_CARRIED ? [] : fresh.map((d) => ({ destination: d, carried }));
 }
@@ -552,6 +686,10 @@ async function tick() {
 }
 
 function derive(payload) {
+  effort = { left: MAX_EFFORT, cut: false };
+  try { return deriveAll(payload); } finally { effort = null; }
+}
+function deriveAll(payload) {
   const { records, report } = payload;
   const errBySeq = new Map();
   for (const e of report.errors) if (e.seq != null) (errBySeq.get(e.seq) || errBySeq.set(e.seq, []).get(e.seq)).push(e);
@@ -559,12 +697,21 @@ function derive(payload) {
   // A record is sealed only by a checkpoint that verifies: one that fails (a record edited and its
   // hash recomputed breaks the Merkle root there) seals nothing.
   const covering = (seq) => checkpoints.find((c) => seq >= c.covers.from_seq && seq <= c.covers.to_seq);
-  const sealed = (seq) => { const c = covering(seq); return c ? (errBySeq.has(c.seq) ? "failed" : "sealed") : ""; };
+  const restarts = new Map((report.restarts || []).map((x) => [x.checkpoint_seq, x]));
+  const sealed = (seq) => {
+    const c = covering(seq);
+    if (!c) return "";
+    if (errBySeq.has(c.seq)) return "failed";
+    const late = restarts.get(c.seq);
+    return late && seq >= late.from_seq && seq <= late.to_seq ? "restart" : "sealed";
+  };
+  // recorder.py names its own run recorder-<first 8 of chain_id>. Its notes are not agent activity.
+  const ownNote = (r) => r.event_type === "note" && r.run_id === "recorder-" + Array.from(String(r.chain_id)).slice(0, 8).join("");
 
   const runs = new Map();
   const totals = { llm: 0, tool: 0, egress: 0, flags: 0, failed: 0 };
   for (const r of records) {
-    if (r.kind !== "event" || !r.run_id || r.event_type === "heartbeat") continue;  // liveness, not agent activity
+    if (r.kind !== "event" || !r.run_id || r.event_type === "heartbeat" || ownNote(r)) continue;  // not agent activity
     let run = runs.get(r.run_id);
     if (!run) {
       run = { id: r.run_id, parent: r.parent_run_id || null, agent: r.agent_id, operator: r.operator_id,
@@ -586,12 +733,33 @@ function derive(payload) {
   for (const run of runs.values()) {
     let taint = null;
     let lastContext = [];
-    const calls = [];  // [index, name, call, context]: what each approval approved
+    const calls = new Map();  // name -> [index, name, call, context], in order: what each approval approved
     const approvals = [];  // [index, event, approval, taint step]
+    const requests = new Map();  // request key -> contexts of the model calls that asked for it, not yet answered
+    let latestAsked = new Set();  // request keys of the latest model call
     for (const [i, ev] of run.events.entries()) {
       ev._flags = [];
+      if (effort) effort.left += EFFORT_PER_RECORD;
+      try {
+      // As findings.py: a name past the limit is not matched against the patterns, and that is said.
+      for (const [entries, field] of [[ev.tool_calls, "name"], [ev.approvals, "action"]])
+        for (const e of entries || []) if (String(e[field] || "").length > MAX_NAME) throw new Error("over the name limit");
       if (ev.event_type === "llm_call") {
+        if (ev["x-context-truncated"] != null || ev["x-context-missing"] != null)
+          ev._flags.push({ rule: "MNQ-000", finding: "this call's context is incomplete, so findings that depend on the rest of it may be missing", taint: ev.step_id });
+        else if (ev.attributes && ev.attributes.output_captured === false && !(ev.status === "error" && !ev.attributes.capture_note))
+          ev._flags.push({ rule: "MNQ-000", finding: "this call's output was not captured, so findings that depend on what the model asked for may be missing", taint: ev.step_id });
+        else if (ev.attributes && (ev.attributes.output_captured === "partial" || ev.attributes.partial === true))
+          ev._flags.push({ rule: "MNQ-000", finding: "this call's output was only partly captured, because the stream stopped early or went past the size limit, so findings that depend on the rest of what the model asked for may be missing", taint: ev.step_id });
         lastContext = ev.context || [];
+        latestAsked = new Set();
+        for (const call of ev.tool_calls || []) {
+          const key = requestKey(call);
+          if (key === null) continue;
+          if (!requests.has(key)) requests.set(key, []);
+          requests.get(key).push(lastContext);
+          latestAsked.add(key);
+        }
         const bad = lastContext.filter((s) => UNTRUSTED.has(s.source));
         if (bad.length) {
           taint = taint || { step: ev.step_id, sources: [...new Set(bad.map((s) => s.source))] };
@@ -609,29 +777,55 @@ function derive(payload) {
             for (const out of internalDataOut(call.name, call.arguments, lastContext))
               ev._flags.push({ rule: "MNQ-006", finding: `${call.name} (requested) → ${out.destination} carrying ${out.carried.slice(0, 3).join(", ")} (from internal)`, taint: taint ? taint.step : ev.step_id });
           }
-      } else if (taint && ev.event_type === "egress" && !isLoopback((ev.egress || [])[0] || {}) && !isModelApi((ev.egress || [])[0] || {})) {
+      } else if (taint && ev.event_type === "egress" && !isLoopback(ev, (ev.egress || [])[0] || {}) && !isOwnModelApi(ev, (ev.egress || [])[0] || {})) {
         const e = (ev.egress || [])[0] || {};
         ev._flags.push({ rule: "MNQ-003", finding: `${addr(e.source_ip, e.source_port)} → ${addr(e.dest_ip, e.dest_port)}`, taint: taint.step });
+      } else if (taint && ev.event_type === "note" && socketNote(ev) && !isLoopback(ev, socketNote(ev)) && !isOwnModelApi(ev, socketNote(ev))) {
+        const n = socketNote(ev);
+        ev._flags.push({ rule: "MNQ-003", finding: `${n.kind} → ${n.dest_ip || n.host || "?"}:${n.dest_port == null ? "?" : n.dest_port}`, taint: taint.step });
+      } else if (taint && ev.event_type === "note" && socketNotesRanOut(ev)) {
+        ev._flags.push({ rule: "MNQ-000", finding: "further datagram or raw socket destinations were not noted, so findings that depend on them may be missing", taint: ev.step_id });
       } else if (taint && ev.event_type === "approval") {
         const a = (ev.approvals || [])[0] || {};
         if (a.decision === "approved" && a.approver_type !== "human") approvals.push([i, ev, a, taint.step]);
       } else if (ev.event_type === "tool_call") {
         for (const call of ev.tool_calls || []) {
-          calls.push([i, String(call.name || ""), call, lastContext]);
-          for (const out of internalDataOut(call.name, call.arguments, lastContext))
+          // The model call that asked for this tool call, when another thread's has come in between.
+          // In a run that goes one step at a time the latest model call asked for it, and is the one used.
+          const key = requestKey(call);
+          const asked = requests.get(key ?? "");
+          const older = asked && asked.length ? asked.pop() : null;
+          const context = older === null || latestAsked.has(key) ? lastContext : older;
+          const callName = String(call.name || "");
+          if (!calls.has(callName)) calls.set(callName, []);
+          calls.get(callName).push([i, callName, call, context]);
+          for (const out of internalDataOut(call.name, call.arguments, context))
             ev._flags.push({ rule: "MNQ-006", finding: `${call.name} → ${out.destination} carrying ${out.carried.slice(0, 3).join(", ")} (from internal)`, taint: taint ? taint.step : ev.step_id });
           if (taint && isSensitive(ev, call.name))
-            for (const hit of untrustedValues(call.name, call.arguments, lastContext))
+            for (const hit of untrustedValues(call.name, call.arguments, context))
               ev._flags.push({ rule: "MNQ-004", finding: `${call.name} ← "${hit.value}" (from ${hit.sources.join(",")})`, taint: taint.step });
         }
       }
+      } catch {  // a file can hold anything: one record must not cost the rest, and must not pass in silence
+        ev._flags.push({ rule: "MNQ-000", finding: "the rules could not read this record", taint: ev.step_id });
+      }
+      if (overLimit())
+        ev._flags.push({ rule: "MNQ-000", finding: "the rules reached their work limit on this file", taint: ev.step_id });
     }
     // An approval is judged by the call it approved: the next one of that name, else the latest before it.
     for (const [i, ev, a, step] of approvals) {
-      const same = calls.filter((c) => c[1] === String(a.action || ""));
-      const match = same.find((c) => c[0] > i) || same[same.length - 1];
-      if (match ? approvalMatters(match[1], match[2], match[3]) : approvalMatters(String(a.action || ""), null, []))
-        ev._flags.push({ rule: "MNQ-002", finding: `${a.action} by ${a.approver}`, taint: step });
+      const same = calls.get(String(a.action || "")) || [];
+      let low = 0, high = same.length;
+      while (low < high) { const mid = (low + high) >> 1; if (same[mid][0] > i) high = mid; else low = mid + 1; }
+      const match = low < same.length ? same[low] : same[same.length - 1];
+      try {
+        if (match ? approvalMatters(match[1], match[2], match[3]) : approvalMatters(String(a.action || ""), null, []))
+          ev._flags.push({ rule: "MNQ-002", finding: `${a.action} by ${a.approver}`, taint: step });
+      } catch {
+        ev._flags.push({ rule: "MNQ-000", finding: "this approval could not be judged", taint: step });
+      }
+      if (overLimit())
+        ev._flags.push({ rule: "MNQ-000", finding: "this approval could not be judged: the rules reached their work limit", taint: step });
     }
     for (const ev of run.events) for (const f of ev._flags) run.flags.push({ seq: ev.seq, step: ev.step_id, ...f });
     totals.flags += run.flags.length;
@@ -659,7 +853,7 @@ function renderFileSelect(root) {
   const current = [...sel.options].map((o) => o.value).join("|");
   const next = state.files.map((f) => f.name).join("|");
   if (current !== next) {
-    sel.replaceChildren(...state.files.map((f) => h("option", { value: f.name }, `${f.ok ? "" : "[!] "}${f.name}`)));
+    sel.replaceChildren(...state.files.map((f) => h("option", { value: f.name }, `${f.unrecognised ? "[?] " : f.ok ? "" : "[!] "}${f.name}`)));
     if (!state.files.length) sel.append(h("option", { value: "" }, "no evidence files"));
   }
   sel.value = state.name || "";
@@ -685,7 +879,7 @@ function renderBadge(d) {
   const r = d.report;
   const errors = r.errors_total ?? r.errors.length;
   const cls = !r.ok ? "bad" : r.warnings.length ? "warn" : "ok";
-  const label = !r.ok ? `Integrity failed · ${plural(errors, "error")}` : r.warnings.length ? "Verified · warnings" : "Verified";
+  const label = d.payload.file.unrecognised ? "Unrecognised · not verified" : !r.ok ? `Integrity failed · ${plural(errors, "error")}` : r.warnings.length ? "Verified · warnings" : "Verified";
   badge.replaceChildren(h("span", { class: `status ${cls}` }, label));
   const signer = r.signer_keys.length ? r.signer_keys.join(", ") : "unsigned";
   meta.textContent = `${r.checkpoints} checkpoints · signer ${signer} · key ${d.payload.pinned ? "pinned" : "NOT pinned"}`;
@@ -702,6 +896,19 @@ function renderBanners(d) {
   if (d.payload.records_shown_from > 0) {
     box.append(h("div", { class: "banner warn" },
       `Large file: showing the most recent ${d.records.length.toLocaleString()} of ${d.payload.records_total.toLocaleString()} records. Verification covered the whole file.`));
+  }
+  const unread = d.records.filter((r) => r._unparseable).length;
+  if (unread) {
+    box.append(h("div", { class: "banner bad" },
+      `${plural(unread, "record")} could not be read and ${unread === 1 ? "is" : "are"} not shown. The rules did not run on ${unread === 1 ? "it" : "them"}, so findings may be missing. The problems are listed below.`));
+  }
+  if (d.payload.file.unrecognised) {
+    box.append(h("div", { class: "banner warn" }, d.report.errors[0].message));
+    return;
+  }
+  for (const c of d.report.continues_from || []) {
+    box.append(h("div", { class: "banner warn" },
+      `This chain was started in place of a file that could not be continued (${c.reason}). That file was renamed ${c.file}. Keep it and check it. If it is gone, nothing here shows what it held.`));
   }
   if (d.report.errors.length) {
     const total = d.report.errors_total ?? d.report.errors.length;
@@ -799,7 +1006,11 @@ function renderDetail(d) {
   const table = h("table", { class: "tl" },
     h("thead", {}, h("tr", {}, h("th", {}, "Seq"), h("th", { class: "time-h" }, "Time (UTC)"), h("th", {}, "Step"),
       h("th", {}, "Type"), h("th", {}, "Detail"), h("th", {}, "Seal"))),
-    h("tbody", {}, run.events.map((ev) => renderEvent(ev, d))));
+    h("tbody", {}, run.events.map((ev) => {
+      try { return renderEvent(ev, d); } catch {  // one record must not blank the page
+        return h("tr", { class: "ev tampered" }, h("td", { class: "seq" }, String(ev.seq)), h("td", { colspan: 5, class: "err" }, "This record could not be shown."));
+      }
+    })));
   pane.replaceChildren(head, findings, h("div", { class: "scroll", id: "timeline" }, table));
   const tl = document.getElementById("timeline");
   if (state.focusSeq != null) {
@@ -825,6 +1036,8 @@ function renderEvent(ev, d) {
     const m = ev.model || {};
     headline = m.version || m.name || "model";
     sub.push(...(ev.context || []).map((seg, i) => segTag(ev, seg, i)));
+    if (ev["x-context-missing"] != null || ev["x-context-truncated"] != null)
+      sub.push(h("span", { class: "err", title: "part of this call's context could not be restored" }, "context incomplete"));
     if (ev.tool_calls?.length) sub.push(h("span", {}, "→"), ...ev.tool_calls.map((tc) => h("span", { class: "call" }, `${tc.name}(${argsPreview(tc.arguments)})`)));
     (ev.context || []).forEach((seg, i) => { if (state.open.has(`${ev.seq}:c${i}`)) more.push(kv(`${seg.source}${seg.name ? " · " + seg.name : ""}`, content(seg.content, seg.content_hash, "content"))); });
     if (open) {
@@ -867,12 +1080,13 @@ function renderEvent(ev, d) {
     headline = ev.attributes?.message || t;
   }
   if (ev.error && t !== "run_end" && t !== "tool_call") sub.push(h("span", { class: "err" }, ev.error));
-  if (open) for (const f of ev._flags) more.push(kv(f.rule, `${RULES[f.rule].explain}${f.rule === "MNQ-001" ? "" : ` Untrusted content first reached the model at step ${f.taint}.`}`));
+  if (open) for (const f of ev._flags) more.push(kv(f.rule, `${RULES[f.rule].explain}${f.rule === "MNQ-001" || f.rule === "MNQ-000" ? "" : ` Untrusted content first reached the model at step ${f.taint}.`}`));
   if (open) more.push(h("details", {}, h("summary", { class: "label", style: "cursor:pointer" }, "Raw record"),
     h("pre", { class: "content" }, JSON.stringify(ev, (k, v) => (k.startsWith("_") ? undefined : v), 2))));
 
   const seal = errors.length ? h("span", { class: "seal broken", title: "record no longer matches what was signed" }, "BROKEN")
     : sealed === "failed" ? h("span", { class: "seal broken", title: "the checkpoint covering this record does not verify" }, "SEAL FAILS")
+    : sealed === "restart" ? h("span", { class: "seal sealed", title: "signed only after a restart: until then this record rested on the hash chain alone, so an earlier change to it could not be detected" }, "sealed late")
     : h("span", { class: `seal${sealed ? " sealed" : ""}`, title: sealed ? "covered by a signed checkpoint" : "not yet covered by a signed checkpoint" }, sealed ? "sealed" : "pending");
   return h("tr", {
       class: `ev${open ? " open" : ""}${errors.length ? " tampered" : ""}${ev._flags.length ? " flagged" : ""}`,
@@ -942,8 +1156,10 @@ function renderFinder() {
 }
 
 function focusSeq(seq) {
-  const rec = state.data.records.find((r) => r.seq === seq);
-  if (rec?.run_id) state.runId = rec.run_id;
+  let rec = state.data.records.find((r) => r.seq === seq);
+  // A recorder's own note is in no run: show what follows it.
+  if (rec?.run_id && !state.data.runs.has(rec.run_id)) rec = state.data.records.find((r) => r.seq > seq && state.data.runs.has(r.run_id));
+  if (rec?.run_id) { state.runId = rec.run_id; seq = rec.seq; }
   state.follow.run = false;
   state.focusSeq = seq;
   state.open.add(String(seq));

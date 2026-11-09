@@ -29,7 +29,10 @@ def parse_json(data: str | bytes) -> Any:
     and it accepts ``NaN``. Either would let one evidence line mean two different things to
     two verifiers, so both are refused.
     """
-    return json.loads(data, object_pairs_hook=_no_duplicates, parse_constant=_no_constant, parse_int=_number)
+    if isinstance(data, bytes):  # json.loads would guess: UTF-16 or a BOM must not read here and fail in the verifier
+        data = data.decode("utf-8")
+    return json.loads(data, object_pairs_hook=_no_duplicates, parse_constant=_no_constant, parse_int=_number,
+                      parse_float=_float)
 
 
 def _number(text: str) -> int | float:
@@ -42,6 +45,13 @@ def _number(text: str) -> int | float:
     if math.isinf(as_float):
         raise CanonicalizationError(f"number {text[:20]}... is too large for JSON")
     return as_float
+
+
+def _float(text: str) -> float:
+    value = float(text)
+    if math.isinf(value):  # 1e999: JSON can spell it, and nothing can hash or send it on
+        raise CanonicalizationError(f"number {text[:20]} is too large for JSON")
+    return value
 
 
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict:
@@ -95,8 +105,12 @@ def _write(value: Any, out: list[str]) -> None:
         for key in value:
             if not isinstance(key, str):
                 raise CanonicalizationError(f"object keys must be strings, got {key!r}")
+        try:
+            ordered = sorted(value, key=lambda k: k.encode("utf-16-be"))
+        except UnicodeEncodeError as exc:  # a lone surrogate in a key
+            raise CanonicalizationError(f"object key is not valid Unicode: {exc}") from exc
         out.append("{")
-        for i, key in enumerate(sorted(value, key=lambda k: k.encode("utf-16-be"))):
+        for i, key in enumerate(ordered):
             if i:
                 out.append(",")
             out.append(json.dumps(key, ensure_ascii=False))

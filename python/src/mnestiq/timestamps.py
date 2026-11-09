@@ -18,7 +18,10 @@ parsing and handed to the verifier separately. Install with ``pip install mnesti
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import threading
+import time
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Sequence
@@ -38,6 +41,10 @@ class TimestampError(Exception):
     pass
 
 
+class TimestampsNotInstalled(TimestampError):
+    """The optional library is missing: the token could not be checked, which is not the same as a bad token."""
+
+
 def default_roots() -> list[x509.Certificate]:
     """The roots of the default TSAs: DigiCert Trusted Root G4 and USERTrust RSA (Sectigo)."""
     pem = resources.files("mnestiq").joinpath("tsa_roots.pem").read_bytes()
@@ -48,7 +55,7 @@ def _rfc3161() -> Any:
     try:
         import rfc3161_client
     except ImportError as exc:
-        raise TimestampError("timestamps need: pip install mnestiq[timestamps]") from exc
+        raise TimestampsNotInstalled("timestamps need: pip install mnestiq[timestamps]") from exc
     return rfc3161_client
 
 
@@ -87,9 +94,36 @@ class Timestamper:
         raise TimestampError("no timestamp authority answered: " + "; ".join(problems))
 
     def _post(self, url: str, body: bytes) -> bytes:
+        """The TSA's answer, within ``timeout`` seconds in all. The socket timeout alone restarts with
+        every byte, and a checkpoint waits here with the agent behind it, so the request runs on the side."""
+        outcome: list[bytes | Exception] = []
+
+        def fetch() -> None:
+            try:
+                outcome.append(self._fetch(url, body))
+            except Exception as exc:
+                outcome.append(exc)
+
+        context = contextvars.copy_context()  # the egress hooks must keep seeing this as the recorder's own traffic
+        worker = threading.Thread(target=context.run, args=(fetch,), name="mnestiq-tsa", daemon=True)
+        worker.start()
+        worker.join(self.timeout)
+        if not outcome:
+            raise TimestampError(f"no complete answer within {self.timeout} s")
+        if isinstance(outcome[0], Exception):
+            raise outcome[0]
+        return outcome[0]
+
+    def _fetch(self, url: str, body: bytes) -> bytes:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/timestamp-query"})
+        deadline = time.monotonic() + self.timeout
+        data = b""
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            data: bytes = resp.read(1 << 20)
+            while len(data) < 1 << 20 and time.monotonic() < deadline:  # a slow answer can't keep this thread either
+                chunk = resp.read1((1 << 20) - len(data))
+                if not chunk:
+                    break
+                data += chunk
         return data
 
 
@@ -186,7 +220,10 @@ def token_from_response(reply: bytes) -> bytes:
     tag, body, _ = _read(reply, 0)
     if tag != 0x30:
         raise TimestampError("the TSA's answer is not a TimeStampResp")
-    status, rest = _children(body)[0], _children(body)[1:]
+    parts = _children(body)
+    if not parts:
+        raise TimestampError("the TSA's answer is empty")
+    status, rest = parts[0], parts[1:]
     status_tag, status_body, _ = _read(status, 0)
     code_tag, code, _ = _read(status_body, 0)
     if status_tag != 0x30 or code_tag != 0x02 or int.from_bytes(code, "big") not in (0, 1):
@@ -202,7 +239,9 @@ def split_certificates(token: bytes) -> tuple[list[x509.Certificate], bytes]:
     The certificate list is outside what the TSA signs, so removing it changes nothing
     the signature covers.
     """
-    tag, body, _ = _read(token, 0)
+    tag, body, end = _read(token, 0)
+    if end != len(token):  # bytes after the token would change the record's hash and nothing else
+        raise TimestampError("the token has bytes after its end")
     oid, explicit = _children(body)[:2]
     _, inner, _ = _read(explicit, 0)
     _, signed_data, _ = _read(inner, 0)
@@ -260,7 +299,10 @@ def _der(tag: int, content: bytes) -> bytes:
 
 def _without_credentials(url: str) -> str:
     """The URL without a user:password@ part, for logs."""
-    parts = urllib.parse.urlsplit(url)
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:  # called while handling a failure: the next authority must still get its turn
+        return "<unparseable url>"
     if "@" not in parts.netloc:
         return url
     return urllib.parse.urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))

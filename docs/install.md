@@ -1,7 +1,8 @@
 # Installing the recorder
 
 The recorder is a Python package. It needs Python 3.10 or newer and runs on Windows, macOS and Linux.
-It makes no network calls of its own: evidence stays where you write it.
+Unless you turn on a signing service, Key Vault or timestamps, it makes no network calls of its own:
+evidence stays where you write it.
 
 ## 1. Install
 
@@ -60,7 +61,7 @@ see [signing.md](signing.md).
 
 ## 4. Record your agent
 
-Either run the proxy and point the agent at it (no code changes, any language), or add the recorder to
+Either run the proxy and point the agent at it (no code changes, for an agent that lets you set its model API's base URL), or add the recorder to
 your Python code. Both are in the [README](../README.md#record-your-own-agent). Then:
 
 ```bash
@@ -74,7 +75,9 @@ Wherever you point it: `FileSink("evidence.jsonl")` or the proxy's first argumen
 new evidence files are readable by their owner only. On Windows a file takes its folder's permissions,
 so keep evidence in a folder only the agent's account can read. Evidence holds what the agent read and
 wrote, which may include personal data or secrets that passed through it: treat it like the data it
-came from. `mnestiq redact` makes a copy without that content that still verifies.
+came from. `mnestiq redact` makes a copy without that content that still verifies. It refuses a file
+that holds a malformed record, a value that does not match its digest, a field this version does not
+know, or any `x-` field other than `x-omitted`, and then writes no copy.
 
 ## Uninstall
 
