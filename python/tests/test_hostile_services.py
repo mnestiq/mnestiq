@@ -1196,6 +1196,7 @@ class RawUpstream:
             if callable(reply):
                 reply(conn)
             else:
+                conn.settimeout(60)  # a 16 MiB reply can take more than the 5 seconds above on a busy machine
                 conn.sendall(reply)
             conn.shutdown(socket.SHUT_WR)
 
