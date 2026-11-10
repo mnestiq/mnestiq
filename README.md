@@ -107,7 +107,8 @@ mnestiq dashboard evidence.jsonl --trusted-key keys/signing.pub
   out by default because model calls are recorded on their own.
 - **Provenance:** every piece of model context is tagged at capture time:
   `system`, `user`, `model`, `tool_output`, `retrieved_doc`, `web`, `agent_msg`,
-  `memory`. That's what makes prompt-injection analysis possible afterwards.
+  `memory`. That's what makes prompt-injection analysis possible afterwards. A role or content
+  block this version does not know is tagged `unknown`, which the rules treat as untrusted.
 - **Tamper evidence:** records are hash-chained (RFC 8785 canonical JSON, SHA-256)
   and periodically sealed by Ed25519-signed Merkle checkpoints (RFC 9162 trees).
   Edits, deletions, insertions and reordering of records under a signed checkpoint fail
@@ -170,8 +171,9 @@ mnestiq dashboard evidence/ --trusted-key keys/signing.pub
 A local investigation view at the link it prints (`http://127.0.0.1:8765/?key=...`, whose key keeps
 other accounts on the machine out): runs and sub-runs, a step-by-step
 timeline with every piece of model context colored by provenance, findings (below), the
-file's verification result, each record's status (sealed, unsealed, or tampered, worked out
-in the page and not covered by the test suite), and a connection finder: paste an `ip:port` and jump
+file's verification result, each record's status (sealed, unsealed, or tampered: the server says
+which checkpoints verified, and the page marks each record from that, which the test suite does not
+run), and a connection finder: paste an `ip:port` and jump
 to the agent step with that recorded connection. It live-updates while agents write.
 
 | Rule | Name | Fires when |
@@ -192,7 +194,13 @@ verdict: an agent that visits a link a colleague posted triggers `MNQ-001` too. 
 cannot read (a field of a type the recorder never writes), a model call whose context could not be
 restored in full, and a record the rules' work limit stopped all come back as `MNQ-000`, so a finding
 that depended on them is never lost in silence. The same rules are available in Python as
-`mnestiq.findings`.
+`mnestiq.findings`. The dashboard's server runs them over each whole file.
+
+A host counts as its parent domain's (`img.evil.example` is `evil.example`'s), except under a shared
+suffix where anyone can have a name, such as `co.uk` or `github.io`. Two names there are two sites. The
+list of shared suffixes is built in and is not the full public suffix list, so two sites under a suffix
+it lacks can still be taken for one. `MNQ-005` finds images in markdown, in markdown references, and in
+HTML tags that load an address when shown (`img`, `image`, `video`, `audio`, `source`, `input`).
 
 It stays on your machine: it binds to loopback only, rejects non-local `Host` headers,
 renders evidence strictly as text, and its Content-Security-Policy forbids the page from
@@ -228,7 +236,7 @@ cannot read as evidence, or at one another recorder is writing refuses to start 
 | **Power loss** | `FileSink(path, fsync=True)` forces each record to disk before the agent continues. |
 | **Someone deletes the end of the file** | `Recorder(..., on_checkpoint=HeadFile("/other/disk/agent.head.json"))` keeps the latest checkpoint in a second place; `mnestiq verify evidence.jsonl --head /other/disk/agent.head.json` then reports a file cut back to an earlier checkpoint. |
 | **Sensitive content** | New evidence files are created owner-read/write only on Linux and macOS. On Windows a file takes its folder's access list, so keep evidence in a folder only the agent's account can read. Use `mnestiq redact` before sharing. It refuses a file it cannot redact safely: see [docs/install.md](docs/install.md#where-evidence-is-kept). |
-| **Large evidence in the dashboard** | The dashboard verifies the whole file but shows the most recent 20,000 records. |
+| **Large evidence in the dashboard** | The dashboard verifies the whole file and runs the rules over it, but shows the most recent 20,000 records. Findings on earlier records are listed apart, up to 20,000, with a count of the rest. |
 
 ## Repository layout
 

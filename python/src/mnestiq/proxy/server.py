@@ -20,10 +20,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..egress import sanitize_url
-from ..recorder import Recorder, Run
+from ..egress import _mask_params_in_text, sanitize_url
+from ..integrations._common import _CLOSED_EARLY
+from ..integrations.openai import chat_left_out
+from ..recorder import _UNKNOWN, Recorder, Run
 from .formats import (
     ANTHROPIC,
+    CHAT,
+    DEFAULT_CONTENT_BYTES,
     OPENAI,
     REPEATED_KEY,
     EventStream,
@@ -365,14 +369,20 @@ class ModelProxy:
         if answer is not None and (status or 0) < 400:
             try:
                 fields.update(answer_fields(api, answer))
+                left_out = chat_left_out(answer) if api == CHAT else None
+                if left_out is not None:  # as the SDK path marks it
+                    attributes["output_captured"], attributes["capture_note"] = "partial", left_out
             except Exception:
                 attributes["output_captured"] = False
         else:
             attributes["output_captured"] = False
         problem = capture.problem if capture is not None else None
         if problem is not None:  # what was read stays in the record, marked as not the whole answer
-            attributes["output_captured"] = False
+            # As the SDK path marks it: partial when some of the answer is in the record.
+            attributes["output_captured"] = "partial" if "output" in fields else False
             attributes["capture_note"] = problem
+        if error is None and capture is not None and capture.ended_early:
+            error = _CLOSED_EARLY  # as the SDK path says of a stream that did not reach its end
         if error:
             fields["error"] = _without(error, _credentials(request_headers))
         fields["attributes"] = attributes
@@ -385,8 +395,8 @@ class ModelProxy:
                       "request_understood": False, "output_captured": False,
                       "capture_note": "the full record of this call could not be written"}
         try:
-            run.llm_call(provider=up.name, model=str(fields.get("model", "unknown")), context=[], latency_ms=latency_ms,
-                         error=fields.get("error", error), attributes=attributes)
+            run.llm_call(provider=up.name, model=str(fields.get("model") or _UNKNOWN), context=[],
+                         latency_ms=latency_ms, error=fields.get("error", error), attributes=attributes)
         except Exception as exc:
             self.recorder._record_failure(exc)
 
@@ -438,8 +448,10 @@ def _short(value: Any, limit: int = 300) -> str:
 class _Capture:
     """A copy of the answer as it passes, up to ``limit`` bytes, read back afterwards."""
 
-    def __init__(self, api: str | None, streaming: bool, encoding: str, limit: int) -> None:
+    def __init__(self, api: str | None, streaming: bool, encoding: str, limit: int,
+                 content_limit: int = DEFAULT_CONTENT_BYTES) -> None:
         self.api, self.streaming, self.limit = api, streaming and api is not None, limit
+        self.content_limit = content_limit
         self.raw = bytearray()
         self.complete = True
         self._taken = 0  # bytes read so far, after unpacking
@@ -448,7 +460,7 @@ class _Capture:
             if encoding in ("gzip", "deflate") else None
         self._unreadable = encoding not in ("", "identity", "gzip", "deflate")
         self._events = EventStream() if self.streaming else None
-        self._reader = stream_reader(api) if self.streaming and api else None
+        self._reader = stream_reader(api, content_limit) if self.streaming and api else None
 
     def feed(self, piece: bytes) -> None:
         if self._unreadable or self.api is None or not self.complete:
@@ -484,7 +496,20 @@ class _Capture:
             return "an event was too large to read, and nothing after it was read"
         if self._reader.unreadable:
             return f"{self._reader.unreadable} event(s) could not be read"
+        # The notes the SDK path writes for the same stream.
+        if self._reader.truncated:
+            return f"output past {self.content_limit} bytes was not kept"
+        if self._reader.damaged:
+            return "a chunk of the stream could not be read or put in its place"
+        if self._reader.accumulator.left_out:
+            return self._reader.accumulator.left_out
         return None if self._reader.finished else "the stream ended before its last event"
+
+    @property
+    def ended_early(self) -> bool:
+        """A stream read to its last byte that never said its answer was complete."""
+        return (self._reader is not None and self._events is not None and self.complete and not self._unreadable
+                and not self._events.broken and not self._reader.finished)
 
     def answer(self) -> dict | None:
         if self._unreadable:
@@ -559,7 +584,9 @@ class _Handler(BaseHTTPRequestHandler):
                    sanitize_url("http://proxy" + path) if path.startswith("/") else "(unparsed request)", code)
 
     def log_message(self, format: str, *args: Any) -> None:
-        _log.debug("proxy: %s", _SECRET_IN_TEXT.sub(r"\1=***", format % args if args else format))
+        # A bad request line is quoted whole, with keys in brackets or encoded as well as plain ones.
+        text = _mask_params_in_text(format % args if args else format)
+        _log.debug("proxy: %s", _SECRET_IN_TEXT.sub(r"\1=***", text))
 
     def do_GET(self) -> None:
         with self.server.proxy._call():
@@ -644,7 +671,7 @@ class _Handler(BaseHTTPRequestHandler):
         response_headers = {k.lower(): v for k, v in response.getheaders()}
         streaming = "text/event-stream" in response_headers.get("content-type", "")
         capture = _Capture(api, streaming, response_headers.get("content-encoding", "").lower(),
-                           proxy.max_capture_bytes) if api is not None else None
+                           proxy.max_capture_bytes, proxy.recorder.max_content_bytes) if api is not None else None
         error = self._relay(conn, response, capture)
         if error is None and not response.will_close:
             response.close()  # read to the end, but Python 3.10 leaves it open and the connection unusable

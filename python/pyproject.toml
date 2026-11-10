@@ -58,6 +58,11 @@ exclude = ["**/__pycache__", "**/*.pyc", ".coverage"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+xfail_strict = true
+markers = [
+    "leaves_state(reason): the test leaves process state behind on purpose, so the leak guard in conftest.py skips it",
+]
 
 [tool.ruff]
 line-length = 120

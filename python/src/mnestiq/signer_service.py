@@ -66,6 +66,9 @@ from .verify import WITNESS_FOLDER, WITNESS_KIND, WITNESS_VERSION, read_witness_
 _log = logging.getLogger("mnestiq.signer")
 MAX_REQUEST = 1 << 20
 HANDSHAKE_SECONDS = 5.0  # a client that has not proven the token by then is cut off
+IDLE_SECONDS = 300.0  # a connection with no request for this long is closed. SignerClient reconnects by itself
+MAX_CONNECTIONS = 256  # handled at once. Past it a new connection is closed at once, as the proxy does
+MAX_HANDSHAKES = 32  # of those, still proving the token: one without it cannot hold the rest for long
 _MERKLE_ROOT = re.compile(r"sha256:[0-9a-f]{64}")
 MIN_TOKEN_CHARS = 32  # signer init writes 64
 MAX_COVERED = 1 << 40  # records in one checkpoint: their hashes alone would fill over 100 TB of the recorder's memory
@@ -665,15 +668,24 @@ class SignerService:
             fh.flush()
             os.fsync(fh.fileno())
 
-    def start(self, address: str = "127.0.0.1:8741") -> SignerServer:
-        return SignerServer(self, address)
+    def start(self, address: str = "127.0.0.1:8741", *, max_connections: int = MAX_CONNECTIONS,
+              idle_seconds: float = IDLE_SECONDS) -> SignerServer:
+        return SignerServer(self, address, max_connections=max_connections, idle_seconds=idle_seconds)
 
 
 class SignerServer:
     """Accepts connections on a background thread until ``close()``."""
 
-    def __init__(self, service: SignerService, address: str) -> None:
+    def __init__(self, service: SignerService, address: str, *, max_connections: int = MAX_CONNECTIONS,
+                 idle_seconds: float = IDLE_SECONDS) -> None:
+        if not _is_int(max_connections) or max_connections < 1:
+            raise SignerError(f"max_connections must be a whole number of at least 1, not {max_connections!r}")
+        if not (math.isfinite(idle_seconds) and idle_seconds > 0):
+            raise SignerError(f"idle_seconds must be a positive number of seconds, not {idle_seconds!r}")
         self.service = service
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self._handshakes = threading.BoundedSemaphore(min(MAX_HANDSHAKES, max_connections))
+        self._idle_seconds = idle_seconds
         target = parse_address(address)
         if isinstance(target, str) and os.name == "nt":
             raise SignerError("on Windows the signer listens on 127.0.0.1:<port>")
@@ -701,22 +713,50 @@ class SignerServer:
                 if self._closed:
                     return
                 continue
-            _own_thread(self._serve, "mnestiq-signer-client", conn).start()
+            # A thread per connection, so their number is bounded, and so is the number still proving the token.
+            if not self._slots.acquire(blocking=False):
+                self._turn_away(conn)
+                continue
+            if not self._handshakes.acquire(blocking=False):
+                self._slots.release()
+                self._turn_away(conn)
+                continue
+            try:
+                _own_thread(self._serve, "mnestiq-signer-client", conn).start()
+            except RuntimeError:  # no thread to be had: this one is closed, the next may find one
+                self._handshakes.release()
+                self._slots.release()
+                self._turn_away(conn)
+
+    @staticmethod
+    def _turn_away(conn: Any) -> None:
+        _log.warning("mnestiq signer: too many connections at once, closed a new one")
+        with contextlib.suppress(OSError):
+            conn.close()
 
     def _serve(self, conn: Any) -> None:
+        try:
+            self._serve_one(conn)
+        finally:
+            self._slots.release()
+
+    def _serve_one(self, conn: Any) -> None:
         with contextlib.closing(conn):
             try:
                 read_timeout(conn, HANDSHAKE_SECONDS)
                 deliver_challenge(conn, self._token)
                 answer_challenge(conn, self._token)
-                read_timeout(conn, None)
+                # Not for ever: a client that stalls would hold its thread and its slot.
+                read_timeout(conn, self._idle_seconds)
             except (AuthenticationError, OSError, EOFError) as exc:  # wrong token, or silent too long
                 _log.warning("mnestiq signer: rejected a connection: %r", exc)
                 return
+            finally:
+                self._handshakes.release()
             while True:
                 try:
                     raw = conn.recv_bytes(MAX_REQUEST)
-                except (EOFError, OSError):
+                except (EOFError, OSError):  # closed, or idle past the deadline
                     return
                 try:
                     reply = self.service.handle(json.loads(raw))

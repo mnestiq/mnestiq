@@ -18,6 +18,7 @@ import os
 import socket
 import struct
 import threading
+import time
 from typing import Any, Protocol, runtime_checkable
 
 from cryptography.hazmat.primitives import hashes
@@ -44,6 +45,10 @@ class WitnessUnsupported(SignerError):
 
 
 WITNESS_TIMEOUT_S = 3.0  # how long one witness send waits for an answer, on its own connection
+IDLE_REUSE_S = 120.0  # a connection idle longer is not reused: the service closes idle ones (300 s by default)
+# Sent again after a failure even when the service may have read them: a repeated sign is answered with the
+# signature already given for that exact request, and the others change nothing.
+_SAFE_TO_RESEND = frozenset({"public_key", "sign", "repeat"})
 WITNESS_BEHIND = "must move forward"  # in the service's refusal of a head at or behind one it already holds
 
 
@@ -207,14 +212,19 @@ class SignerClient:
         line = line if line is not None else self._line
         seconds = timeout if timeout is not None else self._timeout
         with line.lock:
-            for attempt in (1, 2):  # one reconnect if the service restarted
+            for attempt in (1, 2):  # one reconnect if the service restarted, or closed a connection left idle
+                if line.conn is not None and time.monotonic() - line.used > IDLE_REUSE_S:
+                    line.drop()  # the service may have closed it by now
+                reused, sent = line.conn is not None, False
                 try:
                     if line.conn is None:
                         line.conn = _connect(parse_address(self.address), self._token, seconds)
                     line.conn.send_bytes(json.dumps(request).encode("utf-8"))
+                    sent = True
                     if not line.conn.poll(seconds):
                         raise TimeoutError("the signer did not answer")
                     reply = json.loads(line.conn.recv_bytes(1 << 20))
+                    line.used = time.monotonic()
                     break
                 except (ValueError, RecursionError):
                     raise SignerError(f"the signer at {self.address} answered something that is not JSON") from None
@@ -222,7 +232,11 @@ class SignerClient:
                     raise SignerError(f"the signer at {self.address} did not accept the token") from None
                 except (OSError, EOFError, TimeoutError) as exc:
                     line.drop()
-                    if attempt == 2:
+                    # A kept connection the service closed was closed before it read this. Anything else may have
+                    # been acted on, so only a request that is safe to repeat is sent again.
+                    closed = reused and isinstance(exc, (EOFError, ConnectionError))
+                    resend = not sent or closed or request.get("op") in _SAFE_TO_RESEND
+                    if attempt == 2 or not resend:
                         raise SignerError(f"the signer at {self.address} is not reachable: {exc!r}") from exc
         if raw and isinstance(reply, dict):  # the caller reads the fields of a refusal
             return reply
@@ -236,6 +250,7 @@ class _Line:
 
     def __init__(self) -> None:
         self.conn: Any = None
+        self.used = 0.0  # when its last answer came
         self.lock = threading.Lock()
 
     def drop(self) -> None:

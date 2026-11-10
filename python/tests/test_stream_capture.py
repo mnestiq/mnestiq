@@ -1,6 +1,7 @@
 """Streams from create(stream=True) and the OpenAI helpers: the real SDKs against a mocked HTTP transport."""
 
 import asyncio
+import contextlib
 import contextvars
 import gc
 import json
@@ -587,17 +588,28 @@ def test_a_collected_stream_is_recorded_once():
     assert len(_events(sink)) == 1
 
 
-def test_a_finalizer_on_a_thread_holding_the_recorder_lock_does_not_write_through_it():
+@contextlib.contextmanager
+def _inside_a_write(rec):
+    """This thread part way through writing a record, as a finalizer that runs there finds it."""
+    with rec._lock:
+        rec._writing += 1
+        try:
+            yield
+        finally:
+            rec._writing -= 1
+
+
+def test_a_finalizer_on_a_thread_in_the_middle_of_a_write_does_not_write_through_it():
     """A collection can start on a thread in the middle of writing a record."""
     sink, rec = _recorder()
     instrument_models(rec)
     with rec.run():
         stream = _create_messages(_client(anthropic.Anthropic, _sse(STREAM_EVENTS)))
         next(stream)
-        with rec._lock:
+        with _inside_a_write(rec):
             del stream
             _collect()
-            assert _events(sink) == []  # not written while this thread holds the lock
+            assert _events(sink) == []  # not written while this thread is inside a write
         assert _common._deferred
         _common._run_deferred()
     assert not _common._deferred
@@ -611,7 +623,7 @@ def test_a_write_left_by_a_finalizer_is_done_on_the_next_call():
     with rec.run():
         stream = _create_messages(_client(anthropic.Anthropic, _sse(STREAM_EVENTS)))
         next(stream)
-        with rec._lock:
+        with _inside_a_write(rec):
             del stream
             _collect()
         list(_create_messages(_client(anthropic.Anthropic, _sse(STREAM_EVENTS))))
@@ -1204,7 +1216,7 @@ def test_a_write_left_by_a_finalizer_is_done_by_recorder_close():
     instrument_models(rec)
     stream = _create_messages(_client(anthropic.Anthropic, _sse(STREAM_EVENTS)))
     next(stream)
-    with rec._lock:
+    with _inside_a_write(rec):
         del stream
         _collect()
     assert _common._deferred
@@ -1219,7 +1231,7 @@ def test_closing_a_stream_on_a_thread_inside_the_recorder_defers():
     instrument_models(rec)
     stream = _create_messages(_client(anthropic.Anthropic, _sse(STREAM_EVENTS)))
     next(stream)
-    with rec._lock:
+    with _inside_a_write(rec):
         stream.close()
         assert _events(sink) == []
     _common._run_deferred()

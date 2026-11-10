@@ -503,8 +503,9 @@ def answer_file(path, key, answer):
     return path
 
 
-@pytest.mark.parametrize("answer", ["![" * 150_000, "<img " * 40_000, "\n" * 200_000],
-                         ids=["image", "img-tag", "ref-def"])
+@pytest.mark.parametrize("answer", ["![" * 150_000, "<img " * 40_000, "\n" * 200_000, "![a[" * 100_000,
+                                    "![a][" * 100_000, '<img a="' * 60_000, "<video poster=" * 40_000],
+                         ids=["image", "img-tag", "ref-def", "alt-brackets", "ref-label", "quoted-attr", "poster"])
 def test_quadratic_answer_patterns(tmp_path, key, answer):
     path = answer_file(tmp_path / "e.jsonl", key, answer)
     assert run_python(path, 3, "findings(records)")
@@ -546,8 +547,12 @@ def test_number_text_is_the_same_in_both_readers(tmp_path):
 @needs_node
 def test_quadratic_answer_patterns_on_the_page(tmp_path):
     script = node_script(tmp_path, "\n".join([
-        'const ev = { output: { content: "![".repeat(150000) }, context: [] }',
-        'console.log(answerLinks(ev, [{ source: "web", content: "hello" }]).length)']))
+        "const texts = ['!['.repeat(150000), '![a['.repeat(100000), '![a]['.repeat(100000),",
+        "               '<img a=\"'.repeat(60000), '<video poster='.repeat(40000)]",
+        "for (const text of texts) {",
+        "  const ev = { output: { content: text }, context: [] }",
+        '  console.log(answerLinks(ev, [{ source: "web", content: "hello" }]).length)',
+        "}"]))
     try:
         subprocess.run(["node", str(script)], capture_output=True, timeout=3, check=True)
     except subprocess.TimeoutExpired:

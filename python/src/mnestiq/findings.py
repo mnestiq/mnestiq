@@ -1,7 +1,8 @@
 """Provenance findings: what an agent did after untrusted content reached its model.
 
 Each finding names what was observed, not a conclusion. The dashboard implements the
-same rules in JavaScript, so keep the two in step.
+same rules in JavaScript, so keep the two in step. Its server runs these over the whole file and
+the page shows what they find. It shows what its own copy finds only when the server could not run them.
 
 MNQ-001  untrusted argument   A tool call's arguments carry a destination or identifier
                               (email address, URL or host, account number, long number)
@@ -47,6 +48,10 @@ to someone who asked for it, with no instruction to plant. Data-driven
 work also does all three
 (visiting a link a colleague posted, deleting the file a search found), so a finding is
 a lead to review, not a verdict.
+
+A host's parent domain stands for its owner (img.evil.example is evil.example's) only below a public suffix:
+co.uk, github.io or s3.amazonaws.com is no one's site. The suffixes here are not the full public suffix list,
+so two sites under a suffix it lacks can still be taken for one.
 
 A tool is sensitive when the recorder marked it (``@recorder.tool(sensitive=True)``),
 or, when unmarked, when its name says so (``update_password``, ``delete_file``, ...).
@@ -251,11 +256,12 @@ def untrusted_arguments(llm_call: dict) -> list[dict]:
             for ind in sorted(indicators(value)):
                 found = ind if ind in untrusted and ind not in trusted else None
                 if found is None and re.search(r"[/?]", ind):
-                    # The planted link may end in "?d=" and the model fill in the data: the host is
+                    # The planted link may end in "?d=" and the model fill in the data, or carry it in a
+                    # label of the host ("<card>.evil.example"): the host, or a parent domain of it, is
                     # what came from the untrusted content.
                     host = _host(ind)
-                    if len(host) >= 6 and "." in host and host in untrusted and host not in trusted:
-                        found = host
+                    if "." in host and not any(d in trusted for d in _domains(host)):
+                        found = next((d for d in _domains(host) if len(d) >= 6 and d in untrusted), None)
                 if found:
                     sources = sorted({s["source"] for s in untrusted_segments if found in _Corpus([s])})
                     hits.append({"tool": call.get("name"), "indicator": ind, "sources": sources})
@@ -306,34 +312,105 @@ def untrusted_values(tool: str, arguments: Any, context: list[dict]) -> list[dic
     return hits
 
 
-# Each of these matches as soon as it has read to the closing bracket, whether or not what follows makes it
-# an image: the text it read is not read again from the next "![" inside it.
-_IMAGE = re.compile(rf"!\[[^\]]*(?:\]\([{_S}]*<?([^){_S}>]+))?|<img\b([^>]*)", re.IGNORECASE | re.ASCII)
-_IMAGE_SRC = re.compile(rf"\bsrc[{_S}]*=[{_S}]*[\"']?([^\"'{_S}>]+)", re.IGNORECASE | re.ASCII)
+# Each of these matches as soon as it has read what it can, whether or not what follows makes it an image: the
+# text it read is not read again from the next "![" or "<" inside it. Alt text is read as markdown reads it, with
+# brackets in pairs and any character after a backslash.
+_ALT = r"(?:[^\[\]\\]|\\[\s\S]?|\[[^\[\]\\]*\]?)*"
+_IMAGE = re.compile(rf"!\[{_ALT}(?:\]\([{_S}]*<?([^){_S}>]+))?", re.IGNORECASE | re.ASCII)
+# A tag that loads an address as soon as it is shown. A quoted value may hold a ">".
+_IMAGE_TAG = re.compile(r"<(?:img|image|input|video|audio|source)\b((?:[^>\"']|\"[^\"]*\"?|'[^']*'?)*)",
+                        re.IGNORECASE | re.ASCII)
+_ATTRIBUTE = re.compile(rf"([^{_S}\"'>/=]+)[{_S}]*(?:=[{_S}]*(?:\"([^\"]*)\"?|'([^']*)'?|([^{_S}\"'>]+)))?")
+_LOADS = frozenset({"src", "srcset", "poster", "href"})  # the attributes of those tags that name what they load
 _LINK = re.compile(rf"https?:[/\\]*[^{_S}\"'<>)\]]+", re.IGNORECASE | re.ASCII)
-_REF_IMAGE = re.compile(r"!\[[^\]]*(?:\]\[([^\]]+)\])?")
+# ![alt][label], ![alt][] and ![alt]: the last two name the reference by their alt text. A label is 999 characters
+# at most.
+_REF_IMAGE = re.compile(rf"!\[({_ALT})(?:(\])(?:\[([^\[\]\\]{{0,999}})\])?)?")
 _REF_DEF = re.compile(rf"^[ \t]*\[([^\]]*)(?:\]:[{_S}]*<?([^{_S}]+?)>?(?:[{_S}]|$))?", re.MULTILINE)
+_SPACES = re.compile(f"[{_S}]+")
 
 
 def _images(text: str) -> set[str]:
     """The addresses of the images in an answer: markdown, an HTML tag, or a markdown reference."""
-    found = set()
-    for m in _IMAGE.finditer(text):
-        source = m.group(1) or (_IMAGE_SRC.search(m.group(2)) if m.group(2) else None)
-        if source:
-            found.add(source if isinstance(source, str) else source.group(1))
+    found = {m.group(1) for m in _IMAGE.finditer(text) if m.group(1)}
+    for tag in _IMAGE_TAG.finditer(text):
+        for attribute in _ATTRIBUTE.finditer(tag.group(1)):
+            name = attribute.group(1).lower().rsplit(":", 1)[-1]  # xlink:href is href
+            value = next((v for v in attribute.group(2, 3, 4) if v is not None), None)
+            if name not in _LOADS or value is None:
+                continue
+            for part in value.split(",") if name == "srcset" else [value]:  # "a.png 1x, b.png 2x"
+                address = _SPACES.split(part.strip(_SPACE_CHARS))[0]
+                if address:
+                    found.add(address)
     refs = {m.group(1).lower(): m.group(2) for m in _REF_DEF.finditer(text) if m.group(1) and m.group(2)}  # [ref]: url
-    labels = (m.group(1).lower() for m in _REF_IMAGE.finditer(text) if m.group(1))
-    return found | {refs[label] for label in labels if label in refs}
+    for m in _REF_IMAGE.finditer(text):
+        if m.group(2) is None or (m.group(3) is None and text.startswith("(", m.end())):
+            continue  # not closed, or an inline image
+        label = (m.group(3) or m.group(1)).lower()
+        if label in refs:
+            found.add(refs[label])
+    return found
 
 
 MAX_LABELS = 16  # a host and its parents, from the end: the end of a longer name is what its owner controls
 
 
+# Names under which anyone can have a site of their own: hosting and tunnel services, and the ones collection endpoints
+# are set up under. Not the public suffix list, only the part of it attackers reach for. A "*" stands for any one label
+# ("s3.*.amazonaws.com" is s3.eu-west-1.amazonaws.com). The page has the same list, in the same order.
+PUBLIC_SUFFIXES = (
+    "*.amazonaws.com", "*.backblazeb2.com", "*.cloudapp.azure.com", "*.compute.amazonaws.com",
+    "*.digitaloceanspaces.com", "*.elb.amazonaws.com", "*.web.core.windows.net", "amazonaws.com", "amplifyapp.com",
+    "app.github.dev", "appspot.com", "awsapprunner.com", "azure-api.net", "azureedge.net", "azurefd.net",
+    "azurestaticapps.net", "azurewebsites.net", "backblazeb2.com", "beeceptor.com", "bitbucket.io",
+    "blob.core.windows.net", "blogspot.com", "burpcollaborator.net", "cloudapp.azure.com", "cloudapp.net",
+    "cloudfront.net", "cloudfunctions.net", "codesandbox.io", "core.windows.net", "csb.app", "database.windows.net",
+    "ddns.net", "deno.dev", "dfs.core.windows.net", "digitaloceanspaces.com", "duckdns.org", "dweb.link",
+    "execute-api.*.amazonaws.com", "file.core.windows.net", "firebaseapp.com", "firebaseio.com",
+    "firebasestorage.app", "fly.dev", "github.io", "githubusercontent.com", "gitlab.io", "gitpod.io", "glitch.me",
+    "googleusercontent.com", "herokuapp.com", "herokudns.com", "hookbin.com", "hopto.org", "interact.sh",
+    "koyeb.app", "lambda-url.*.on.aws", "lhr.life", "loca.lt", "localhost.run", "localtunnel.me", "m.pipedream.net",
+    "mooo.com", "myshopify.com", "neocities.org", "netlify.app", "netlify.com", "ngrok-free.app", "ngrok-free.dev",
+    "ngrok.app", "ngrok.dev", "ngrok.io", "oast.fun", "oast.live", "oast.me", "oast.online", "oast.pro", "oast.site",
+    "oastify.com", "on.aws", "ondigitalocean.app", "onrender.com", "pages.dev", "pipedream.net", "pythonanywhere.com",
+    "queue.core.windows.net", "r2.cloudflarestorage.com", "r2.dev", "railway.app", "readthedocs.io", "repl.co",
+    "replit.app", "replit.dev", "requestbin.net", "requestcatcher.com", "run.app", "s3-website.*.amazonaws.com",
+    "s3.*.amazonaws.com", "s3.*.backblazeb2.com", "s3.amazonaws.com", "s3.dualstack.*.amazonaws.com",
+    "serveo.net", "servicebus.windows.net", "sharepoint.com", "stackblitz.io", "storage.googleapis.com",
+    "supabase.co", "surge.sh", "sytes.net", "table.core.windows.net", "trafficmanager.net", "trycloudflare.com",
+    "up.railway.app", "val.run", "vercel.app", "web.app", "web.core.windows.net", "webcontainer.io", "webflow.io",
+    "webhook.site", "weebly.com", "windows.net", "wixsite.com", "wordpress.com", "workers.dev", "zapto.org",
+)
+# A short generic label under a country's code is that country's suffix: co.uk, com.au, org.uk, ac.jp, co.nz, com.br.
+COUNTRY_SECOND_LEVELS = frozenset({"ac", "co", "com", "ed", "edu", "go", "gob", "gov", "lg", "ltd", "mil", "ne", "net",
+                                   "nom", "or", "org", "plc", "sch"})
+_SUFFIX_NAMES = frozenset(s for s in PUBLIC_SUFFIXES if "*" not in s)
+_SUFFIX_PATTERNS = tuple(s.split(".") for s in PUBLIC_SUFFIXES if "*" in s)
+_COUNTRY_CODE = re.compile(r"[a-z]{2}")
+_NUMBER_LABEL = re.compile(r"[0-9]+|0x[0-9a-f]*")  # the last label of an IPv4 address, in any spelling
+
+
+def is_public_suffix(name: str) -> bool:
+    """Whether ``name`` is a suffix under which anyone can have a name of their own, and so no one's site: a top-level
+    domain, a country's second level (co.uk) or a hosting service in PUBLIC_SUFFIXES (github.io, s3.amazonaws.com)."""
+    labels = name.split(".")
+    if len(labels) == 1 or name in _SUFFIX_NAMES:
+        return True
+    if len(labels) == 2 and labels[0] in COUNTRY_SECOND_LEVELS and _COUNTRY_CODE.fullmatch(labels[1]):
+        return True
+    return any(len(p) == len(labels) and all(a in ("*", b) for a, b in zip(p, labels, strict=True))
+               for p in _SUFFIX_PATTERNS)
+
+
 def _domains(host: str) -> list[str]:
-    """The host and its parent domains of two labels or more: a.b.evil.example, b.evil.example, evil.example."""
+    """The host and its parent domains that someone can own: a.b.evil.example, b.evil.example, evil.example. A public
+    suffix is left out: that a user named bbc.co.uk says nothing about evil.co.uk. A name of one label, or an IP
+    address, stands as it is."""
     labels = host.split(".")[-MAX_LABELS:]
-    return [".".join(labels[i:]) for i in range(len(labels) - 1)] or [host]
+    if len(labels) == 1 or _NUMBER_LABEL.fullmatch(labels[-1]):  # an address: "1.10" is no parent of 203.0.1.10
+        return [host]
+    return [d for d in (".".join(labels[i:]) for i in range(len(labels) - 1)) if not is_public_suffix(d)]
 _SKIP_BLOCKS = frozenset({"tool_use", "function_call", "tool_call", "thinking", "redacted_thinking"})
 
 
@@ -349,7 +426,8 @@ def answer_text(value: Any) -> str:
     return ""
 
 
-_SCHEME = re.compile(r"^(?:[a-z][a-z0-9+.-]*:)?[/\\]*")  # //host, https:/host and a backslash form all load
+# //host, https:/host and a backslash form all load. In "evil.example:8443/c" the colon starts a port, not a scheme.
+_SCHEME = re.compile(r"^(?:[a-z][a-z0-9+.-]*:(?![0-9]+(?:[/\\?#]|\Z)))?[/\\]*")
 
 
 def _host(url: str) -> str:
@@ -592,7 +670,7 @@ def findings(records: Iterable[dict]) -> list[dict]:
                     st.out.append((i, {**finding, "rule": NOT_EVALUATED, "taint_step": None,
                                        "detail": f"approval could not be judged ({type(exc).__name__}): "
                                                  "an MNQ-002 finding may be missing"}))
-                    continue
+                    matters = False  # a cut it made on the way is still reported here, not on the next approval
                 if effort.cut:
                     effort.cut = False
                     st.out.append((i, {**finding, "rule": NOT_EVALUATED, "taint_step": None,
@@ -625,9 +703,8 @@ def _incomplete_context(r: dict) -> dict | None:
                                                    "Findings that depend on what the model asked for may be missing"}
     if isinstance(attributes, dict) and (attributes.get("output_captured") == "partial"
                                          or attributes.get("partial") is True):
-        return {**_not_evaluated(r, ""), "detail": "llm_call output was only partly captured: the stream stopped "
-                                                   "early or went past the size limit. Findings that depend on the "
-                                                   "rest of what the model asked for may be missing"}
+        return {**_not_evaluated(r, ""), "detail": "llm_call output was only partly captured. Findings that depend "
+                                                   "on the rest of what the model asked for may be missing"}
     return None
 
 

@@ -3,7 +3,8 @@
     python tests/fuzz/run_long.py --minutes 480 --out fuzz-found
 
 Each kind of problem is saved a few times, so a common one cannot fill the disk. A saved case holds the file, its
-seed and what broke, and goes in tests/fuzz/corpus/ to become a regression test. Exit code 1 means something was found.
+seed and what broke, and goes in tests/fuzz/corpus/ to become a regression test. Exit code 1 means something was found,
+and 2 that no file was fuzzed.
 """
 
 from __future__ import annotations
@@ -160,6 +161,10 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "summary.json").write_text(json.dumps(summary, indent=1), "utf-8")
     print(json.dumps(summary, indent=1))
+    if not total:
+        print("run_long: no file was fuzzed (files: 0). The workers did no work, so this run proves nothing. "
+              "Check --minutes, --files and --jobs, and the workers' errors above.", file=sys.stderr)
+        return 2
     return 1 if seen else 0
 
 

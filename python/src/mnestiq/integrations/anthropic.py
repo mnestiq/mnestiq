@@ -19,7 +19,8 @@ from collections.abc import Callable
 from ..jsonable import exception_text, get, is_not_given, to_jsonable
 from ..recorder import Recorder, Run, Segment
 from ._common import (StreamAccumulator, _as_dict, as_items, follow_copies, inside_recorded_call, is_stream, keep_part,
-                      parse_args, remember_tool, sampling_params, sdk_call, snapshot, tool_name, wrap_method)
+                      model_name, parse_args, remember_tool, sampling_params, sdk_call, snapshot, tool_name,
+                      wrap_method)
 
 
 def make_record(recorder: Recorder, *, tool_sources: dict[str, str] | None = None) -> Callable[..., None]:
@@ -37,7 +38,7 @@ def make_record(recorder: Recorder, *, tool_sources: dict[str, str] | None = Non
             attributes = {"streaming": True} if streamed else None
             if partial is not None:
                 attributes = {"streaming": True, "partial": True}
-        common: dict[str, Any] = dict(provider="anthropic", model=str(kwargs.get("model")), context=context,
+        common: dict[str, Any] = dict(provider="anthropic", model=model_name(kwargs.get("model")), context=context,
                                       params=sampling_params(kwargs), system_prompt=system, latency_ms=latency,
                                       error=error, attributes=attributes)
         if response is None:
@@ -47,25 +48,27 @@ def make_record(recorder: Recorder, *, tool_sources: dict[str, str] | None = Non
             common["attributes"] = {"streaming": True, "output_captured": False}
             run.llm_call(**common)
             return
-        blocks = to_jsonable(get(response, "content") or [])
-        usage = _as_dict(to_jsonable(get(response, "usage")))
-        run.llm_call(
-            **common,
-            output=blocks,
-            response_model=get(response, "model"),
-            stop_reason=get(response, "stop_reason"),
-            response_id=get(response, "id"),
-            tool_calls=[{"id": b.get("id"), "name": b.get("name"),
-                         "arguments": (partial or {}).get(i, b.get("input"))}
-                        for i, b in enumerate(blocks if isinstance(blocks, list) else [])
-                        if isinstance(b, dict) and b.get("type") == "tool_use"],
-            usage={k: v for k, v in usage.items() if k in ("input_tokens", "output_tokens",
-                                                            "cache_read_input_tokens",
-                                                            "cache_creation_input_tokens")},
-        )
+        run.llm_call(**common, **message_answer(response, partial))
 
     record.new_accumulator = _MessageStream  # type: ignore[attr-defined]
     return record
+
+
+def message_answer(response: Any, partial: dict[int, Any] | None = None) -> dict[str, Any]:
+    """What a whole Messages API answer says, as keyword arguments for ``Run.llm_call``. An SDK object
+    or the JSON the proxy read: the record is the same for the same answer."""
+    blocks = to_jsonable(get(response, "content") or [])
+    usage = _as_dict(to_jsonable(get(response, "usage")))
+    return {
+        "output": blocks,
+        "response_model": get(response, "model"),
+        "stop_reason": get(response, "stop_reason"),
+        "response_id": get(response, "id"),
+        "tool_calls": [{"id": b.get("id"), "name": b.get("name"), "arguments": (partial or {}).get(i, b.get("input"))}
+                       for i, b in enumerate(blocks if isinstance(blocks, list) else [])
+                       if isinstance(b, dict) and b.get("type") == "tool_use"],
+        "usage": {k: v for k, v in usage.items() if k in _USAGE_FIELDS},
+    }
 
 
 _TEXT_DELTAS = {"text_delta": "text", "thinking_delta": "thinking", "signature_delta": "signature",
@@ -315,7 +318,8 @@ def _message_segments(message: Any, tool_names: dict[str, str], sources: dict[st
     if role == "system":  # mid-conversation operator instruction
         return [Segment(source="system", role=role, content=content)]
     if isinstance(content, str):
-        return [Segment(source="model" if role == "assistant" else "user", role=role, content=content)]
+        source = {"assistant": "model", "user": "user"}.get(role, "unknown") if isinstance(role, str) else "unknown"
+        return [Segment(source=source, role=role, content=content)]
     segments: list[Segment] = []
     for block in content or []:
         btype = block.get("type") if isinstance(block, dict) else None
@@ -331,8 +335,16 @@ def _message_segments(message: Any, tool_names: dict[str, str], sources: dict[st
             source = "web" if btype.startswith("web_") else "tool_output"
             segments.append(Segment(source=source, role=role, name=btype.removesuffix("_tool_result"),
                                     content=block))
-        elif role == "assistant":
+        elif role == "assistant" and btype in _MODEL_BLOCKS:
             segments.append(Segment(source="model", role=role, content=block))
-        else:
+        elif role == "user" and btype in _USER_BLOCKS:
             segments.append(Segment(source="user", role=role, content=block))
+        else:  # a block or role this version does not know may carry anyone's words: not taken as trusted
+            segments.append(Segment(source="unknown", role=role, content=block))
     return segments
+
+
+# Blocks known to be the model's own words, or the caller's own input, in the turn of that role.
+_MODEL_BLOCKS = frozenset({"text", "tool_use", "server_tool_use", "mcp_tool_use", "thinking", "redacted_thinking",
+                           "compaction"})
+_USER_BLOCKS = frozenset({"text", "image", "document", "search_result", "container_upload"})

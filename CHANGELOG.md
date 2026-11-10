@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased
+
+Fixes found in a review of 1.1.0. The record format and spec version are unchanged. Some records now carry
+different values: a missing model name, a role this version does not know, and an answer that is not all in its
+record are each written one way on every path. The rules find planted links and images they used to miss.
+Commands report the library's own errors in one line.
+
+### Changes you may notice
+
+- `mnestiq` commands report a `RecorderError`, `SinkError`, `SignerError` or `TimestampError` as one `error:`
+  line and exit with code 2, as for a bad argument. Before, these ended in a traceback with exit code 1, the
+  same as INVALID.
+- `mnestiq verify` and `mnestiq inspect` write characters that change the direction of text as escapes, as they
+  do line breaks. `mnestiq verify` cuts a field name it quotes from a file to 200 characters.
+- A request that names no model is recorded with model `<unknown>` on every path. The SDK integrations wrote
+  `None` and the API proxy wrote `unknown`.
+- An OpenAI `role: "function"` message, the older form of a tool result, is recorded as `tool_output`, or as
+  the source set for that tool. A chat role, Responses item type, or Anthropic role or content block that this
+  version does not know is recorded as `unknown`, which the rules treat as untrusted. Before, most of these
+  counted as the user's words.
+- A Chat Completions answer with several choices still has only the first recorded. The record is now marked
+  `output_captured: "partial"`, with a `capture_note` that says so. This holds for streams too.
+- The API proxy reads answers and streams with the same code as the SDK integrations, so the same answer gives
+  the same record on both paths. It now marks an answer it holds part of as `"partial"` rather than `false`,
+  keeps streamed output up to `max_content_bytes` as the SDK path does, and gives a stream that ends before its
+  last event the `error` the SDK path gives.
+- `instrument_egress()` refuses a single string for `ignore_hosts` or `stamp_hosts` with `TypeError`. It used to
+  read one as a set of letters. Names in these lists are matched without regard to case or a trailing dot.
+- The signing service serves at most 256 connections at once, 32 of them still proving the token, and closes a
+  connection idle for 300 seconds. See [docs/signing.md](docs/signing.md).
+- The rules read a host with a port (`evil.example:8443/c`) correctly. `MNQ-001` also flags a
+  planted link whose host is a name under a host from untrusted content, such as data put in a label.
+- A host counts as its parent domain's except under a shared suffix where anyone can have a name, such as
+  `co.uk` or `github.io`. Before, a name the user gave there could hide another site under the same suffix. The
+  list is built in and is not the full public suffix list.
+- `MNQ-001` is now quiet for a link to a name under a site the user or the system prompt named, as `MNQ-005`
+  and `MNQ-006` already were. If the user names `acme.example`, a planted link to `cdn.acme.example` is not
+  flagged. In 1.1.0 it was.
+- An IP address has no parent domain. Before, a number in the user's words, such as a version `1.10`, could
+  hide an image loaded from `203.0.1.10`.
+- The `MNQ-000` text for a partly captured answer no longer names a cause, since there is now more than one.
+- `MNQ-005` finds images in more forms: the `img`, `image`, `video`, `audio`, `source` and `input` tags with
+  `src`, `srcset`, `poster` or `href`, the markdown references `![alt][]` and `![alt]`, and alt text that holds
+  brackets.
+- When the rules reach their work limit while judging an approval, `MNQ-000` is reported on that approval, not
+  on the next one.
+- The dashboard's server runs the rules over each whole file, and the page shows what they find. In a file too
+  large to show whole, findings on earlier records are listed apart, up to 20,000, with a count of the rest. If
+  the server cannot run them, the page runs its own copy on the records shown and says so.
+- The dashboard marks a record sealed only by a checkpoint the verifier checked with no error. It calls a record
+  altered only for a hash, link, Merkle root or signature that does not match, and labels other problems by kind.
+
+### Fixed
+
+- Error text in egress events, and the API proxy's log, mask query values with secret looking names in each
+  form clients quote them, as the `url` field does.
+- A stream closed early while egress capture is on is recorded where it ends, and its run ends. Events put aside
+  while the chain was busy keep their order, and are written at process exit if the recorder was never closed.
+  Events put aside from threads with no run of their own are capped at 4,096. Past that, each one is dropped and
+  counted in `recorder.failures`.
+- With `instrument_egress()`, the run id headers no longer reach a host that is not stamped, such as one a
+  redirect leads to, and the caller's own request object is left as it was. In strict mode a cancelled request
+  still raises the cancellation, even when recording it fails.
+- Every event the recorder writes about itself carries the agent's identity, and an empty `agent_id` no longer
+  makes one fail.
+- `MemorySink` holds what a file would hold, read back the way a file is read.
+- A recorder refuses to carry on from a file with a salt that is not 16 bytes, signed or not.
+- `mnestiq verify` looks at no more than 1,000 schema errors per record, so one crafted line no longer uses
+  memory without bound. It still shows the first five.
+- `mnestiq proxy --azure-key` reads the key as `signer serve` does: it gives up after 30 seconds and says what
+  went wrong in words.
+- `SignerClient` does not reuse a connection left idle for more than 120 seconds. After a failure it sends a
+  request again only when that is safe.
+- Nothing can come between a recorder's last records and its final checkpoint on `close()`.
+- Before Python 3.12, a connection made within a few calls of the recursion limit could now and then go
+  unrecorded without being counted. It is counted in `recorder.failures`.
+
 ## 1.1.0 (2026-11-09)
 
 Security fixes for crafted evidence files, reported by Agentic Thinking, and for what our own testing then

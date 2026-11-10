@@ -408,6 +408,10 @@ class Recorder:
         self._timestamp_next_try = 0.0
         self._on_checkpoint = on_checkpoint
         self._lock = threading.RLock()
+        # How deep the thread holding the lock is in a write of the chain. Only a finalizer can bring that
+        # thread back here before the write is done, and only then must a new record wait. Holding the
+        # lock on purpose to write is not that.
+        self._writing = 0
         # While a checkpoint is being signed, an event written from the same thread (a hook seeing
         # the signer's or the timestamp authority's traffic, say) would take the checkpoint's place
         # in the chain. Such events wait here and are written right after the checkpoint.
@@ -482,11 +486,7 @@ class Recorder:
         if recovered:
             # Record the recovery in the chain. The torn bytes stay in the sidecar file.
             try:
-                self.append_event({
-                    "event_type": "note", "run_id": f"recorder-{self.chain_id[:8]}", "agent_id": self.agent_id,
-                    "sandbox_id": self.sandbox_id,
-                    "attributes": {"message": "recovered from an interrupted write", **recovered},
-                })
+                self.append_event(self._own_event({"message": "recovered from an interrupted write", **recovered}))
             except Exception as exc:  # a torn file often means a full disk: the agent still starts
                 if strict:
                     raise
@@ -538,11 +538,7 @@ class Recorder:
             if self._closed:
                 return None
             self._last_signed = time.monotonic()  # also paces retries while a signer is down
-            self._append({
-                "event_type": "heartbeat", "run_id": f"recorder-{self.chain_id[:8]}", "agent_id": self.agent_id,
-                "sandbox_id": self.sandbox_id,
-                "attributes": {"interval_s": self._interval} if self._interval is not None else None,
-            })
+            self._note({"interval_s": self._interval} if self._interval is not None else None, "heartbeat")
             if self._signer is None or time.monotonic() < self._next_try:
                 return None
             try:
@@ -578,7 +574,19 @@ class Recorder:
         except Exception:
             pass
 
+    def _inside_write(self) -> bool:
+        """This thread is in the middle of writing to the chain, so whatever wants to write now was started
+        by a finalizer or a hook inside that write, and must wait for a safe point."""
+        return self._writing > 0 and bool(self._lock._is_owned())  # type: ignore[attr-defined]
+
     def _write(self, record: dict) -> dict:
+        self._writing += 1
+        try:
+            return self._write_now(record)
+        finally:
+            self._writing -= 1
+
+    def _write_now(self, record: dict) -> dict:
         record["record_hash"] = record_hash(record)
         problem = schema_problem(record, show_value=False)  # the failure is logged: never the agent's data
         if problem:
@@ -618,6 +626,13 @@ class Recorder:
             return record
 
     def _append(self, body: dict) -> dict:
+        self._writing += 1
+        try:
+            return self._append_now(body)
+        finally:
+            self._writing -= 1
+
+    def _append_now(self, body: dict) -> dict:
         if self._closed:
             raise RecorderError("recorder is closed")
         if self._checkpointing:
@@ -716,12 +731,8 @@ class Recorder:
                 raise RecorderError("recorder is closed")
             if self._signer is None:
                 raise RecorderError("this recorder has no signer to hand over from; pass signer= instead")
-            self._append({
-                "event_type": "note", "run_id": f"recorder-{self.chain_id[:8]}", "agent_id": self.agent_id,
-                "sandbox_id": self.sandbox_id,
-                "attributes": {"message": reason, "from_key": key_id(self._signer.public_key),
-                               "to_key": key_id(signer.public_key)},
-            })
+            self._note({"message": reason, "from_key": key_id(self._signer.public_key),
+                        "to_key": key_id(signer.public_key)})
             next_key = {"sig_alg": signer.sig_alg, "public_key": signer.public_key,
                         "key_id": key_id(signer.public_key)}
             record = self._sign_checkpoint(self._signer, next_key, retry=False)
@@ -796,14 +807,19 @@ class Recorder:
             return False
         return True
 
-    def _note(self, attributes: dict, event_type: str = "note") -> None:
-        body = {"event_type": event_type, "run_id": f"recorder-{self.chain_id[:8]}",
-                "agent_id": _text(self.agent_id) or _UNKNOWN, "sandbox_id": self.sandbox_id,
-                "agent_identity": self.agent_identity, "attributes": attributes}
+    def _own_event(self, attributes: dict | None, event_type: str = "note") -> dict:
+        """The body of an event the recorder writes about itself. Every one is built here, so each carries the
+        agent's identity, and an empty agent id cannot make one fail the schema."""
+        return {"event_type": event_type, "run_id": f"recorder-{self.chain_id[:8]}",
+                "agent_id": _text(self.agent_id) or _UNKNOWN,  # runs can name their own agent and leave this empty
+                "sandbox_id": self.sandbox_id, "agent_identity": self.agent_identity, "attributes": attributes}
+
+    def _note(self, attributes: dict | None, event_type: str = "note") -> dict:
+        body = self._own_event(attributes, event_type)
         try:
-            self._append(body)
+            return self._append(body)
         except CanonicalizationError:  # a name that is not valid Unicode: keep the record, mend the text
-            self._append(valid_texts(body))
+            return self._append(valid_texts(body))
 
     def _note_clean_close(self) -> None:
         """Say in the chain that this recorder stopped as intended, as the last record before its last checkpoint.
@@ -833,12 +849,7 @@ class Recorder:
         if self._inherited is None:
             return
         try:
-            self._append({
-                "event_type": "note", "run_id": f"recorder-{self.chain_id[:8]}",
-                "agent_id": _text(self.agent_id) or _UNKNOWN,  # runs can name their own agent and leave this empty
-                "sandbox_id": self.sandbox_id,
-                "attributes": {"message": "resumed with records not yet signed", RESTART_FIELD: self._inherited},
-            })
+            self._note({"message": "resumed with records not yet signed", RESTART_FIELD: self._inherited})
         except Exception as exc:
             self._next_try = time.monotonic() + self._retry_after
             raise _NoteNotWritten(f"the note naming the records taken over unsigned could not be written: {exc!r}"
@@ -971,28 +982,32 @@ class Recorder:
         with self._lock:
             if self._closed:
                 return
+            self._writing += 1  # the last records and the checkpoint over them: nothing may come between
             try:
                 try:
-                    self._note_clean_close()
-                except Exception as exc:  # the records are still worth signing without it
+                    try:
+                        self._note_clean_close()
+                    except Exception as exc:  # the records are still worth signing without it
+                        if self.strict:
+                            raise
+                        self._record_failure(exc)
+                    self.checkpoint()
+                except Exception as exc:
                     if self.strict:
                         raise
                     self._record_failure(exc)
-                self.checkpoint()
-            except Exception as exc:
-                if self.strict:
-                    raise
-                self._record_failure(exc)
+                finally:
+                    self._closed = True
+                    if self._witness is not None:
+                        self._witness.stop()
+                    try:
+                        self._sink.close()
+                    except Exception as exc:  # e.g. the disk is still full: the agent goes on
+                        if self.strict:
+                            raise
+                        self._record_failure(exc)
             finally:
-                self._closed = True
-                if self._witness is not None:
-                    self._witness.stop()
-                try:
-                    self._sink.close()
-                except Exception as exc:  # e.g. the disk is still full: the agent goes on
-                    if self.strict:
-                        raise
-                    self._record_failure(exc)
+                self._writing -= 1
         if self._witness is not None:  # outside the lock, and bounded
             self._witness.finish(WITNESS_CLOSE_WAIT_S)
 
@@ -1161,6 +1176,7 @@ def _read_chain(sink: Sink) -> tuple[dict | None, dict | None, list[str], str | 
         if not isinstance(rec, dict) or not {"chain_id", "seq", "record_hash"} <= rec.keys():
             raise RecorderError("the sink already holds data that is not Mnestiq evidence, use a new file")
         _refuse_damage(checker, rec)
+        _refuse_bad_salts(rec)
         if rec.get("kind") != "checkpoint":
             pending.append(rec["record_hash"])
         else:
@@ -1262,6 +1278,22 @@ def _refuse_bad_schema(records: list[dict]) -> None:
             raise RecorderError(f"record {record.get('seq')!r} failed verification (schema). {_REFUSED}")
 
 
+_SALT = re.compile(r"[A-Za-z0-9+/]{21}[AQgw]==")  # 16 bytes of canonical base64, as the schema says
+
+
+def _refuse_bad_salts(record: dict) -> None:
+    """Raise ``RecorderError`` if a salt in ``record`` is not 16 bytes. Nothing else marks where a salt ends
+    and its value starts, so bytes could move from one to the other with the digest unchanged. Checked for
+    every record, signed ones too, as the schema check skips those."""
+    for container_key, field in REDACTABLE_FIELDS:
+        container = record.get(container_key)
+        for obj in container if isinstance(container, list) else [container]:
+            if isinstance(obj, dict) and field + SALT_SUFFIX in obj:
+                salt = obj[field + SALT_SUFFIX]
+                if not isinstance(salt, str) or not _SALT.fullmatch(salt):
+                    raise RecorderError(f"record {record.get('seq')!r} failed verification (schema). {_REFUSED}")
+
+
 def _refuse_damage(checker: ChainVerifier, record: dict) -> None:
     """Raise ``RecorderError`` if ``record`` is not what a recorder would have written next in this chain."""
     seq = record.get("seq")
@@ -1338,17 +1370,21 @@ class Run:
         body.update(fields)
         try:
             with self.recorder._lock:  # under the chain's lock, so steps run in the order of the records
-                body["step_id"] = self._step
-                self._step += 1
-                if self.ended:  # a thread of this run, still working after it finished
-                    extra = body.get("attributes")
-                    body["attributes"] = {**(extra if isinstance(extra, dict) else {}), "after_run_end": True}
-                elif event_type == "run_end":
-                    self.ended = True
+                self.recorder._writing += 1
                 try:
-                    return self.recorder.append_event(body)
-                except CanonicalizationError:  # text that is not valid Unicode: keep the event, mend the text
-                    return self.recorder.append_event(valid_texts(body))
+                    body["step_id"] = self._step
+                    self._step += 1
+                    if self.ended:  # a thread of this run, still working after it finished
+                        extra = body.get("attributes")
+                        body["attributes"] = {**(extra if isinstance(extra, dict) else {}), "after_run_end": True}
+                    elif event_type == "run_end":
+                        self.ended = True
+                    try:
+                        return self.recorder.append_event(body)
+                    except CanonicalizationError:  # text that is not valid Unicode: keep the event, mend the text
+                        return self.recorder.append_event(valid_texts(body))
+                finally:
+                    self.recorder._writing -= 1
         except Exception as exc:
             if self.recorder.strict:
                 raise

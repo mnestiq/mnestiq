@@ -17,7 +17,7 @@ from typing import Any
 from collections.abc import AsyncIterator, Callable, Iterator
 
 from ..jsonable import exception_text, is_not_given, to_jsonable
-from ..recorder import Recorder, _before_close, _current_run, current_run
+from ..recorder import _UNKNOWN, Recorder, _before_close, _current_run, current_run
 
 SAMPLING_PARAMS = ("temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens",
                    "max_output_tokens", "seed", "stop", "stop_sequences", "tool_choice", "reasoning", "thinking",
@@ -41,6 +41,13 @@ def sdk_call() -> Iterator[None]:
         yield
     finally:
         _inside_call.reset(token)
+
+
+def model_name(value: Any) -> str:
+    """The model a request names, written the one way the recorder writes a missing name."""
+    if value is None or is_not_given(value):
+        return _UNKNOWN
+    return str(value) or _UNKNOWN
 
 
 def sampling_params(kwargs: dict) -> dict:
@@ -480,6 +487,7 @@ class StreamAccumulator:
         self.arguments = _Bounded(limit)
         self.complete = False  # the API said this was the end of the reply
         self.damaged = False  # something delivered to the caller could not be kept, or put in its place
+        self.left_out: str | None = None  # why part of what reached the caller is not in the record, if so
 
     @property
     def truncated(self) -> bool:
@@ -604,12 +612,12 @@ class StreamCapture:
         self._write_when_safe(_LOCK_WAIT_S)
 
     def _write_when_safe(self, wait_s: float) -> None:
-        """Write once the recorder's lock is held. A thread already inside the recorder may only have got
-        here through a finalizer: writing through its lock then would break the record being written, so
+        """Write once the recorder's lock is held. A thread in the middle of a write to the chain may only have
+        got here through a finalizer: writing through its lock then would break the record being written, so
         the write is left for the next safe point. So is one that cannot get the lock in ``wait_s``."""
         lock: Any = self.recorder._lock
         try:
-            free = not lock._is_owned() and lock.acquire(timeout=wait_s)
+            free = not self.recorder._inside_write() and lock.acquire(timeout=wait_s)
         except Exception:
             free = False
         if not free:
@@ -646,12 +654,14 @@ class StreamCapture:
             body, self.damaged = None, True
         attributes: dict[str, Any] = {"streaming": True}
         damaged = self.damaged or accumulator.damaged
-        if not accumulator.complete or accumulator.truncated or damaged:
+        if not accumulator.complete or accumulator.truncated or damaged or accumulator.left_out:
             attributes["output_captured"] = "partial" if body else False
         if accumulator.truncated:
             attributes["capture_note"] = f"output past {self.recorder.max_content_bytes} bytes was not kept"
         elif damaged:
             attributes["capture_note"] = "a chunk of the stream could not be read or put in its place"
+        elif accumulator.left_out:
+            attributes["capture_note"] = accumulator.left_out
         error: str | None = exception_text(exc) if exc is not None else None
         if error is None and not accumulator.complete:
             error = _CLOSED_EARLY
