@@ -1,4 +1,4 @@
-"""Red-team tests against the verifier, the rules, redact and the dashboard.
+"""Tampered-file tests against the verifier, the rules, redact and the dashboard.
 
 Each test builds a real file with the real Recorder and then acts as an attacker who can write to the
 file but does not hold the signing key. A test marked xfail is an attack that works today. When the
