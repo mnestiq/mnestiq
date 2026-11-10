@@ -1135,6 +1135,7 @@ def _audit_hook(event: str, args: tuple) -> None:
                 _audited(handler, event, args)
     except RecursionError:
         # The agent is at the bottom of its stack. Only what takes no frame of ours can be done here.
+        run = None
         try:
             run = _current_run.get()
             if run is not None and not _suppressed.get() and _covered_socket.get() is None:
@@ -1142,6 +1143,11 @@ def _audit_hook(event: str, args: tuple) -> None:
                     _starved.append((run, event, args))
                 else:
                     run.recorder.failures += 1
+        except RecursionError:
+            # Before Python 3.12 looking up a variable that is not set can take one more level than is left.
+            # Counting takes none, so the event is counted as missing and not lost without a word.
+            if run is not None:
+                run.recorder.failures += 1
         except Exception:
             pass
     except Exception:  # not BaseException: a Ctrl-C that lands in here is still the program's

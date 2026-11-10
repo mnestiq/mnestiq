@@ -74,6 +74,8 @@ Commands report the library's own errors in one line.
 - `SignerClient` does not reuse a connection left idle for more than 120 seconds. After a failure it sends a
   request again only when that is safe.
 - Nothing can come between a recorder's last records and its final checkpoint on `close()`.
+- Before Python 3.12, a connection made within a few calls of the recursion limit could now and then go
+  unrecorded without being counted. It is counted in `recorder.failures`.
 
 ## 1.1.0 (2026-11-09)
 
