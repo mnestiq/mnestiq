@@ -34,7 +34,7 @@ from typing import Any
 from collections.abc import Callable, Mapping
 from urllib.parse import urlsplit
 
-from ..recorder import Recorder
+from ..recorder import _UNKNOWN, Recorder
 from ._common import _run_deferred, _streamed_raw, inside_recorded_call, snapshot, wrap_create
 from .anthropic import make_record, stream_method
 from .openai import make_records
@@ -217,7 +217,7 @@ def _describe_request(args: tuple, kwargs: dict) -> dict:
             if key in sent and key in copied and copied[key] is not sent[key]:
                 options.json_data = {**sent, key: copied[key]}
                 sent = options.json_data
-    seen.setdefault("model", "<unknown>")
+    seen.setdefault("model", _UNKNOWN)
     seen["stream"] = kwargs.get("stream") is True or body.get("stream") is True
     headers = getattr(options, "headers", None)
     if isinstance(headers, Mapping):

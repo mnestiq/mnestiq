@@ -1436,7 +1436,7 @@ def test_an_answer_with_duplicate_keys_is_not_recorded_as_clean(air, name):
     air.raw.replies.append(_http(body))
     assert air.post(CHAT[1]) == (200, body)
     (call,) = air.records()
-    assert call["attributes"].get("output_captured") is False
+    assert call["attributes"].get("output_captured") in (False, "partial")
 
 
 def test_a_request_with_duplicate_keys_is_not_recorded_as_clean(air):
@@ -1508,7 +1508,8 @@ def test_a_stream_with_a_hole_keeps_what_was_read_and_says_so(air):
     assert air.post(CHAT[1], json.dumps({"model": "m", "stream": True}).encode()) == (200, stream)
     (call,) = air.records()
     assert call["output"]["content"]["content"] == "Hello there"
-    assert call["attributes"]["output_captured"] is False and "could not be read" in call["attributes"]["capture_note"]
+    attrs = call["attributes"]
+    assert attrs["output_captured"] == "partial" and "could not be read" in attrs["capture_note"]
 
 
 def test_a_huge_request_and_answer_pass_whole_and_the_record_says_what_it_left_out(air):
@@ -1837,7 +1838,7 @@ def test_an_unreadable_event_reaches_the_agent_and_is_not_recorded_as_a_whole_an
     assert status == 200 and data == stream
     assert air.problems() == []
     (call,) = air.records()
-    assert call["status"] == "error" or call["attributes"].get("output_captured") is False
+    assert call["status"] == "error" or call["attributes"].get("output_captured") in (False, "partial")
 
 
 STREAM_BYTES = {"no_final_blank_line": b"data: {}", "no_data_field": b"event: x\n\n",
@@ -1870,7 +1871,7 @@ def test_a_stream_cut_before_its_last_event_is_not_recorded_as_whole(air, api):
     assert status == 200 and data == stream
     assert air.problems() == []
     (call,) = air.records()
-    assert call["status"] == "error" or call["attributes"].get("output_captured") is False
+    assert call["status"] == "error" or call["attributes"].get("output_captured") in (False, "partial")
 
 
 def test_an_event_with_duplicate_keys_is_not_recorded_as_clean(air):
@@ -1881,7 +1882,7 @@ def test_an_event_with_duplicate_keys_is_not_recorded_as_clean(air):
     status, data = air.post(CHAT[1], json.dumps({"model": "m", "stream": True}).encode())
     assert status == 200 and data == stream
     (call,) = air.records()
-    assert call["status"] == "error" or call["attributes"].get("output_captured") is False
+    assert call["status"] == "error" or call["attributes"].get("output_captured") in (False, "partial")
 
 
 def _sse_gzip(body):
@@ -1915,7 +1916,7 @@ def test_an_event_over_the_size_limit_reaches_the_agent_and_is_not_recorded_as_w
     status, data = air.post(CHAT[1], json.dumps({"model": "m", "stream": True}).encode())
     assert status == 200 and data == stream
     (call,) = air.records()
-    assert call["status"] == "error" or call["attributes"].get("output_captured") is False
+    assert call["status"] == "error" or call["attributes"].get("output_captured") in (False, "partial")
 
 
 def test_an_unfinished_tool_call_too_deep_to_read_is_still_recorded(air):

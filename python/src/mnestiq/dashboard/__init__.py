@@ -3,7 +3,8 @@
     mnestiq dashboard ./evidence --trusted-key keys/signing.pub
 
 Serves a single-page dashboard on 127.0.0.1 that reads evidence files from disk,
-verifies them with the same verifier as the CLI, and live-updates as agents write.
+verifies them with the same verifier as the CLI, runs the detection rules over each whole
+file, and live-updates as agents write.
 
 Containment: binds to loopback only, rejects non-local Host headers (DNS
 rebinding), answers data requests only with the random key in the link it prints
@@ -30,17 +31,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from itertools import islice
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 from urllib.parse import parse_qs, urlsplit
 
 from ..canonical import parse_json
 from ..context import expand
+from ..findings import findings
 from ..verify import ChainVerifier, Issue, Report, is_blank
 
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
-MAX_RECORDS = 20_000   # sent to the browser per file, verification still reads everything
+MAX_RECORDS = 20_000   # sent to the browser per file, verification and the rules still read everything
+MAX_EARLIER_FINDINGS = 20_000  # findings on records before those sent, listed on the page: the page says how many more
 MAX_ERRORS = 1_000     # a file is checked until it has this many problems
 MAX_LOAD_BYTES = 256 * 1024 * 1024  # the largest file read into memory and verified here
 _VERIFY_BATCH = 1_024  # lines verified between looks at how many problems were found
@@ -116,7 +119,7 @@ class EvidenceStore:
         summary = {"name": self.name(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "ok": False,
                    "records": 0, "errors": 1, "warnings": 0, "unrecognised": True}
         body = {"file": summary, "report": {**report.to_dict(), "errors_total": 1}, "pinned": bool(self.trusted_keys),
-                "records": [], "records_total": 0, "records_shown_from": 0}
+                "records": [], "records_total": 0, "records_shown_from": 0, "sealed": [], "findings": None}
         payload = json.dumps(body).encode("utf-8")
         return _Loaded((st.st_mtime_ns, st.st_size), summary, payload,
                        '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
@@ -169,6 +172,8 @@ class EvidenceStore:
 
         # Model calls that record only what changed are shown with their full context.
         records.extend(expand(parsed()))
+        shown = {seq for r in records if (seq := _seq(r.get("seq"))) is not None}
+        first_shown = min(shown, default=None)
         summary = {
             "name": self.name(path),
             "size": st.st_size,
@@ -183,7 +188,11 @@ class EvidenceStore:
         report_dict["errors"] = report_dict["errors"][:MAX_ERRORS]
         body = {"file": summary, "report": report_dict, "pinned": bool(self.trusted_keys),
                 "records": list(records), "records_total": total,
-                "records_shown_from": total - len(records)}
+                "records_shown_from": total - len(records),
+                # What the verifier vouches for: the checkpoints that checked with no error, and what they cover.
+                # The page marks a record sealed by these alone, never by what a checkpoint in the file claims.
+                "sealed": [s for s in verifier.sealed if first_shown is None or s["to_seq"] >= first_shown],
+                "findings": _findings(lines, shown)}
         # "replace": a lone surrogate parses from JSON (the verifier reports it) but has no UTF-8 form
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8", "replace")
         loaded = _Loaded(stamp, summary, payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
@@ -192,6 +201,38 @@ class EvidenceStore:
             while len(self._cache) > MAX_CACHED:
                 self._cache.popitem(last=False)
         return loaded
+
+
+def _seq(value: object) -> int | None:
+    """A record's seq when it is a whole number, as the page reads it (JSON's 4.0 is 4). None otherwise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) if isinstance(value, int) or value.is_integer() else None
+
+
+def _findings(lines: list[bytes], shown: set[int]) -> dict | None:
+    """What ``findings()`` finds in the whole file, split by whether its record is among those sent to the page.
+    The page shows only the most recent records, and a run that began before them has its taint there: the rules
+    must see the whole file, or findings inside the window go missing too. Their own work limit bounds the time.
+    None if they could not be run at all, which the page then says."""
+
+    def every_record() -> Iterator[Any]:
+        for raw in lines:
+            if not is_blank(raw):
+                try:
+                    yield parse_json(raw)
+                except (ValueError, RecursionError):
+                    yield None  # in its place, so that the rules say it was not evaluated
+
+    try:
+        found = findings(every_record())
+    except Exception:  # a file can hold anything: the page then runs the rules on what it was sent
+        return None
+    in_window: list[dict] = []
+    earlier: list[dict] = []
+    for finding in found:
+        (in_window if _seq(finding.get("seq")) in shown else earlier).append(finding)
+    return {"shown": in_window, "earlier": earlier[:MAX_EARLIER_FINDINGS], "earlier_total": len(earlier)}
 
 
 def _sniff_file(fh: BinaryIO) -> bool | None:

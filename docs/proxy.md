@@ -16,8 +16,9 @@ mnestiq proxy evidence/support-bot.jsonl --agent support-bot --signer \
 ```
 
 `--signer` signs with the signing service (`MNESTIQ_SIGNER`, `MNESTIQ_SIGNER_TOKEN`, see
-[signing.md](signing.md)). `--azure-key URL` signs with Azure Key Vault, and `--key PATH` with a
-key file, for trying it out. After 5 quiet minutes it signs a heartbeat and anything not yet
+[signing.md](signing.md)). `--azure-key URL` signs with Azure Key Vault, reading the key as
+`signer serve` does and giving up after 30 seconds, and `--key PATH` signs with a key file, for
+trying it out. After 5 quiet minutes it signs a heartbeat and anything not yet
 signed (`--heartbeat-minutes`), and it signs everything before it stops on Ctrl+C or a service
 stop (SIGTERM, or Ctrl+Break on Windows). A proxy killed outright leaves the records since its
 last checkpoint unsigned. The proxy prints the address to use for each provider:
@@ -71,11 +72,16 @@ mnestiq proxy ... --tool-source fetch_page=web --tool-source crm_lookup=internal
 
 It sees what the model was told (system prompt, the user's words, the tool results the agent
 handed back) and what the model asked for (tool calls, answers, token use), with the time,
-latency, the provider's request id and the connection's addresses. Streamed answers are recorded
-whole.
+latency, the provider's request id and the connection's addresses. Answers, streamed or not, are
+read with the same code as the SDK integrations, so the same answer gives the same output, tool
+calls and marks on both paths. A request that names no model is recorded with model `<unknown>`.
 
-A call that was not captured in full says so in its `attributes`. `output_captured` is `false` when the
-record holds no complete answer, with the reason in `capture_note` when the proxy knows it.
+A call that was not captured in full says so in its `attributes`. `output_captured` is `"partial"` when
+the record holds part of the answer, and `false` when it holds none of it, with the reason in
+`capture_note` when the proxy knows it. Streamed output past the recorder's `max_content_bytes` (1 MiB
+by default) is not kept. A stream that ends before its last event also gets an `error`. Of a Chat
+Completions answer with several choices, only the first is recorded, and the record is marked
+`"partial"`.
 `request_understood` is `false` for a request the proxy could not read as a model call, which is then
 kept whole as untrusted, with the reason in `request_note` when there is one.
 

@@ -158,7 +158,9 @@ without an injection. Content that a tool labels trusted (`internal`) is never t
 tool that returns text a customer can write, such as an order note, should label it
 `tool_output`. MNQ-004 does not compare an argument value over 200 characters. An address or host is
 traced only when it is written the way a real one is: one fused to other text with no separator, longer
-than 254 characters, or with a label over 63 characters is not traced. An edit of the right type, such as
+than 254 characters, or with a label over 63 characters is not traced. The rules take a host for its parent
+domain's except under a shared suffix such as `co.uk` or `github.io`. Their list of those is built in and is not
+the full public suffix list, so two sites under a suffix it lacks can be taken for one. An edit of the right type, such as
 an emptied `context`, cannot be told apart by the rules. Only `mnestiq verify` shows it, so read findings
 together with the verdict. Findings are leads for a person to triage, not verdicts.
 

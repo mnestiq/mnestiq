@@ -14,7 +14,8 @@ from collections.abc import Callable
 from ..jsonable import get, is_not_given, to_jsonable
 from ..recorder import Recorder, Run, Segment
 from ._common import (_SLOT_BYTES, StreamAccumulator, _as_dict, as_items, follow_copies, is_stream, json_size,
-                      keep_part, parse_args as _parse_args, remember_tool, sampling_params, tool_name, wrap_method)
+                      keep_part, model_name, parse_args as _parse_args, remember_tool, sampling_params, tool_name,
+                      wrap_method)
 
 
 def make_records(recorder: Recorder, *, tool_sources: dict[str, str] | None = None,
@@ -30,7 +31,7 @@ def make_records(recorder: Recorder, *, tool_sources: dict[str, str] | None = No
         messages = [to_jsonable(m) for m in as_items(kwargs.get("messages"))]
         system = [m.get("content") for m in messages
                   if isinstance(m, dict) and m.get("role") in ("system", "developer")]
-        common: dict[str, Any] = dict(provider="openai", model=str(kwargs.get("model")),
+        common: dict[str, Any] = dict(provider="openai", model=model_name(kwargs.get("model")),
                       context=chat_segments(messages, sources()), params=sampling_params(kwargs),
                       system_prompt=system or None, latency_ms=latency, error=error)
         if response is None:
@@ -39,30 +40,20 @@ def make_records(recorder: Recorder, *, tool_sources: dict[str, str] | None = No
         if is_stream(kwargs, response):
             run.llm_call(**common, attributes={"streaming": True, "output_captured": False})
             return
-        choices = to_jsonable(get(response, "choices") or [])
-        choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
-        message = choice.get("message", {})
-        calls = message.get("tool_calls") if isinstance(message, dict) else None
-        legacy = message.get("function_call") if isinstance(message, dict) else None
-        calls = [*(calls if isinstance(calls, list) else []),
-                 *([{"function": legacy}] if isinstance(legacy, dict) else [])]
-        usage = _as_dict(to_jsonable(get(response, "usage")))
-        run.llm_call(
-            **common,
-            output=message,
-            response_model=get(response, "model"),
-            stop_reason=choice.get("finish_reason"),
-            response_id=get(response, "id"),
-            tool_calls=[_chat_tool_call(tc) for tc in calls if isinstance(tc, dict)],
-            usage={"input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens")},
-            attributes=attributes,
-        )
+        answer = chat_answer(response)
+        left_out = chat_left_out(response)
+        if left_out is not None:  # what the agent got is more than the record holds: it says so
+            attributes = dict(attributes or {})
+            if attributes.get("output_captured") is not False:
+                attributes["output_captured"] = "partial"
+            attributes.setdefault("capture_note", left_out)
+        run.llm_call(**common, **answer, attributes=attributes)
 
     def record_responses(run: Run, kwargs: dict, response: Any, latency: int, error: str | None,
                          attributes: dict[str, Any] | None = None) -> None:
         instructions = kwargs.get("instructions")
         instructions = None if instructions is None or is_not_given(instructions) else instructions
-        common: dict[str, Any] = dict(provider="openai", model=str(kwargs.get("model")),
+        common: dict[str, Any] = dict(provider="openai", model=model_name(kwargs.get("model")),
                       context=responses_segments(instructions, kwargs.get("input"), sources()),
                       params=sampling_params(kwargs), system_prompt=instructions, latency_ms=latency, error=error)
         if response is None:
@@ -71,25 +62,63 @@ def make_records(recorder: Recorder, *, tool_sources: dict[str, str] | None = No
         if is_stream(kwargs, response):
             run.llm_call(**common, attributes={"streaming": True, "output_captured": False})
             return
-        output = to_jsonable(get(response, "output") or [])
-        usage = _as_dict(to_jsonable(get(response, "usage")))
-        run.llm_call(
-            **common,
-            output=output,
-            response_model=get(response, "model"),
-            stop_reason=get(response, "status"),
-            response_id=get(response, "id"),
-            tool_calls=[{"id": item.get("call_id"), "name": item.get("name") or item.get("type"),
-                         "arguments": _parse_args(item.get("arguments", item.get("input", item.get("action"))))}
-                        for item in (output if isinstance(output, list) else [])
-                        if isinstance(item, dict) and item.get("type") in MODEL_CALLS],
-            usage={"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")},
-            attributes=attributes,
-        )
+        run.llm_call(**common, **responses_answer(response), attributes=attributes)
 
     record_chat.new_accumulator = _ChatStream  # type: ignore[attr-defined]
     record_responses.new_accumulator = _ResponsesStream  # type: ignore[attr-defined]
     return record_chat, record_responses
+
+
+def chat_answer(response: Any) -> dict[str, Any]:
+    """What a whole Chat Completions answer says, as keyword arguments for ``Run.llm_call``. An SDK object
+    or the JSON the proxy read: the record is the same for the same answer."""
+    choices = to_jsonable(get(response, "choices") or [])
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message", {})
+    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    legacy = message.get("function_call") if isinstance(message, dict) else None
+    calls = [*(calls if isinstance(calls, list) else []),
+             *([{"function": legacy}] if isinstance(legacy, dict) else [])]
+    usage = _as_dict(to_jsonable(get(response, "usage")))
+    return {
+        "output": message,
+        "response_model": get(response, "model"),
+        "stop_reason": choice.get("finish_reason"),
+        "response_id": get(response, "id"),
+        "tool_calls": [_chat_tool_call(tc) for tc in calls if isinstance(tc, dict)],
+        "usage": {"input_tokens": usage.get("prompt_tokens"), "output_tokens": usage.get("completion_tokens")},
+    }
+
+
+OTHER_CHOICES = ("only the first of several choices is recorded: the text and tool calls of the others "
+                 "were not kept, and no rule judged them")
+
+
+def chat_left_out(response: Any) -> str | None:
+    """Why a whole Chat Completions answer is not all in its record, if so: a record holds choice 0 only."""
+    choices = get(response, "choices")
+    try:
+        many = choices is not None and len(choices) > 1
+    except TypeError:
+        return None
+    return OTHER_CHOICES if many else None
+
+
+def responses_answer(response: Any) -> dict[str, Any]:
+    """What a whole Responses API answer says, as keyword arguments for ``Run.llm_call``."""
+    output = to_jsonable(get(response, "output") or [])
+    usage = _as_dict(to_jsonable(get(response, "usage")))
+    return {
+        "output": output,
+        "response_model": get(response, "model"),
+        "stop_reason": get(response, "status"),
+        "response_id": get(response, "id"),
+        "tool_calls": [{"id": item.get("call_id"), "name": item.get("name") or item.get("type"),
+                        "arguments": _parse_args(item.get("arguments", item.get("input", item.get("action"))))}
+                       for item in (output if isinstance(output, list) else [])
+                       if isinstance(item, dict) and item.get("type") in MODEL_CALLS],
+        "usage": {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")},
+    }
 
 
 _DELTA_FIELDS = frozenset({"role", "content", "refusal", "tool_calls", "function_call"})
@@ -136,6 +165,8 @@ class _ChatStream(StreamAccumulator):
         for choice in get(chunk, "choices") or []:
             if get(choice, "index", 0) == 0:
                 self._choice(choice)
+            else:  # reached the caller, and is not in the record
+                self.left_out = OTHER_CHOICES
 
     def _choice(self, choice: Any) -> None:
         finish_reason = get(choice, "finish_reason")
@@ -443,9 +474,15 @@ def _chat_segment(m: dict, tool_names: dict[str, str], sources: dict[str, str]) 
     if role == "tool":
         name = tool_name(tool_names, m.get("tool_call_id"))
         return Segment(source=sources.get(name or "", "tool_output"), role=role, name=name, content=m.get("content"))
+    if role == "function":  # the legacy form of a tool result: what a function sent back, never the user's words
+        name = m.get("name") if isinstance(m.get("name"), str) else None
+        return Segment(source=sources.get(name or "", "tool_output"), role=role, name=name, content=m.get("content"))
     if role in ("system", "developer"):
         return Segment(source="system", role=role, content=m.get("content"))
-    return Segment(source="user", role=role or "user", content=m.get("content"))
+    if role in ("user", None):  # no role at all is read as the user's, as the Responses path reads it
+        return Segment(source="user", role="user", content=m.get("content"))
+    # A role this version does not know could be anyone's words, so it is not taken for the user's.
+    return Segment(source="unknown", role=role if isinstance(role, str) else None, content=m.get("content"))
 
 
 def responses_segments(instructions: Any, input_: Any, sources: dict[str, str]) -> list[Segment]:
@@ -480,10 +517,14 @@ def _responses_segment(item: Any, tool_names: dict[str, str], sources: dict[str,
                        content=item.get("output", item))
     if itype in CALLS_WITH_RESULTS:
         return Segment(source=CALLS_WITH_RESULTS[itype], role="tool", name=item.get("name") or itype, content=item)
+    if itype == "reasoning":
+        return Segment(source="model", role="assistant", content=item)
+    if itype not in (None, "message"):  # an item type this version does not know: its role is only its claim
+        return Segment(source="unknown", role=role or "user", content=item)
     if role in ("system", "developer"):
         return Segment(source="system", role=role, content=item.get("content"))
-    if role == "assistant" or itype == "reasoning":
+    if role == "assistant":
         return Segment(source="model", role="assistant", content=item)
-    if role == "user" or (itype in (None, "message") and role is None):
+    if role in ("user", None):
         return Segment(source="user", role="user", content=item.get("content", item))
     return Segment(source="unknown", role=role or "user", content=item)  # a kind of item this version does not know

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -13,13 +14,14 @@ from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from importlib import resources
+from itertools import islice
 from pathlib import Path
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING, Any
 
 from cryptography.exceptions import InvalidSignature
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import best_match
+from jsonschema import Draft202012Validator, validators
+from jsonschema.exceptions import ValidationError, best_match
 
 from .canonical import CanonicalizationError, canonical_json, parse_json
 from .hashing import (
@@ -105,6 +107,15 @@ def version_key(version: Any) -> tuple[int, int] | None:
 _MINOR = re.compile(r"1\.(0|[1-9][0-9]{0,3})")
 
 
+def _shown(text: str, limit: int = 200) -> str:
+    """Text from a file, for a message: on one line, with control, line-breaking and direction characters written
+    as escapes (a field named "x\\n  head  matches" must not print a line of its own), and at most ``limit``
+    characters of it."""
+    cut = text[:limit]
+    out = "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in cut)
+    return out + ("..." if len(text) > limit else "")
+
+
 def _unknown_fields(rec: dict) -> list[str]:
     """Top-level fields, and an event type, that this verifier's version does not define."""
     kind = rec.get("kind")
@@ -136,6 +147,51 @@ class _Keys:
     tsa_roots: list[x509.Certificate] | None = None  # roots for RFC 3161 tokens; None means the defaults
 
 
+MAX_SCHEMA_ERRORS = 1_000  # schema errors looked at per record: a line of 200 KB can hold 100,000, five are shown
+
+
+def _one_of(validator: Any, subschemas: list, instance: Any, schema: dict) -> Iterator[ValidationError]:
+    """The schema's oneOf, as jsonschema checks it, but holding at most MAX_SCHEMA_ERRORS errors of each branch.
+    jsonschema holds them all, so a record with no kind used about 2,000 times its size in memory."""
+    branches = enumerate(subschemas)
+    context: list[ValidationError] = []
+    for index, subschema in branches:
+        errors = list(islice(validator.descend(instance, subschema, schema_path=index), MAX_SCHEMA_ERRORS))
+        if not errors:
+            first_valid = subschema
+            break
+        context.extend(errors)
+    else:
+        yield ValidationError(f"{instance!r} is not valid under any of the given schemas", context=context)
+        return
+    more_valid = [each for _, each in branches if validator.evolve(schema=each).is_valid(instance)]
+    if more_valid:
+        more_valid.append(first_valid)
+        reprs = ", ".join(repr(each) for each in more_valid)
+        yield ValidationError(f"{instance!r} is valid under each of {reprs}")
+
+
+def _any_of(validator: Any, subschemas: list, instance: Any, schema: dict) -> Iterator[ValidationError]:
+    """The schema's anyOf, as jsonschema checks it, with the same bound as _one_of."""
+    context: list[ValidationError] = []
+    for index, subschema in enumerate(subschemas):
+        errors = list(islice(validator.descend(instance, subschema, schema_path=index), MAX_SCHEMA_ERRORS))
+        if not errors:
+            return
+        context.extend(errors)
+    yield ValidationError(f"{instance!r} is not valid under any of the given schemas", context=context)
+
+
+_BoundedValidator = validators.extend(Draft202012Validator, {"oneOf": _one_of, "anyOf": _any_of})
+
+
+def _schema_errors(record: Any) -> list[ValidationError]:
+    """The first five schema errors of a record by where they are, out of the first MAX_SCHEMA_ERRORS found. A
+    record with fewer than that gets the same five as from all of them."""
+    found = islice(_validator(record).iter_errors(record), MAX_SCHEMA_ERRORS)
+    return heapq.nsmallest(5, found, key=lambda e: [(isinstance(p, str), p) for p in e.absolute_path])
+
+
 @lru_cache(maxsize=1)
 def _validators() -> dict[str | None, Draft202012Validator]:
     """The whole schema (under None), and one validator per kind of record.
@@ -146,11 +202,11 @@ def _validators() -> dict[str | None, Draft202012Validator]:
     cost, with the error a reader needs (the field that is wrong) rather than "not valid under any
     of the given schemas". Any other record goes through the whole schema."""
     schema = json.loads(resources.files("mnestiq.schema").joinpath("record.schema.json").read_text("utf-8"))
-    out: dict[str | None, Draft202012Validator] = {None: Draft202012Validator(schema)}
+    out: dict[str | None, Draft202012Validator] = {None: _BoundedValidator(schema)}
     for kind in ("event", "checkpoint"):
         branch = {k: v for k, v in schema.items() if k != "oneOf"}
         branch["$ref"] = f"#/$defs/{kind}"
-        out[kind] = Draft202012Validator(branch)
+        out[kind] = _BoundedValidator(branch)
     return out
 
 
@@ -164,12 +220,12 @@ def schema_problem(record: dict, show_value: bool = True) -> str | None:
     field and the rule only: the message is then safe for an application log, since a schema error
     otherwise quotes the value, which can be anything the agent handled (an API key, a document)."""
     instance = json.loads(canonical_json(record))
-    error = best_match(_validator(instance).iter_errors(instance))
+    error = best_match(islice(_validator(instance).iter_errors(instance), MAX_SCHEMA_ERRORS))
     if error is None:
         # The schema leaves room for what later minor versions add. A record of a version this verifier
         # implements may hold only what that version defines.
         unknown = _unknown_fields(instance) if (version_key(instance.get("spec_version")) or (9, 9)) <= (1, 0) else []
-        return f"unknown field(s): {', '.join(unknown)}" if unknown else None
+        return f"unknown field(s): {', '.join(map(_shown, unknown))}" if unknown else None
     where = "/".join(map(str, error.absolute_path)) or "record"
     if show_value:
         return f"{where}: {error.message}"
@@ -229,6 +285,8 @@ class ChainVerifier:
         self.restart = None
         self.last_checkpoint: int | None = None  # the seq of the latest checkpoint seen
         self.lines = 0  # lines read so far, blank ones included: error line numbers count on from here
+        # The checkpoints that verified with no error at all, in order: seq, and the from_seq and to_seq they cover
+        self.sealed: list[dict[str, int]] = []
 
     def feed(self, lines: Iterable[bytes | str]) -> None:
         report = self.report
@@ -273,10 +331,10 @@ class ChainVerifier:
 
     def _check_record(self, rec: dict, line_no: int, seq: int | None) -> None:
         report, keys = self.report, self.keys
-        schema_errors = sorted(_validator(rec).iter_errors(rec),
-                               key=lambda e: [(isinstance(p, str), p) for p in e.absolute_path]) if self.schema else []
+        errors_before = len(report.errors)
+        schema_errors = _schema_errors(rec) if self.schema else []
         if schema_errors:
-            for err in schema_errors[:5]:
+            for err in schema_errors:
                 where = "/".join(map(str, err.absolute_path)) or "(record)"
                 report.error("schema", f"{where}: {err.message}", line_no, seq)
             if not isinstance(rec.get("record_hash"), str) or seq is None:
@@ -383,7 +441,7 @@ class ChainVerifier:
                 # counts as unsigned here, never as valid, and stays in the unsigned tail.
                 _check_range(rec, self.pending, report, line_no, seq)
                 _check_unknown_signer(rec, keys, report, line_no, seq)
-                self.not_checked.add(f"signatures with {rec.get('sig_alg')}")
+                self.not_checked.add(f"signatures with {_shown(str(rec.get('sig_alg')))}")
                 self.unverifiable += len(self.pending)
                 self.unverified_tail += len(self.pending)
             else:
@@ -392,6 +450,10 @@ class ChainVerifier:
                 self.unverified_tail = 0
                 if seq is not None:
                     report.signed_through_seq = seq
+                if seq is not None and self.pending and len(report.errors) == errors_before:
+                    # Nothing about this checkpoint failed: its range, its Merkle root and its signature checked,
+                    # and its key is a trusted one when keys are pinned.
+                    self.sealed.append({"seq": seq, "from_seq": self.pending[0][0], "to_seq": self.pending[-1][0]})
             if seq is not None:
                 self.checkpoint_hashes[seq] = stored
                 self.last_checkpoint = seq
@@ -469,10 +531,10 @@ class ChainVerifier:
         if not unknown:
             return
         if newer:
-            self.not_checked.update(unknown)
+            self.not_checked.update(map(_shown, unknown))
         else:
             report.error("schema", f"unknown field(s) for spec_version {rec.get('spec_version')}: "
-                                   f"{', '.join(unknown)}", line_no, seq)
+                                   f"{', '.join(map(_shown, unknown))}", line_no, seq)
 
     def _check_context_base(self, rec: dict, v1: bool, report: Report, line_no: int, seq: int) -> None:
         """A call that records only what changed must point back to an earlier model call of the same run

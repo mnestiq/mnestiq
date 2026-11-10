@@ -12,10 +12,19 @@ on:
 permissions:
   contents: read
 
+# One release run per tag at a time. A run that is already publishing is never cancelled, as
+# stopping halfway could leave a version on PyPI without its attestation.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # The tests install many packages from PyPI and run their code: they get no signing rights.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MNESTIQ_CI_STRICT: "1"  # everything is installed: a missing node or library fails the run
     permissions:
       contents: read
     defaults:
@@ -34,6 +43,7 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write      # to sign the provenance attestation
@@ -78,6 +88,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: pypi
       url: https://pypi.org/p/mnestiq

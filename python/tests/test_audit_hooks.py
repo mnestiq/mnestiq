@@ -97,14 +97,6 @@ def hooks():
     uninstrument_egress()
 
 
-@pytest.fixture(autouse=True)
-def _no_system_proxy_lookup(monkeypatch):
-    """On macOS urllib reads the system's proxy settings, which can look the target up in DNS."""
-    if sys.platform == "darwin":
-        monkeypatch.setattr(urllib.request, "proxy_bypass", lambda *args, **kwargs: False)
-        monkeypatch.setattr("requests.utils.proxy_bypass", lambda *args, **kwargs: False, raising=False)
-
-
 @pytest.fixture
 def rec():
     recorder = Recorder(MemorySink(), agent_id="agent")
@@ -1266,9 +1258,11 @@ def test_what_is_left_waiting_is_written_when_the_recorder_closes():
     recorder = Recorder(MemorySink(), agent_id="agent")
     with recorder.run() as run:
         recorder._lock.acquire()
+        recorder._writing += 1  # as a finalizer finds a thread part way through a write
         try:
             run.note("waits")
         finally:
+            recorder._writing -= 1
             recorder._lock.release()
         assert notes(recorder, "message") == []
     assert notes(recorder, "message") == ["waits"]

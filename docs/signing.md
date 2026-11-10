@@ -72,6 +72,13 @@ refused, and chains already held keep working. Signing and the witness have a li
 use up signing's. Anyone holding the token can fill the limit by naming new chains. Treat a refusal you did not
 expect as an incident.
 
+The service serves at most 256 connections at once, and at most 32 of them may still be proving the token. Past
+either limit, a new connection is closed at once and the service logs a warning. A connection with no request for
+300 seconds is closed. `SignerClient` does not reuse a connection left idle for more than 120 seconds, and
+reconnects by itself. After a failure it sends a request again only when that is safe: a public key or sign
+request, never a witness send that may have arrived. In Python, `SignerService.start(max_connections=...,
+idle_seconds=...)` sets the first and last limits. `signer serve` has no option for them.
+
 A checkpoint covers at most 2^40 records, far more than a recorder can hold. If a chain stops being
 signed with "only the next checkpoint is signed" and you did not expect it, someone holding the
 token may have had a checkpoint signed that does not match the records. Treat it as an incident:

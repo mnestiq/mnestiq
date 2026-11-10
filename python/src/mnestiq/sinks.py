@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import json
 import os
 import re
 import stat
@@ -322,8 +321,8 @@ class MemorySink:
         self.recovered: dict | None = None
 
     def append(self, record: dict) -> None:
-        # Round-trip through canonical JSON so in-memory records match what a file would hold.
-        self.records.append(json.loads(canonical_json(record)))
+        # Round-trip through canonical JSON, read back as a file is read, so these records match what a file would hold.
+        self.records.append(parse_json(canonical_json(record)))
 
     def existing(self) -> Iterator[dict]:
         return iter(list(self.records))

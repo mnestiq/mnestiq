@@ -30,13 +30,20 @@ def _say(text: str) -> None:
     print(_CONTROL.sub("?", text))
 
 
-_LINE_BREAKING = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# Control and line-breaking characters, and the ones that change the direction text is shown in.
+_LINE_BREAKING = re.compile(r"[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]")
 
 
 def _one_line(text: str) -> str:
     """Text from an evidence file, shown on one line. A newline in a tool's error must not start what looks
-    like another record of the listing, so control characters are escaped."""
+    like another record of the listing, so control characters are escaped. So are the characters that turn
+    text around on screen."""
     return _LINE_BREAKING.sub(lambda m: m.group().encode("unicode_escape").decode("ascii"), text)
+
+
+def _say_line(text: str) -> None:
+    """One line of output that holds values from an evidence file."""
+    _say(_one_line(text))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,8 +141,23 @@ def main(argv: list[str] | None = None) -> int:
         return {"verify": _verify, "keygen": _keygen, "inspect": _inspect, "redact": _redact,
                 "dashboard": _dashboard, "signer": _signer, "proxy": _proxy, "demo": _demo}[args.command](args)
     except (OSError, ValueError, RecursionError) as exc:  # a head or key file can hold anything too
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_one_line(str(exc))}", file=sys.stderr)
         return EXIT_USAGE
+    except Exception as exc:
+        if not isinstance(exc, _library_errors()):
+            raise
+        # The recorder refused the evidence file, a signer or a timestamp authority failed: said in one line.
+        print(f"error: {_one_line(str(exc)) or type(exc).__name__}", file=sys.stderr)
+        return EXIT_USAGE
+
+
+def _library_errors() -> tuple[type[Exception], ...]:
+    """The errors this library raises on purpose. Each says what went wrong in words, so a traceback adds nothing."""
+    from .signers import SignerError
+    from .sinks import RecorderError  # SinkError is one of these
+    from .timestamps import TimestampError
+
+    return (RecorderError, SignerError, TimestampError)
 
 
 def _verify(args: argparse.Namespace) -> int:
@@ -157,25 +179,25 @@ def _verify(args: argparse.Namespace) -> int:
         print(json.dumps(report.to_dict(), indent=2))
         return EXIT_OK if report.ok else EXIT_INVALID
 
-    _say(f"{'VALID' if report.ok else 'INVALID'}  {args.file}")
-    _say(f"  chain     {report.chain_id}")
-    _say(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
+    _say_line(f"{'VALID' if report.ok else 'INVALID'}  {args.file}")
+    _say_line(f"  chain     {report.chain_id}")
+    _say_line(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
     if report.signed_through_seq is not None:
-        _say(f"  signed    through seq {report.signed_through_seq} by {', '.join(report.signer_keys)}")
+        _say_line(f"  signed    through seq {report.signed_through_seq} by {', '.join(report.signer_keys)}")
     if report.timestamps:
         last = report.timestamps[-1]
-        _say(f"  time      {len(report.timestamps)} checkpoint(s) timestamped by an outside authority, "
-              f"the latest (seq {last['seq']}) at {last['time']}")
+        _say_line(f"  time      {len(report.timestamps)} checkpoint(s) timestamped by an outside authority, "
+                   f"the latest (seq {last['seq']}) at {last['time']}")
     for rot in report.rotations:
-        _say(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
+        _say_line(f"  handover  at seq {rot['seq']}: {rot['from_key']} -> {rot['to_key']}")
     if report.head_seq is not None:
-        _say(f"  head      matches the checkpoint at seq {report.head_seq} kept elsewhere")
+        _say_line(f"  head      matches the checkpoint at seq {report.head_seq} kept elsewhere")
     if report.witness is not None:
-        _say(f"  witness   {_witness_reach(report.witness)}")
+        _say_line(f"  witness   {_witness_reach(report.witness)}")
     for issue in report.errors:
-        _say(f"  ERROR   {_where(issue)}{issue.code}: {issue.message}")
+        _say_line(f"  ERROR   {_where(issue)}{issue.code}: {issue.message}")
     for issue in report.warnings:
-        _say(f"  warning {_where(issue)}{issue.code}: {issue.message}")
+        _say_line(f"  warning {_where(issue)}{issue.code}: {issue.message}")
     return EXIT_OK if report.ok else EXIT_INVALID
 
 
@@ -245,7 +267,8 @@ def _proxy(args: argparse.Namespace) -> int:
     from .keys import load_private_key
     from .proxy import DEFAULT_UPSTREAMS, ModelProxy
     from .recorder import SOURCES, Recorder
-    from .signers import AzureKeyVaultSigner, LocalSigner, SignerClient, SignerError
+    from .signer_service import key_vault_signer
+    from .signers import LocalSigner, SignerClient, SignerError
     from .sinks import FileSink, HeadFile
 
     sources = {}
@@ -256,7 +279,8 @@ def _proxy(args: argparse.Namespace) -> int:
                              f"SOURCE one of {', '.join(sorted(SOURCES))}")
         sources[tool] = source
     try:
-        signer = (SignerClient.from_env() if args.signer else AzureKeyVaultSigner(args.azure_key) if args.azure_key
+        # The same Key Vault read as signer serve: given up on at a deadline, and its errors said in words.
+        signer = (SignerClient.from_env() if args.signer else key_vault_signer(args.azure_key) if args.azure_key
                   else LocalSigner(load_private_key(args.key)) if args.key else None)
     except SignerError as exc:
         print(f"error: {exc}", file=sys.stderr)

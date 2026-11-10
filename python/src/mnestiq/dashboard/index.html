@@ -480,30 +480,87 @@ function untrustedValues(tool, args, context) {
 }
 // MNQ-005: images, and links carrying data, that untrusted content put in the model's answer.
 // Mirrors mnestiq/findings.py.
-// Each matches as soon as it has read to the closing bracket, whether or not what follows makes it an image:
-// the text it read is not read again from the next "![" inside it.
-const IMAGE_RX = /!\[[^\]]*(?:\]\(\s*<?([^)\s>]+))?|<img\b([^>]*)/gi;
-const IMAGE_SRC_RX = /\bsrc\s*=\s*["']?([^"'\s>]+)/i;
+// Each matches as soon as it has read what it can, whether or not what follows makes it an image: the text it
+// read is not read again from the next "![" or "<" inside it. Alt text is read as markdown reads it, with
+// brackets in pairs and any character after a backslash.
+const ALT = String.raw`(?:[^\[\]\\]|\\[\s\S]?|\[[^\[\]\\]*\]?)*`;
+const IMAGE_RX = new RegExp(String.raw`!\[` + ALT + String.raw`(?:\]\(\s*<?([^)\s>]+))?`, "gi");
+// A tag that loads an address as soon as it is shown. A quoted value may hold a ">".
+const IMAGE_TAG_RX = /<(?:img|image|input|video|audio|source)\b((?:[^>"']|"[^"]*"?|'[^']*'?)*)/gi;
+const ATTRIBUTE_RX = /([^\s"'>\/=]+)\s*(?:=\s*(?:"([^"]*)"?|'([^']*)'?|([^\s"'>]+)))?/g;
+const LOADS = new Set(["src", "srcset", "poster", "href"]);  // the attributes of those tags that name what they load
 const LINK_RX = /https?:[\/\\]*[^\s"'<>)\]]+/gi;
-const REF_IMAGE_RX = /!\[[^\]]*(?:\]\[([^\]]+)\])?/g;
+// ![alt][label], ![alt][] and ![alt]: the last two name the reference by their alt text. A label has 999 characters at most.
+const REF_IMAGE_RX = new RegExp(String.raw`!\[(` + ALT + String.raw`)(?:(\])(?:\[([^\[\]\\]{0,999})\])?)?`, "g");
 const REF_DEF_RX = /^[ \t]*\[([^\]]*)(?:\]:\s*<?(\S+?)>?(?:\s|$))?/gm;
 const MAX_LABELS = 16;  // a host and its parents, from the end: the end of a longer name is what its owner controls
 function images(text) {
   const found = new Set();
-  for (const m of text.matchAll(IMAGE_RX)) {
-    const source = m[1] || (m[2] ? (IMAGE_SRC_RX.exec(m[2]) || [])[1] : null);
-    if (source) found.add(source);
-  }
+  for (const m of text.matchAll(IMAGE_RX)) if (m[1]) found.add(m[1]);
+  for (const tag of text.matchAll(IMAGE_TAG_RX))
+    for (const a of tag[1].matchAll(ATTRIBUTE_RX)) {
+      const name = a[1].toLowerCase().split(":").pop();  // xlink:href is href
+      const value = a[2] ?? a[3] ?? a[4];
+      if (!LOADS.has(name) || value === undefined) continue;
+      for (const part of name === "srcset" ? value.split(",") : [value]) {  // "a.png 1x, b.png 2x"
+        const address = part.trim().split(/\s+/)[0];
+        if (address) found.add(address);
+      }
+    }
   const refs = new Map([...text.matchAll(REF_DEF_RX)].filter((m) => m[1] && m[2]).map((m) => [m[1].toLowerCase(), m[2]]));
-  for (const m of text.matchAll(REF_IMAGE_RX)) if (m[1] && refs.has(m[1].toLowerCase())) found.add(refs.get(m[1].toLowerCase()));
+  for (const m of text.matchAll(REF_IMAGE_RX)) {
+    if (m[2] === undefined || (m[3] === undefined && text.startsWith("(", m.index + m[0].length))) continue;  // not closed, or an inline image
+    const label = (m[3] || m[1]).toLowerCase();
+    if (refs.has(label)) found.add(refs.get(label));
+  }
   return found;
 }
-// The host and its parent domains of two labels or more: img.evil.example loads from evil.example's owner too.
+// Names under which anyone can have a site of their own: hosting and tunnel services, and the ones collection
+// endpoints are set up under. Not the public suffix list, only the part of it attackers reach for. A "*" stands for
+// any one label. The same list as PUBLIC_SUFFIXES in findings.py, in the same order.
+const PUBLIC_SUFFIXES = [
+  "*.amazonaws.com", "*.backblazeb2.com", "*.cloudapp.azure.com", "*.compute.amazonaws.com",
+  "*.digitaloceanspaces.com", "*.elb.amazonaws.com", "*.web.core.windows.net", "amazonaws.com", "amplifyapp.com",
+  "app.github.dev", "appspot.com", "awsapprunner.com", "azure-api.net", "azureedge.net", "azurefd.net",
+  "azurestaticapps.net", "azurewebsites.net", "backblazeb2.com", "beeceptor.com", "bitbucket.io",
+  "blob.core.windows.net", "blogspot.com", "burpcollaborator.net", "cloudapp.azure.com", "cloudapp.net",
+  "cloudfront.net", "cloudfunctions.net", "codesandbox.io", "core.windows.net", "csb.app", "database.windows.net",
+  "ddns.net", "deno.dev", "dfs.core.windows.net", "digitaloceanspaces.com", "duckdns.org", "dweb.link",
+  "execute-api.*.amazonaws.com", "file.core.windows.net", "firebaseapp.com", "firebaseio.com", "firebasestorage.app",
+  "fly.dev", "github.io", "githubusercontent.com", "gitlab.io", "gitpod.io", "glitch.me", "googleusercontent.com",
+  "herokuapp.com", "herokudns.com", "hookbin.com", "hopto.org", "interact.sh", "koyeb.app", "lambda-url.*.on.aws",
+  "lhr.life", "loca.lt", "localhost.run", "localtunnel.me", "m.pipedream.net", "mooo.com", "myshopify.com",
+  "neocities.org", "netlify.app", "netlify.com", "ngrok-free.app", "ngrok-free.dev", "ngrok.app", "ngrok.dev",
+  "ngrok.io", "oast.fun", "oast.live", "oast.me", "oast.online", "oast.pro", "oast.site", "oastify.com", "on.aws",
+  "ondigitalocean.app", "onrender.com", "pages.dev", "pipedream.net", "pythonanywhere.com", "queue.core.windows.net",
+  "r2.cloudflarestorage.com", "r2.dev", "railway.app", "readthedocs.io", "repl.co", "replit.app", "replit.dev",
+  "requestbin.net", "requestcatcher.com", "run.app", "s3-website.*.amazonaws.com", "s3.*.amazonaws.com",
+  "s3.*.backblazeb2.com", "s3.amazonaws.com", "s3.dualstack.*.amazonaws.com", "serveo.net", "servicebus.windows.net",
+  "sharepoint.com", "stackblitz.io", "storage.googleapis.com", "supabase.co", "surge.sh", "sytes.net",
+  "table.core.windows.net", "trafficmanager.net", "trycloudflare.com", "up.railway.app", "val.run", "vercel.app",
+  "web.app", "web.core.windows.net", "webcontainer.io", "webflow.io", "webhook.site", "weebly.com", "windows.net",
+  "wixsite.com", "wordpress.com", "workers.dev", "zapto.org"
+];
+// A short generic label under a country's code is that country's suffix: co.uk, com.au, org.uk, ac.jp, co.nz, com.br.
+const COUNTRY_SECOND_LEVELS = new Set(["ac", "co", "com", "ed", "edu", "go", "gob", "gov", "lg", "ltd", "mil", "ne", "net", "nom", "or", "org", "plc", "sch"]);
+const SUFFIX_NAMES = new Set(PUBLIC_SUFFIXES.filter((s) => !s.includes("*")));
+const SUFFIX_PATTERNS = PUBLIC_SUFFIXES.filter((s) => s.includes("*")).map((s) => s.split("."));
+// Whether a name is a suffix under which anyone can have a name of their own, and so no one's site. Mirrors
+// is_public_suffix in findings.py.
+function isPublicSuffix(name) {
+  const labels = name.split(".");
+  if (labels.length === 1 || SUFFIX_NAMES.has(name)) return true;
+  if (labels.length === 2 && COUNTRY_SECOND_LEVELS.has(labels[0]) && /^[a-z]{2}$/.test(labels[1])) return true;
+  return SUFFIX_PATTERNS.some((p) => p.length === labels.length && p.every((a, i) => a === "*" || a === labels[i]));
+}
+// The host and its parent domains that someone can own: img.evil.example loads from evil.example's owner too. A
+// public suffix is left out: that a user named bbc.co.uk says nothing about evil.co.uk.
 function domains(host) {
   const labels = host.split(".").slice(-MAX_LABELS);
+  if (labels.length === 1 || /^(?:[0-9]+|0x[0-9a-f]*)$/.test(labels[labels.length - 1])) return [host];  // an address
   const out = [];
   for (let i = 0; i < labels.length - 1; i++) out.push(labels.slice(i).join("."));
-  return out.length ? out : [host];
+  return out.filter((d) => !isPublicSuffix(d));
 }
 const SKIP_BLOCKS = new Set(["tool_use", "function_call", "tool_call", "thinking", "redacted_thinking"]);
 function answerText(v) {
@@ -514,7 +571,8 @@ function answerText(v) {
 }
 function hostOf(url) {  // as _host in findings.py: no scheme, user, port or path
   // A browser reads a backslash as a slash, and a single slash after the scheme loads the same host.
-  const rest = url.toLowerCase().replace(/^(?:[a-z][a-z0-9+.-]*:)?[\/\\]*/, "").split(/[\/\\?#]/)[0].split("@").pop();
+  // In "evil.example:8443/c" the colon starts a port, not a scheme.
+  const rest = url.toLowerCase().replace(/^(?:[a-z][a-z0-9+.-]*:(?![0-9]+(?:[\/\\?#]|$)))?[\/\\]*/, "").split(/[\/\\?#]/)[0].split("@").pop();
   return rest.startsWith("[") ? rest.split("]")[0] + "]" : rest.split(":")[0];
 }
 function answerLinks(ev, untrustedSegs) {
@@ -546,9 +604,12 @@ function untrustedArguments(ev, untrustedSegs) {
     for (const value of strings(call.arguments))
       for (const ind of indicators(value)) {
         let found = inCorpus(untrusted, ind) && !inCorpus(trusted, ind) ? ind : null;
-        if (!found && /[/?]/.test(ind)) {  // a planted link the model filled with data: its host came from the content
+        // A planted link the model filled with data, in its path, its query or a label of its host: the host, or a
+        // parent domain of it, came from the content.
+        if (!found && /[/?]/.test(ind)) {
           const host = hostOf(ind);
-          if (host.length >= 6 && host.includes(".") && inCorpus(untrusted, host) && !inCorpus(trusted, host)) found = host;
+          if (host.includes(".") && !domains(host).some((d) => inCorpus(trusted, d)))
+            found = domains(host).find((d) => d.length >= 6 && inCorpus(untrusted, d)) || null;
         }
         if (found)
           hits.push({ tool: call.name, indicator: ind,
@@ -592,7 +653,7 @@ function approvalMatters(name, call, context) {
     || untrustedArguments({ context, tool_calls: [call] }, context.filter((s) => UNTRUSTED.has(s.source))).length > 0;
 }
 const state = { files: [], name: null, etag: null, data: null, runId: null, focusSeq: null, open: new Set(), lastOk: 0,
-  follow: { file: true, run: true } };
+  follow: { file: true, run: true }, elsewhereOpen: false };
 
 function h(tag, props, ...kids) {
   const el = document.createElement(tag);
@@ -694,14 +755,21 @@ function deriveAll(payload) {
   const errBySeq = new Map();
   for (const e of report.errors) if (e.seq != null) (errBySeq.get(e.seq) || errBySeq.set(e.seq, []).get(e.seq)).push(e);
   const checkpoints = records.filter((r) => r.kind === "checkpoint" && r.covers);
-  // A record is sealed only by a checkpoint that verifies: one that fails (a record edited and its
-  // hash recomputed breaks the Merkle root there) seals nothing.
-  const covering = (seq) => checkpoints.find((c) => seq >= c.covers.from_seq && seq <= c.covers.to_seq);
+  // A record is sealed only by a checkpoint the verifier checked with no error at all: the server sends those, with
+  // what each covers. What a checkpoint in the file says it covers is not enough, since anyone can write one. A
+  // record that a failing checkpoint claims shows that its seal fails.
+  const seals = (payload.sealed || []).filter((s) => s && typeof s.from_seq === "number" && typeof s.to_seq === "number")
+    .sort((a, b) => a.from_seq - b.from_seq);
+  const covering = (seq) => {
+    let low = 0, high = seals.length;
+    while (low < high) { const mid = (low + high) >> 1; if (seals[mid].from_seq <= seq) low = mid + 1; else high = mid; }
+    const c = seals[low - 1];
+    return c && seq <= c.to_seq ? c : null;
+  };
   const restarts = new Map((report.restarts || []).map((x) => [x.checkpoint_seq, x]));
   const sealed = (seq) => {
     const c = covering(seq);
-    if (!c) return "";
-    if (errBySeq.has(c.seq)) return "failed";
+    if (!c) return checkpoints.some((k) => errBySeq.has(k.seq) && seq >= k.covers.from_seq && seq <= k.covers.to_seq) ? "failed" : "";
     const late = restarts.get(c.seq);
     return late && seq >= late.from_seq && seq <= late.to_seq ? "restart" : "sealed";
   };
@@ -750,7 +818,7 @@ function deriveAll(payload) {
         else if (ev.attributes && ev.attributes.output_captured === false && !(ev.status === "error" && !ev.attributes.capture_note))
           ev._flags.push({ rule: "MNQ-000", finding: "this call's output was not captured, so findings that depend on what the model asked for may be missing", taint: ev.step_id });
         else if (ev.attributes && (ev.attributes.output_captured === "partial" || ev.attributes.partial === true))
-          ev._flags.push({ rule: "MNQ-000", finding: "this call's output was only partly captured, because the stream stopped early or went past the size limit, so findings that depend on the rest of what the model asked for may be missing", taint: ev.step_id });
+          ev._flags.push({ rule: "MNQ-000", finding: "this call's output was only partly captured, so findings that depend on the rest of what the model asked for may be missing", taint: ev.step_id });
         lastContext = ev.context || [];
         latestAsked = new Set();
         for (const call of ev.tool_calls || []) {
@@ -830,6 +898,7 @@ function deriveAll(payload) {
     for (const ev of run.events) for (const f of ev._flags) run.flags.push({ seq: ev.seq, step: ev.step_id, ...f });
     totals.flags += run.flags.length;
   }
+  const elsewhere = serverFindings(payload.findings, runs, totals);
 
   for (const run of runs.values()) if (run.parent && runs.has(run.parent)) runs.get(run.parent).children.push(run);
   const roots = [...runs.values()].filter((r) => !r.parent || !runs.has(r.parent)).sort((a, b) => b.firstSeq - a.firstSeq);
@@ -837,7 +906,36 @@ function deriveAll(payload) {
   const walk = (run, depth) => { order.push({ ...run, depth }); run.children.sort((a, b) => a.firstSeq - b.firstSeq).forEach((c) => walk(c, depth + 1)); };
   roots.forEach((r) => walk(r, 0));
   const egress = records.filter((r) => r.event_type === "egress");
-  return { payload, report, records, runs, order, totals, errBySeq, sealed, egress, checkpoints };
+  return { payload, report, records, runs, order, totals, errBySeq, sealed, egress, checkpoints, elsewhere };
+}
+
+// The server ran the rules of findings.py over the whole file, and its findings are the ones shown: a run that
+// began before the records shown here keeps the taint it had there. The rules above, on the records shown alone,
+// are what the page shows only when the server could not run them. Returns the findings on records that are not
+// shown in a run (before the window, or a record that could not be read), and how many more there are.
+function serverFindings(found, runs, totals) {
+  if (!found || !Array.isArray(found.shown)) return null;
+  const bySeq = new Map();
+  for (const run of runs.values()) {
+    run.flags = [];
+    for (const ev of run.events) { ev._flags = []; if (!bySeq.has(ev.seq)) bySeq.set(ev.seq, ev); }
+  }
+  const list = [];
+  for (const f of found.shown) {
+    const ev = f && RULES[f.rule] ? bySeq.get(f.seq) : undefined;
+    if (ev) ev._flags.push({ rule: f.rule, finding: String(f.detail), taint: f.taint_step });
+    else if (f) list.push(f);
+  }
+  totals.flags = 0;
+  for (const run of runs.values()) {
+    for (const ev of run.events) for (const f of ev._flags) run.flags.push({ seq: ev.seq, step: ev.step_id, ...f });
+    totals.flags += run.flags.length;
+  }
+  const earlier = Array.isArray(found.earlier) ? found.earlier.filter((f) => f) : [];
+  list.push(...earlier);
+  const more = Math.max(0, (Number(found.earlier_total) || 0) - earlier.length);
+  totals.flags += list.length + more;
+  return { list, more };
 }
 
 // ---------- rendering ----------
@@ -886,6 +984,33 @@ function renderBadge(d) {
   foot.textContent = `${state.name} · ${plural(r.records, "record")} · chain ${short(r.chain_id)}`;
 }
 
+// The errors that mean a record was changed after it was written: a hash, a link, a Merkle root or a signature that
+// does not match. The others say the file cannot be vouched for as it is, not that something in it was changed.
+const ALTERED = new Set(["record_hash", "content_hash", "link", "merkle_root", "signature"]);
+const PROBLEM_KINDS = {
+  untrusted_key: ["UNTRUSTED KEY", "signed by a key that is not trusted"],
+  unverifiable: ["NOT CHECKED", "records this verifier cannot check"],
+  unsigned: ["UNSIGNED", "nothing signed by the trusted key"],
+  empty: ["EMPTY", "no records in the file"],
+  timestamp: ["TIMESTAMP", "timestamps that do not check"],
+};
+const problemKind = (code) => (ALTERED.has(code) ? "altered"
+  : Object.prototype.hasOwnProperty.call(PROBLEM_KINDS, code) ? code : "other");
+const problemLabel = (code) => { const kind = problemKind(code); return kind === "altered" ? "ALTERED" : kind === "other" ? "INVALID" : PROBLEM_KINDS[kind][0]; };
+function describeProblems(errors, total) {
+  const count = new Map();
+  for (const e of errors) {
+    const kind = problemKind(e.code);
+    count.set(kind, (count.get(kind) || 0) + 1);
+  }
+  const parts = [];
+  if (count.get("altered")) parts.push(`records altered after they were written (a hash, link, Merkle root or signature that does not match): ${count.get("altered")}`);
+  for (const [code, [, words]] of Object.entries(PROBLEM_KINDS)) if (count.get(code)) parts.push(`${words}: ${count.get(code)}`);
+  if (count.get("other")) parts.push(`other problems: ${count.get("other")}`);
+  const said = parts.length ? parts.join(" · ").replace(/^./, (c) => c.toUpperCase()) + "." : "";
+  return said + (!count.get("altered") && total <= errors.length ? " None of them shows a record altered after it was written." : "");
+}
+
 function renderBanners(d) {
   const box = document.getElementById("banners");
   box.replaceChildren();
@@ -894,8 +1019,26 @@ function renderBanners(d) {
     ? h("button", { class: "linkish", onclick: () => focusSeq(e.seq) }, `seq ${e.seq}`) : `line ${e.line ?? "?"}`,
     ` ${e.code}: ${e.message}`);
   if (d.payload.records_shown_from > 0) {
+    const from = d.records.find((r) => typeof r.seq === "number");
     box.append(h("div", { class: "banner warn" },
-      `Large file: showing the most recent ${d.records.length.toLocaleString()} of ${d.payload.records_total.toLocaleString()} records. Verification covered the whole file.`));
+      `Large file: the timeline shows only the most recent ${d.records.length.toLocaleString()} of ${d.payload.records_total.toLocaleString()} records`
+      + (from ? `, from seq ${from.seq} on` : "") + `. The ${d.payload.records_shown_from.toLocaleString()} earlier records are not shown. Verification covered the whole file. `
+      + (d.elsewhere ? "So did the detection rules: their findings on the records shown are in the runs, and their findings on earlier records are listed apart below."
+        : "The detection rules could not be run over the whole file, so they ran on the records shown only, and findings that depend on earlier records may be missing.")));
+  }
+  if (d.elsewhere && (d.elsewhere.list.length || d.elsewhere.more)) {
+    const { list, more } = d.elsewhere;
+    const items = h("ul", {});
+    const fill = () => {
+      if (items.childElementCount) return;
+      items.replaceChildren(...list.map((f) => h("li", {}, `seq ${f.seq ?? "?"} · run ${short(typeof f.run_id === "string" ? f.run_id : "") || "?"} · ${f.rule} ${(RULES[f.rule] || {}).name || ""}: ${String(f.detail)}`)));
+    };
+    box.append(h("details", { class: "banner warn", open: state.elsewhereOpen || null,
+        ontoggle: (e) => { state.elsewhereOpen = e.target.open; if (e.target.open) fill(); } },
+      h("summary", {}, `${plural(list.length + more, "finding")} on records not shown in a run here (before the records shown, or not readable as a run's record)`
+        + (more ? `. Listing the first ${list.length.toLocaleString()}: mnestiq.findings() on the whole file gives all of them.` : "")),
+      items));
+    if (state.elsewhereOpen) fill();
   }
   const unread = d.records.filter((r) => r._unparseable).length;
   if (unread) {
@@ -913,7 +1056,7 @@ function renderBanners(d) {
   if (d.report.errors.length) {
     const total = d.report.errors_total ?? d.report.errors.length;
     box.append(h("details", { class: "banner bad", open: true },
-      h("summary", {}, `Integrity check failed: ${plural(total, "problem")}. Records were altered after they were written.`
+      h("summary", {}, `Integrity check failed: ${plural(total, "problem")}. ${describeProblems(d.report.errors, total)}`
         + (total > d.report.errors.length ? ` Showing the first ${d.report.errors.length}.` : "")),
       h("ul", {}, d.report.errors.slice(0, 50).map(item))));
   }
@@ -957,7 +1100,7 @@ function renderRuns(d) {
     h("td", { class: "mono faint" }, short(run.id)),
     h("td", { class: "num" }, count(run, "llm_call")),
     h("td", { class: "num" }, count(run, "egress")),
-    h("td", { class: "num" }, run.tampered ? h("span", { class: "errcount", title: "altered records" }, `✕${run.tampered}`)
+    h("td", { class: "num" }, run.tampered ? h("span", { class: "errcount", title: "records with integrity problems" }, `✕${run.tampered}`)
       : run.flags.length ? h("span", { class: "flagcount" }, run.flags.length) : h("span", { class: "faint" }, "0"))));
   box.replaceChildren(h("table", { class: "runs" },
     h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "Agent"), h("th", {}, "Run"),
@@ -1002,7 +1145,7 @@ function renderDetail(d) {
         h("td", { class: "rule" }, f.rule, h("span", { class: "rname" }, RULES[f.rule].name)),
         h("td", { class: "mono" }, f.step),
         h("td", { class: "mono" }, f.finding),
-        h("td", { class: "mono faint" }, f.rule === "MNQ-001" ? "-" : `step ${f.taint}`)))))] : []);
+        h("td", { class: "mono faint" }, f.rule === "MNQ-001" || f.taint == null ? "-" : `step ${f.taint}`)))))] : []);
   const table = h("table", { class: "tl" },
     h("thead", {}, h("tr", {}, h("th", {}, "Seq"), h("th", { class: "time-h" }, "Time (UTC)"), h("th", {}, "Step"),
       h("th", {}, "Type"), h("th", {}, "Detail"), h("th", {}, "Seal"))),
@@ -1084,7 +1227,8 @@ function renderEvent(ev, d) {
   if (open) more.push(h("details", {}, h("summary", { class: "label", style: "cursor:pointer" }, "Raw record"),
     h("pre", { class: "content" }, JSON.stringify(ev, (k, v) => (k.startsWith("_") ? undefined : v), 2))));
 
-  const seal = errors.length ? h("span", { class: "seal broken", title: "record no longer matches what was signed" }, "BROKEN")
+  const seal = errors.some((e) => ALTERED.has(e.code)) ? h("span", { class: "seal broken", title: "record no longer matches what was signed" }, "BROKEN")
+    : errors.length ? h("span", { class: "seal broken", title: "the verifier found problems with this record: they are shown in its row" }, "INVALID")
     : sealed === "failed" ? h("span", { class: "seal broken", title: "the checkpoint covering this record does not verify" }, "SEAL FAILS")
     : sealed === "restart" ? h("span", { class: "seal sealed", title: "signed only after a restart: until then this record rested on the hash chain alone, so an earlier change to it could not be detected" }, "sealed late")
     : h("span", { class: `seal${sealed ? " sealed" : ""}`, title: sealed ? "covered by a signed checkpoint" : "not yet covered by a signed checkpoint" }, sealed ? "sealed" : "pending");
@@ -1102,7 +1246,7 @@ function renderEvent(ev, d) {
       sub.length ? h("div", { class: "sub" }, sub) : null,
       ...ev._flags.map((f) => h("div", { class: "flag", title: RULES[f.rule].explain },
         h("span", { class: "rule-badge" }, f.rule), h("span", { class: "rname" }, RULES[f.rule].name), h("span", { class: "mono" }, f.finding))),
-      ...errors.map((e) => h("div", { class: "err" }, `ALTERED ${e.code}: ${e.message}`)),
+      ...errors.map((e) => h("div", { class: "err" }, `${problemLabel(e.code)} ${e.code}: ${e.message}`)),
       more.length ? h("div", { class: "expand" }, more) : null),
     h("td", {}, seal));
 }

@@ -55,6 +55,7 @@ full coverage.
 from __future__ import annotations
 
 import _socket
+import atexit
 import contextvars
 import errno
 import copy
@@ -78,7 +79,7 @@ from dataclasses import dataclass, field
 from pathlib import PosixPath, PurePosixPath, PureWindowsPath, WindowsPath
 from typing import Any
 from collections.abc import Callable, Iterator
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from .findings import UNTRUSTED
 from .jsonable import exception_text
@@ -117,6 +118,7 @@ class _HttpCtx:
     source: tuple | None = None
     dest: tuple | None = None
     secrets: tuple[str, ...] = ()
+    query_secrets: tuple[str, ...] = ()  # the query values the url field masks, as an error may quote them
     via_proxy: str | None = None  # a proxy this went through that is not an ignored host
     route_unverified: bool = False  # an ignored name, on a route that could not be proven direct
     ignored: bool = False  # left out of the evidence: this only marks whose socket is whose
@@ -150,9 +152,10 @@ def instrument_egress(
     ``stamp_hosts``: if given, only these hosts get headers. Others are still recorded.
     """
     global _config
+    ignored = _host_set("ignore_hosts", ignore_hosts)
+    stamped = _host_set("stamp_hosts", stamp_hosts) if stamp_hosts is not None else None
     with _install_lock:
-        _config = _Config(stamp_headers, capture_connections, frozenset(ignore_hosts),
-                          frozenset(stamp_hosts) if stamp_hosts is not None else None)
+        _config = _Config(stamp_headers, capture_connections, ignored, stamped)
         if _patches:
             return
         try:
@@ -243,9 +246,23 @@ def _patch(owner: Any, name: str, replacement: Any) -> None:
     setattr(owner, name, ours)
 
 
+def _host_set(option: str, hosts: Any) -> frozenset[str]:
+    """Host names as matching compares them. A bare string would be read as a set of its letters."""
+    if isinstance(hosts, (str, bytes)):
+        raise TypeError(f"{option} takes a set of host names, not one string: use {{{hosts!r}}}")
+    try:
+        names = list(hosts)
+    except TypeError:
+        raise TypeError(f"{option} takes a set of host names, got {type(hosts).__name__}") from None
+    for name in names:
+        if not isinstance(name, str):
+            raise TypeError(f"{option} takes host names as strings, got {type(name).__name__}")
+    return frozenset(filter(None, map(_bare, names)))
+
+
 def _host_matches(host: str, hosts: frozenset[str]) -> bool:
     host = _bare(host)
-    return any(host == h or host.endswith("." + h) for h in hosts)
+    return any(host == h or host.endswith("." + h) for h in map(_bare, hosts))
 
 
 def _hostname(netloc: str) -> str | None:
@@ -265,6 +282,52 @@ def _url_secrets(url: str) -> tuple[str, ...]:
     return tuple(sorted(pieces | {unquote(p) for p in pieces}, key=len, reverse=True))
 
 
+# What clients leave unencoded when they write a URL out again (requests, httpx, urllib3).
+_REQUOTE_SAFE = ("!#$%&'()*+,/:;=?@[]~", "!$&'()*+,;=:@/?", "")
+
+
+def _query_secrets(url: str) -> tuple[str, ...]:
+    """The query values ``sanitize_url`` masks, as sent, decoded and encoded again, longest first."""
+    found: set[str] = set()
+    for piece in urlsplit(url).query.split(";"):
+        for pair in piece.split("&"):  # split as parse_qsl splits, so the same values are found
+            key, sep, value = pair.partition("=")
+            if not sep or not value or not _SECRET_PARAM.search(unquote_plus(key)):
+                continue
+            decoded = unquote_plus(value)
+            found.update({value, unquote(value), decoded, quote_plus(decoded)})
+            found.update(quote(decoded, safe=safe) for safe in _REQUOTE_SAFE)
+    found.discard("")
+    return tuple(sorted(found, key=len, reverse=True))
+
+
+def _mask_values(text: str, values: tuple[str, ...]) -> str:
+    """Mask each value where it stands as a whole value of a key that looks secret. Anchored so a short
+    value cannot eat a host, a port, a path or another key's value that happens to hold the same text."""
+    if not values:
+        return text
+    pattern = re.compile(r"""([?&;]([^?&;=\s'"]{1,256})=)(?:""" + "|".join(map(re.escape, values))
+                         + r""")(?=[&;\s#'"),\]}>]|$)""")
+    return pattern.sub(
+        lambda m: m.group(1) + "***" if _SECRET_PARAM.search(unquote_plus(m.group(2))) else m.group(), text)
+
+
+def _mask_error_text(text: str, secrets: tuple[str, ...] = (), query_secrets: tuple[str, ...] = ()) -> str:
+    """Mask in an error's text what ``sanitize_url`` masks in the URL it quotes."""
+    text = _mask_values(text, query_secrets)  # first, while the values still stand as the client wrote them
+    text = _mask_params_in_text(text)
+    text = _URL_IN_TEXT.sub(lambda m: sanitize_url(m.group()), text)
+    for secret in secrets:
+        text = text.replace(secret, "***")
+    return text
+
+
+def _mask_params_in_text(text: str) -> str:
+    """Mask query values with secret looking names in free text, a path and query alone included."""
+    return _PARAM_IN_TEXT.sub(
+        lambda m: m.group(1) + "***" if _SECRET_PARAM.search(unquote_plus(m.group(2))) else m.group(), text)
+
+
 @contextmanager
 def _http_scope(method: str, url: str, *, via: str | None = None, proxy: str | None = None,
                 opt_in: bool = False) -> Iterator[_HttpCtx | None]:
@@ -280,9 +343,9 @@ def _http_scope(method: str, url: str, *, via: str | None = None, proxy: str | N
         return
     try:
         host = urlsplit(url).hostname or ""
-        secrets = _url_secrets(url)
+        secrets, query_secrets = _url_secrets(url), _query_secrets(url)
     except ValueError:  # recorded as unparseable, and the request is the client's to refuse
-        host, secrets = "", ()
+        host, secrets, query_secrets = "", (), ()
     # What a URL names is only a claim when the bytes go elsewhere (a proxy, an absolute-form target).
     named = host
     if via and _bare(via) != _bare(host):
@@ -309,7 +372,7 @@ def _http_scope(method: str, url: str, *, via: str | None = None, proxy: str | N
     # The name in the URL says nothing about who reads the bytes first. The findings rules need to know.
     unlisted = proxy and _bare(proxy) != _bare(named) and not _host_matches(proxy, cfg.ignore_hosts)
     ctx = _HttpCtx(run=run, egress_id=uuid.uuid4().hex, method=(method or "GET").upper(),
-                   url=sanitize_url(url), host=host, stamped=stamped, secrets=secrets,
+                   url=sanitize_url(url), host=host, stamped=stamped, secrets=secrets, query_secrets=query_secrets,
                    via_proxy=proxy if unlisted else None, route_unverified=unverified and named_ignored)
     token = _active_http.set(ctx)
     try:
@@ -320,7 +383,46 @@ def _http_scope(method: str, url: str, *, via: str | None = None, proxy: str | N
 
 _HEADER_SAFE = re.compile(r"[!-~]{1,200}")
 _URL_IN_TEXT = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
-_PARAM_IN_TEXT = re.compile(r"([?&;]([\w.-]+)=)([^&;\s'\"#)]+)")
+# A key may be percent encoded or hold brackets and colons. A value runs to the next separator, and to a
+# quote only where that quote closes the URL, as a bracket or quote inside a value is still the value.
+_PARAM_IN_TEXT = re.compile(r"""([?&;]([\w.%\[\]:+-]{1,256})=)((?:(?!['"](?:[\s),.;\]}>]|$))[^&;\s#])+)""")
+
+
+_STAMP_NAMES = (RUN_HEADER.lower(), EGRESS_HEADER.lower())
+
+
+@contextmanager
+def _stamped_for_send(ctx: _HttpCtx | None, request: Any) -> Iterator[None]:
+    """Stamp a request's headers for one send, or strip ours when it is not stamped, as a redirect copies
+    the first hop's headers. Once the send returns or raises, the caller's object is as it was."""
+    try:
+        headers = request.headers
+        saved = [(name, value) for name, value in headers.items() if name.lower() in _STAMP_NAMES]
+    except Exception:  # headers of a shape this version does not know: sent as they are
+        if ctx is not None:
+            ctx.stamped = False
+        yield
+        return
+    try:
+        if ctx is None:
+            _strip(headers)
+        else:
+            _stamp(ctx, headers)
+    except Exception:
+        if ctx is not None:
+            ctx.stamped = False
+    try:
+        yield
+    finally:
+        with suppress(Exception):
+            _strip(headers)
+            for name, value in saved:
+                headers[name] = value
+
+
+def _strip(headers: Any) -> None:
+    for name in [n for n in headers if n.lower() in _STAMP_NAMES]:
+        del headers[name]
 
 
 def _stamp(ctx: _HttpCtx, headers: Any) -> None:
@@ -333,6 +435,18 @@ def _stamp(ctx: _HttpCtx, headers: Any) -> None:
     else:  # a redirect copies the first request's headers: they must not reach a host left out
         for name in (RUN_HEADER, EGRESS_HEADER):
             headers.pop(name, None)
+
+
+def _finish_failed(ctx: _HttpCtx, exc: BaseException, conn: tuple[tuple | None, tuple | None] | None = None) -> None:
+    """Record a request that raised. In strict mode a recording failure is raised in its place,
+    but a cancellation stays a cancellation."""
+    try:
+        _finish_http(ctx, error=exc, conn=conn)
+    except Exception as failure:
+        if isinstance(exc, Exception):
+            raise
+        with suppress(Exception):
+            ctx.run.recorder._record_failure(failure)
 
 
 def _addr(entry: dict, prefix: str, addr: tuple | None) -> None:
@@ -359,7 +473,7 @@ def _finish_http(ctx: _HttpCtx, *, status: int | None = None, error: BaseExcepti
         attributes["via_proxy"] = ctx.via_proxy
     if ctx.route_unverified:
         attributes["route_unverified"] = True
-    _emit(ctx.run, entry, ctx.started, error, ctx.secrets, attributes)
+    _emit(ctx.run, entry, ctx.started, error, ctx.secrets, attributes, ctx.query_secrets)
 
 
 def _outlived(run: Run) -> bool:
@@ -367,18 +481,14 @@ def _outlived(run: Run) -> bool:
 
 
 def _emit(run: Run, entry: dict, started: float, error: BaseException | None, secrets: tuple[str, ...] = (),
-          attributes: dict[str, Any] | None = None) -> None:
+          attributes: dict[str, Any] | None = None, query_secrets: tuple[str, ...] = ()) -> None:
     public_ip = getattr(run.recorder, "public_ip", None)
     if public_ip:
         entry["public_ip"] = public_ip
     # Libraries put the full URL in their errors, query secrets included: mask it like the url field.
     message = None
     if error:
-        message = _URL_IN_TEXT.sub(lambda m: sanitize_url(m.group()), exception_text(error))
-        message = _PARAM_IN_TEXT.sub(  # a path and query alone, as requests reports them
-            lambda m: m.group(1) + "***" if _SECRET_PARAM.search(m.group(2)) else m.group(), message)
-        for secret in secrets:
-            message = message.replace(secret, "***")
+        message = _mask_error_text(exception_text(error), secrets, query_secrets)
     if message:
         entry["error"] = message
     with suppress_egress():
@@ -411,12 +521,13 @@ def _patch_httpx(module_name: str) -> None:
     def send(self: Any, request: Any) -> Any:
         with _http_scope(request.method, str(request.url), proxy=_httpx_proxy(self, request)) as ctx:
             if ctx is None:
-                return sync_orig(self, request)
-            _stamp(ctx, request.headers)
+                with _stamped_for_send(None, request):
+                    return sync_orig(self, request)
             try:
-                response = sync_orig(self, request)
+                with _stamped_for_send(ctx, request):
+                    response = sync_orig(self, request)
             except BaseException as exc:  # a cancelled request may still have sent its data
-                _finish_http(ctx, error=exc)
+                _finish_failed(ctx, exc)
                 raise
             _finish_http(ctx, status=response.status_code, conn=_httpx_addrs(response))
             return response
@@ -424,12 +535,13 @@ def _patch_httpx(module_name: str) -> None:
     async def async_send(self: Any, request: Any) -> Any:
         with _http_scope(request.method, str(request.url), proxy=_httpx_proxy(self, request)) as ctx:
             if ctx is None:
-                return await async_orig(self, request)
-            _stamp(ctx, request.headers)
+                with _stamped_for_send(None, request):
+                    return await async_orig(self, request)
             try:
-                response = await async_orig(self, request)
+                with _stamped_for_send(ctx, request):
+                    response = await async_orig(self, request)
             except BaseException as exc:  # a cancelled request may still have sent its data
-                _finish_http(ctx, error=exc)
+                _finish_failed(ctx, exc)
                 raise
             _finish_http(ctx, status=response.status_code, conn=_httpx_addrs(response))
             return response
@@ -490,12 +602,13 @@ def _patch_requests() -> None:
     def send(self: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
         with _http_scope(request.method, request.url, proxy=_requests_proxy(self, request.url, args, kwargs)) as ctx:
             if ctx is None:
-                return original(self, request, *args, **kwargs)
-            _stamp(ctx, request.headers)
+                with _stamped_for_send(None, request):
+                    return original(self, request, *args, **kwargs)
             try:
-                response = original(self, request, *args, **kwargs)
+                with _stamped_for_send(ctx, request):
+                    response = original(self, request, *args, **kwargs)
             except BaseException as exc:  # a cancelled request may still have sent its data
-                _finish_http(ctx, error=exc)
+                _finish_failed(ctx, exc)
                 raise
             # Addresses come from the socket hook (new connections only).
             _finish_http(ctx, status=response.status_code)
@@ -522,11 +635,11 @@ def _patch_urllib() -> None:
             return original(self, http_class, req, **http_conn_args)
         with _http_scope(method, url, proxy=proxy, opt_in=True) as ctx:
             if ctx is None:
-                return original(self, http_class, req, **http_conn_args)
+                return original(self, http_class, _stamped_request(None, req), **http_conn_args)
             try:
                 response = original(self, http_class, _stamped_request(ctx, req), **http_conn_args)
             except BaseException as exc:  # a cancelled request may still have sent its data
-                _finish_http(ctx, error=exc)
+                _finish_failed(ctx, exc)
                 raise
             _finish_http(ctx, status=response.status)
             return response
@@ -534,20 +647,26 @@ def _patch_urllib() -> None:
     _patch(AbstractHTTPHandler, "do_open", do_open)
 
 
-def _stamped_request(ctx: _HttpCtx, req: Any) -> Any:
+def _stamped_request(ctx: _HttpCtx | None, req: Any) -> Any:
     # A copy, as the caller's request may be shared or sent again. Unredirected headers, as urllib
-    # carries a request's normal ones over to a redirect.
-    if not ctx.stamped:
-        return req
+    # carries a request's normal ones over to a redirect. Not stamped: ours are left off the copy.
+    stamping = ctx is not None and ctx.stamped
     try:
+        carried = any(n.lower() in _STAMP_NAMES for n in (*req.headers, *req.unredirected_hdrs))
+        if not stamping and not carried:
+            return req
         stamped = copy.copy(req)
-        stamped.unredirected_hdrs = dict(req.unredirected_hdrs)
-        stamp: dict[str, str] = {}
-        _stamp(ctx, stamp)
-        for name, value in stamp.items():
-            stamped.unredirected_hdrs[name.capitalize()] = value
+        stamped.headers = {n: v for n, v in req.headers.items() if n.lower() not in _STAMP_NAMES}
+        stamped.unredirected_hdrs = {n: v for n, v in req.unredirected_hdrs.items()
+                                     if n.lower() not in _STAMP_NAMES}
+        if ctx is not None and stamping:
+            stamp: dict[str, str] = {}
+            _stamp(ctx, stamp)
+            for name, value in stamp.items():
+                stamped.unredirected_hdrs[name.capitalize()] = value
     except Exception:
-        ctx.stamped = False
+        if ctx is not None:
+            ctx.stamped = False
         return req
     return stamped
 
@@ -571,14 +690,13 @@ def _patch_urllib3() -> None:
         except Exception:
             return make_request_orig(self, conn, method, url, *args, **kwargs)
         with _http_scope(method, full_url, opt_in=True, **route) as ctx:
+            kwargs = _stamped_kwargs(ctx, kwargs, self.headers)
             if ctx is None:
                 return make_request_orig(self, conn, method, url, *args, **kwargs)
-            if ctx.stamped:
-                kwargs = _stamped_kwargs(ctx, kwargs, self.headers)
             try:
                 response = make_request_orig(self, conn, method, url, *args, **kwargs)
             except BaseException as exc:  # a cancelled request may still have sent its data
-                _finish_http(ctx, error=exc, conn=_conn_addrs(conn))
+                _finish_failed(ctx, exc, _conn_addrs(conn))
                 raise
             _finish_http(ctx, status=response.status, conn=_conn_addrs(conn))
             return response
@@ -603,7 +721,7 @@ def _patch_urllib3() -> None:
             try:
                 return prepare_proxy_orig(self, conn)
             except BaseException as exc:
-                _finish_http(ctx, error=exc)
+                _finish_failed(ctx, exc)
                 raise
 
     _patch(tunnelling, "_prepare_proxy", prepare_proxy)
@@ -626,16 +744,22 @@ def _pool_url(pool: Any, url: str) -> str:
     return f"{pool.scheme}://{host}{port}{url}"
 
 
-def _stamped_kwargs(ctx: _HttpCtx, kwargs: dict, default: Any) -> dict:
+def _stamped_kwargs(ctx: _HttpCtx | None, kwargs: dict, default: Any) -> dict:
     # On a copy: the caller's headers, or a pool's shared ones, are what the next attempt starts from.
+    # Not stamped: ours are left off the copy, as a redirect or a retry starts from the last headers.
     try:
         given = kwargs.get("headers")
-        stamped = (default if given is None else given).copy()
-        for name in [n for n in stamped if n.lower() in (RUN_HEADER.lower(), EGRESS_HEADER.lower())]:
-            del stamped[name]  # a plain dict would send the caller's spelling as well as ours
-        _stamp(ctx, stamped)
+        source = default if given is None else given
+        stamping = ctx is not None and ctx.stamped
+        if not (stamping or any(n.lower() in _STAMP_NAMES for n in source or ())):
+            return kwargs
+        stamped = source.copy()
+        _strip(stamped)  # a plain dict would send the caller's spelling as well as ours
+        if ctx is not None and stamping:
+            _stamp(ctx, stamped)
     except Exception:
-        ctx.stamped = False
+        if ctx is not None:
+            ctx.stamped = False
         return kwargs
     return {**kwargs, "headers": stamped}
 
@@ -1050,9 +1174,12 @@ def _audited(handler: Callable[[Run, _Config, str, tuple], None], event: str, ar
 
 def _only_open_run() -> Run | None:
     """Code that left the run's context (a bare Context, a raw thread) still belongs to it, if it can only be this."""
-    if len(_open_runs) != 1:
-        return None
     try:
+        for key, stale in list(_open_runs.items()):  # a run whose end or recorder is gone is not open
+            if stale.ended or stale.recorder._closed:
+                _open_runs.pop(key, None)
+        if len(_open_runs) != 1:
+            return None
         run = next(iter(_open_runs.values()))
     except (StopIteration, RuntimeError):
         return None
@@ -1091,8 +1218,9 @@ def _replay_starved() -> None:
 
 
 def _holds_chain_lock(recorder: Any) -> bool:
-    """This thread is already writing to the chain: a finalizer has run in the middle of a write."""
-    return bool(recorder._lock._is_owned()) and not recorder._checkpointing  # that case has its own queue
+    """This thread is in the middle of writing to the chain: a finalizer has run inside that write.
+    A thread that took the lock on purpose to write, as a stream being closed does, is not."""
+    return bool(recorder._inside_write()) and not recorder._checkpointing  # that case has its own queue
 
 
 def _flush_deferred() -> None:
@@ -1103,7 +1231,7 @@ def _flush_deferred() -> None:
             return
         lock = run.recorder._lock
         if _holds_chain_lock(run.recorder) or not lock.acquire(False):  # never wait here: see _patch_run
-            _deferred_events.append((run, event_type, fields))
+            _deferred_events.appendleft((run, event_type, fields))  # back at the front, so the order holds
             return
         try:
             _unwrapped_emit(run, event_type, **fields)
@@ -1114,6 +1242,15 @@ def _flush_deferred() -> None:
 
 
 _before_close.append(_flush_deferred)
+
+
+def _flush_at_exit() -> None:
+    """The last safe point: what is still waiting is written before the process ends."""
+    with suppress(BaseException):  # nothing at exit may stop the interpreter from stopping
+        _flush_deferred()
+
+
+atexit.register(_flush_at_exit)
 
 
 def _before_run_end(run: Run) -> None:
@@ -1156,6 +1293,8 @@ def _patch_run() -> None:
     original = Run.__dict__["emit"]
 
     def written(self: Run, event_type: str, **fields: Any) -> dict | None:
+        if event_type == "run_end":  # every path that writes an end comes through here
+            _open_runs.pop(id(self), None)
         if not _first_taint(self, event_type, fields):
             return original(self, event_type, **fields)
         # What was noted before taint must not hide what is sent after it: MNQ-003 only counts notes after it. What
@@ -1181,7 +1320,10 @@ def _patch_run() -> None:
             # This thread has no run of its own, so the thread holding the chain's lock may be waiting for it.
             lock = self.recorder._lock
             if not lock.acquire(False):
-                _deferred_events.append((self, event_type, fields))
+                if len(_deferred_events) < _MAX_DEFERRED:
+                    _deferred_events.append((self, event_type, fields))
+                else:
+                    self.recorder.failures += 1
                 return None
             try:
                 return written(self, event_type, **fields)
