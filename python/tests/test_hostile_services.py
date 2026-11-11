@@ -916,13 +916,44 @@ def test_a_folder_in_the_place_of_the_file_is_refused(tmp_path, key):
     assert _open(tmp_path, key) is None
 
 
-@pytest.mark.parametrize("name", ["empty", "only_newlines", "only_spaces"])
-def test_a_file_with_nothing_in_it_starts_a_new_chain(tmp_path, key, name):
+NOTHING = {"empty": b"", "only_newlines": b"\n\n\n", "only_spaces": b"   \n  \t\n", "one_newline": b"\n",
+           "crlf": b"\r\n \r\n", "spaces_and_no_line_end": b"  \t "}
+
+
+@pytest.mark.parametrize("name", sorted(NOTHING))
+def test_a_file_with_nothing_in_it_starts_a_new_chain(tmp_path, key, pub, name):
+    """A file that holds only spaces, tabs and line ends holds no evidence: a script may have made it in advance.
+    The sink empties it when it opens, so the chain starts at the first byte and the file verifies."""
     path = tmp_path / "e.jsonl"
-    path.write_bytes({"empty": b"", "only_newlines": b"\n\n\n", "only_spaces": b"   \n  \t\n"}[name])
+    path.write_bytes(NOTHING[name])
     rec = _open(path, key)
-    assert rec is not None and rec._seq == 0
+    assert rec is not None and rec._seq == 0 and path.read_bytes() == b""
+    with rec.run() as run:
+        run.note("x")
     rec.close()
+    report = verify_file(path, [pub])
+    assert report.ok and report.warnings == [] and path.read_bytes().startswith(b"{")
+    assert [p.name for p in tmp_path.iterdir()] == ["e.jsonl"]  # nothing was set aside: there was nothing to keep
+
+
+@pytest.mark.parametrize("blank", [b"\n", b"   \n", b"\r\n"], ids=["empty_line", "spaces", "crlf"])
+@pytest.mark.parametrize("position", ["first", "middle", "last"])
+def test_a_file_of_records_with_a_blank_line_is_not_continued(tail, key, pub, blank, position):
+    """The verifier refuses a blank line, so records written after one would never verify. In a file that holds
+    records the recorder refuses it as it refuses any other damage, and sets the file aside when told to."""
+    lines = _bytes_of(tail)
+    at = {"first": 0, "middle": len(lines) // 2, "last": len(lines)}[position]
+    damaged = b"".join([*lines[:at], blank, *lines[at:]])
+    tail.write_bytes(damaged)
+    assert _open(tail, key) is None and tail.read_bytes() == damaged
+    rec = _open(tail, key, on_damaged="new_file")
+    assert rec is not None
+    with rec.run() as run:
+        run.note("x")
+    rec.close()
+    assert verify_file(tail, [pub]).ok
+    (aside,) = tail.parent.glob("e.jsonl.damaged-*")
+    assert aside.read_bytes() == damaged
 
 
 @pytest.mark.parametrize("name", ["utf16", "utf8_bom", "crlf", "blank_lines", "whole_file_on_one_line"])

@@ -126,6 +126,12 @@ These are limits by design. We would rather you hear them from us.
    a plain digest that redaction leaves in place, so a guessed system prompt can still be confirmed. Only prompts, documents, model
    answers and tool arguments and results can be redacted: URLs, error messages and approval text
    stay. `verify` says how many fields were redacted, since the detection rules cannot see them.
+   Redaction is itself a change that verifies: anyone who holds the file can remove a redactable value.
+   No other value can take its place, because the digest stays. The salt of a value that is not in the
+   file (redacted, or left out by the recorder as too large) is not signed, since redaction has to be able
+   to remove it. Someone who holds the file can change or remove that salt and the file still verifies. They
+   cannot pass off another value as the recorded one, but they can make the true original fail its check.
+   Keep the salt with the original if you keep an original that the recorder left out.
 8. **The last checkpoint's timestamp.** A signature cannot cover its own timestamp token, and nothing
    signs the last checkpoint's `record_hash`. So the token of the final checkpoint can be removed and the
    file still verifies, with no warning. A head kept elsewhere (`--head`) or the vault shows the change.
@@ -140,7 +146,15 @@ These are limits by design. We would rather you hear them from us.
    chain id has no log to differ from, and `verify` only warns `witness_none`.
 12. **A record's hash covers its canonical form.** Respelling a number (`5` as `5.0`), changing the key order or
    JSON spacing, or writing a character as an escape (`\u0061`) leaves the hash the same. The bytes of the line
-   change and its values do not.
+   change and its values do not. `verify` refuses the respellings that another reader could take for another
+   value or another line: a whole number beyond 2^53 in any spelling but the canonical one, a
+   fraction or exponent in a field that holds an integer, a carriage return inside a record, and a blank line.
+13. **The end of a file.** A record is a line that ends with a line feed. A last line with no line feed is
+   read only if it is a whole record, and `verify` says that its line end is missing. Anything else after the
+   last line feed is not read as a record, and `verify` says how many bytes there are. A recorder that crashed
+   in the middle of a write leaves such bytes, and so does a copy taken while the file was being written. So
+   does someone who cuts the file there, which removes nothing that removing the whole unsigned line would not
+   (see 4).
 
 ## Detection is not perfect
 

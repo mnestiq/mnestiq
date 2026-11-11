@@ -353,7 +353,8 @@ def test_inspect_prints_one_line_per_record(tmp_path, key, capsys):
     rc = main(["inspect", str(path)])
     must(rc == 0, "inspect runs")
     printed = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert len(printed) == len(load(path))
+    # One line for each record, then the line that says whether the file verifies.
+    assert len(printed) == len(load(path)) + 1 and printed[-1].startswith("This listing is not a check.")
     assert any("boom\\n2026" in line for line in printed)
 
 

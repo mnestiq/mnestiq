@@ -99,9 +99,9 @@ def test_a5_change_redacted_content(evidence, pub):
 
 def test_a6_smuggle_a_second_value_with_a_duplicate_key(evidence, pub):
     """Parsers disagree on which of two equal keys wins; the line is refused instead."""
-    lines = evidence.read_bytes().splitlines()
+    lines = evidence.read_bytes().split(b"\n")  # at LF only, as the verifier does. The last piece is empty
     lines[1] = b'{"agent_id":"someone-else",' + lines[1][1:]
-    evidence.write_bytes(b"\n".join(lines) + b"\n")
+    evidence.write_bytes(b"\n".join(lines))
     assert "parse" in errors(verify_file(evidence, [pub]))
 
 

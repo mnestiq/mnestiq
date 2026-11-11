@@ -53,15 +53,41 @@ An evidence file is **JSON Lines**: UTF-8, one record per line, each line a JSON
 object. Producers SHOULD write each line in canonical form (section 5.1). A file holds
 exactly one chain.
 
+A line ends at a line feed (U+000A) and nowhere else. A carriage return (U+000D) directly before
+that line feed belongs to the line end. Anywhere else in a line a carriage return MUST be rejected.
+U+2028, U+2029 and U+0085 inside a text value are ordinary characters and do not end a line, so
+readers MUST split a file at U+000A only. A line that is empty or holds only whitespace MUST be
+rejected.
+
+Bytes after the last line feed are read as a line only if they are a closed object: they begin
+with `{`, and the `}` that closes that object, counting brackets outside text values, is the last
+byte. A verifier MUST then report that the final line feed is missing. Any other bytes after the last
+line feed are not a record: a reader MUST NOT read them as one, and a verifier MUST report that they
+are there. A producer writes a record and its line feed in one write, so such bytes are a write that
+was cut, or a copy taken while the file was being written. A part of a record is never a closed
+object, so a write that was cut is never read as a record.
+
+An evidence file MAY be stored or sent compressed with gzip (RFC 1952). Every rule in this document
+applies to the decompressed bytes. A verifier that does not read gzip MUST say that the file is
+compressed, and MUST NOT report it as a damaged evidence file.
+
 Integers MUST be within +/-(2^53-1). Values that may exceed this (nanosecond
 timestamps, 64-bit ids) MUST be encoded as strings. Floating-point NaN and
-Infinity MUST NOT appear.
+Infinity MUST NOT appear. A field the schema types as `integer` MUST be written without a
+fraction or exponent, and a verifier MUST reject `1.0` or `1e0` there.
+
+A record MUST NOT be nested more than 128 levels deep. The record itself is level 1, and every
+object or array inside another adds one level. Readers MUST reject a deeper record.
 
 Readers MUST reject a line in which an object has the same key twice: parsers
 disagree on which value wins, so such a line could mean one thing to one verifier and
 another to the next. Readers MUST reject NaN and Infinity, and MUST read a number
 written without a fraction or exponent but beyond +/-(2^53-1) as an IEEE-754 double,
-because JCS writes large whole-number doubles that way (3e18 is `3000000000000000000`).
+because JCS writes large whole-number doubles that way (3e18 is `3000000000000000000`). Readers
+MUST reject such a number unless its text is exactly the JCS spelling of that double. So each such
+double has one accepted spelling. `9007199254740993` is rejected: it reads as the double
+`9007199254740992`, and a reader with exact integers would see another value than the one that was
+hashed.
 
 Unknown top-level fields MUST be prefixed `x-`; verifiers MUST ignore them
 semantically (they are still covered by the record hash).
@@ -191,6 +217,12 @@ guess. A value disclosed later is checked with its salt, disclosed with it. This
 a third party without disclosing prompts, customer data or tool output, while
 still letting them check the value if it is disclosed separately.
 
+A `*_salt`, wherever it is present, MUST be the canonical base64 of its bytes, and a verifier MUST
+reject any other text there. A `*_salt` without its `*_hash` is an error. A verifier MUST reject the
+same salt on two values of one record, and MAY check for it across a file. A verifier SHOULD warn
+when a value listed in `x-omitted` has no salt, because its original can then no longer be checked.
+A verifier MUST report how many values of a file are redacted.
+
 ## 6. Integrity
 
 ### 6.1 Chain
@@ -232,6 +264,13 @@ key as errors when keys are pinned. Without pinned keys, verifiers MUST warn.
 A key that a trusted key handed the chain to (section 6.7) is trusted for the rest of
 that chain. A hand-over signed by an untrusted key extends nothing.
 
+When keys are pinned, a file with no checkpoint signed by a trusted key MUST be reported as an
+error: a pinned key that signed nothing proves nothing.
+
+A verifier MUST refuse an Ed25519 public key of small order (a point that 8 times itself gives the
+identity), as a pinned key, as a checkpoint's `public_key` and in `next_key`. For such a key a
+signature that verifies can be written without any private key.
+
 ### 6.5 Known limits
 
 Records after the last checkpoint are covered only by the hash chain. Verifiers
@@ -239,6 +278,19 @@ MUST report how many trailing records are unsigned. Removal of complete trailing
 checkpoint groups cannot be detected from the file alone: a file cut back to any
 earlier checkpoint verifies. Keeping the latest checkpoint elsewhere (section 6.6),
 a transparency log, or a separate WORM store closes this gap.
+
+Redaction is a change that verifies: anyone holding the file can remove a redactable value and its
+salt (section 5.3). The digest stays, so no other value can take its place.
+
+The salt of a value that is not in the file, because the producer omitted it or someone redacted it
+later, is not covered by the record hash: redaction has to be able to remove it. Someone who holds
+the file can change, remove or add such a salt, and the file still verifies. They cannot make another
+value pass for the recorded one. They can make the true value fail its check, or make it impossible
+to check. Whoever keeps the original of an omitted value SHOULD keep its salt with it.
+
+Spacing between tokens, the order of keys, an escape in place of a character, and the spelling of a
+number outside an `integer` field can change without changing the canonical bytes, so the bytes of
+a line are not protected, only its values.
 
 ### 6.6 Head
 
@@ -268,7 +320,8 @@ there is none, by the key that signed the chain's first checkpoint. In a v0.2 re
 a checkpoint signed by any other key MUST be reported as an error, with or without
 pinned keys. In a v0.1 record it MUST be reported as a warning.
 
-Verifiers MUST check that `next_key.key_id` matches `next_key.public_key`.
+Verifiers MUST check that `next_key.key_id` matches `next_key.public_key`, and that
+`next_key.sig_alg` is the algorithm of that key.
 
 ### 6.8 Heartbeats
 
@@ -301,6 +354,11 @@ producer's clock was fast), or when the token is much later than `ts.wall` (the 
 proven only from the token on). A verifier that cannot check tokens MUST say so rather
 than count them as checked. Every record a timestamped checkpoint covers existed no
 later than the token's time.
+
+A `timestamp_token`, when present, MUST be a non-empty string. The token is outside the signing
+payload (section 6.3), because it is made over the signature. So the token of the last checkpoint
+can be removed by someone who holds the file. One that is put in or swapped is checked like any
+other, and a token that fails is an error.
 
 ### 6.10 Context that records only what changed
 
@@ -391,3 +449,11 @@ v0.2 adds P-256 signatures, key hand-overs (`next_key`) and `heartbeat` events. 
 field are unchanged, so a v0.2 verifier verifies v0.1 files as they are. A chain MAY
 move from v0.1 to v0.2 part-way (a recorder upgraded on a running chain), and MUST NOT
 move back. A v0.1 record MUST NOT use P-256, `next_key` or `heartbeat`.
+
+In November 2026 this document was made explicit in places where it did not decide, with no new
+version: how a line ends, blank lines, bytes after the last line feed, whole numbers beyond 2^53,
+nesting and gzip (section 3), salts (section 5.3), keys of small order and files with no trusted
+checkpoint (section 6.4), `next_key.sig_alg` (section 6.7) and the form of `timestamp_token`
+(section 6.9). Nothing a conforming producer writes is read differently. A file changed by hand in
+one of these ways, which an earlier verifier accepted, is rejected. A file whose last write was cut
+is no longer rejected for that reason alone: the cut bytes are reported and not read.

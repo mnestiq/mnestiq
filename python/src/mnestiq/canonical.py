@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -17,33 +18,83 @@ from typing import Any
 # which is what JCS (and every JavaScript verifier) uses for numbers.
 MAX_SAFE_INTEGER = 2**53 - 1
 
+# How deep a value may be nested. The outermost value is level 1, and every object or array inside another
+# adds one level. Text, numbers, true, false and null add none. Level 128 is read, level 129 is refused.
+MAX_DEPTH = 128
+
 
 class CanonicalizationError(ValueError):
     pass
 
 
+class RefusedJSON(CanonicalizationError):
+    """JSON that parses, and that this format does not accept: a value nested past ``MAX_DEPTH``, or a large
+    whole number that is not written the way canonical JSON writes it."""
+
+
 def parse_json(data: str | bytes) -> Any:
-    """Parse JSON as every verifier must: no duplicate keys, no NaN or Infinity.
+    """Parse JSON as every verifier must: no duplicate keys, no NaN or Infinity, nothing nested deeper than
+    ``MAX_DEPTH``, and one spelling for a whole number past 2^53 - 1.
 
     Python's ``json.loads`` keeps the last of two equal keys, other parsers keep the first,
     and it accepts ``NaN``. Either would let one evidence line mean two different things to
-    two verifiers, so both are refused.
+    two verifiers, so both are refused. How deep a parser can go differs between languages and
+    between versions of Python, so the limit is counted here and is the same everywhere.
     """
     if isinstance(data, bytes):  # json.loads would guess: UTF-16 or a BOM must not read here and fail in the verifier
         data = data.decode("utf-8")
+    if nested_too_deep(data):
+        raise RefusedJSON(f"a value is nested more than {MAX_DEPTH} levels deep")
     return json.loads(data, object_pairs_hook=_no_duplicates, parse_constant=_no_constant, parse_int=_number,
                       parse_float=_float)
 
 
+# A whole string, which may hold brackets of its own and may be cut off, or one bracket. The closing quote is
+# optional so that text with no end to a string is passed over once, not once for every quote in it.
+_STRUCTURE = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
+
+
+def nested_too_deep(text: str) -> bool:
+    """Whether JSON text holds a value nested more than ``MAX_DEPTH`` levels deep. Counted on the text, by this
+    code alone, before any parser sees it. For text that is not JSON the answer does not matter: the parser
+    refuses it."""
+    if text.count("[") + text.count("{") <= MAX_DEPTH:  # nearly every line: too few brackets to get there
+        return False
+    depth = 0
+    for match in _STRUCTURE.finditer(text):
+        token = match.group()
+        if token in ("[", "{"):
+            depth += 1
+            if depth > MAX_DEPTH:
+                return True
+        elif token in ("]", "}"):
+            depth -= 1
+    return False
+
+
+_MAX_PLAIN_DIGITS = 21  # canonical JSON writes a number of 1e21 or more with an exponent, never as digits alone
+
+
 def _number(text: str) -> int | float:
-    """Integers past 2^53 read as doubles, as in JavaScript. JCS writes a large whole-number
-    double such as 3e18 as ``3000000000000000000``, which must read back as that double."""
+    """Integers past 2^53 - 1 read as doubles, as in JavaScript. JCS writes a large whole-number
+    double such as 3e18 as ``3000000000000000000``, which must read back as that double.
+
+    Many integer texts read as the same double: ``9007199254740993`` is 2^53 to this parser and another
+    number to one with exact integers. Past 2^53 - 1 only the text canonical JSON writes for the double is
+    accepted, so a number has one spelling there and every reader gets the value that was hashed."""
+    if len(text) <= 15:  # too short to be past 2^53 - 1
+        return int(text)
+    if len(text.lstrip("-")) > _MAX_PLAIN_DIGITS:  # also keeps int() away from text of any length
+        raise RefusedJSON(f"the whole number {text[:24]}... is not written as canonical JSON writes a number "
+                          "of that size")
     value = int(text)
     if abs(value) <= MAX_SAFE_INTEGER:
         return value
     as_float = float(text)
-    if math.isinf(as_float):
-        raise CanonicalizationError(f"number {text[:20]}... is too large for JSON")
+    spelling = _format_number(as_float)
+    if spelling != text:
+        raise RefusedJSON(f"the whole number {text} is past 2^53 - 1 and is not written as canonical JSON "
+                          f"writes the number it is read as ({spelling})")
     return as_float
 
 

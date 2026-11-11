@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import copy
+import gzip
 import hashlib
 import heapq
+import io
 import json
 import os
 import re
 import stat
+import zlib
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -17,13 +20,13 @@ from importlib import resources
 from itertools import islice
 from pathlib import Path
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
 from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator, validators
 from jsonschema.exceptions import ValidationError, best_match
 
-from .canonical import CanonicalizationError, canonical_json, parse_json
+from .canonical import MAX_DEPTH, CanonicalizationError, RefusedJSON, canonical_json, nested_too_deep, parse_json
 from .hashing import (
     GENESIS_HASH,
     SALT_SUFFIX,
@@ -33,7 +36,7 @@ from .hashing import (
     signing_payload,
     slot_digest,
 )
-from .keys import ED25519, SIG_ALGS, key_id, verify_signature
+from .keys import ED25519, KEY_ID_PREFIXES, SIG_ALGS, WeakKeyError, alg_of_public, key_id, verify_signature
 from .merkle import merkle_root
 
 if TYPE_CHECKING:
@@ -68,6 +71,9 @@ class Report:
     unclean_restarts: list[dict] = field(default_factory=list)  # resumes with no clean close: note_seq, checkpoint_seq
     continues_from: list[dict] = field(default_factory=list)  # chains started in place of a file: note_seq, file, ...
     witness: dict | None = None  # how far a witness log reached, when one was given: entries, highest_seq, ...
+    # Bytes after the last line end of the file that are not a whole record: not read, not counted. A whole record
+    # there is read as the last line, leaves this at 0 and gets the warning no_final_newline.
+    incomplete_tail_bytes: int = 0
 
     def error(self, code: str, message: str, line: int | None = None, seq: int | None = None) -> None:
         self.ok = False
@@ -89,9 +95,136 @@ CONTINUES_FIELD = "continues_from"  # in the note of a recorder that started a n
 
 
 def is_blank(line: bytes | str) -> bool:
-    """Whether a line of an evidence file holds nothing: JSON's own whitespace only. Every reader skips by this
-    one test, so a line cannot be nothing to one and a record to another. Any other line is read, and refused."""
+    """Whether a line of an evidence file holds nothing: JSON's own whitespace only. Such a line is not skipped:
+    ``parse_line`` refuses it, and so does every reader, so a line cannot be nothing to one and a record to
+    another."""
     return not (line.strip(b" \t\r\n") if isinstance(line, bytes) else line.strip(" \t\r\n"))
+
+
+class LineError(ValueError):
+    """A line of an evidence file that is not read as a record. The message says why."""
+
+
+def parse_line(raw: bytes | str) -> Any:
+    """One line of an evidence file as JSON, read the way the verifier reads it. Every reader in this package
+    goes through here, so that a line is a record to all of them or to none.
+
+    A line ends with LF, or with CR LF. The line end may be on ``raw`` or already taken off. Raises ``LineError``
+    for a line that is not UTF-8, holds a carriage return or a line feed anywhere else, is blank, or is not JSON
+    this format accepts (see ``parse_json``)."""
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:  # the recorder writes UTF-8 only: other bytes were put there later
+            raise LineError("line is not valid UTF-8") from None
+    text = raw[:-1] if raw.endswith("\n") else raw
+    text = text[:-1] if text.endswith("\r") else text
+    if "\r" in text:  # JSON calls it whitespace, and to other readers it ends a line: one file, two sets of records
+        raise LineError("line holds a carriage return (CR) that is not directly before its line end")
+    if "\n" in text:  # never from a file split at LF: a caller handed over more than one line as one
+        raise LineError("line holds a line feed (LF) before its end, so it is more than one line")
+    if not text.strip(" \t"):
+        raise LineError("line is blank: a line holds one record, and an empty line or one of spaces only is "
+                        "not skipped")
+    try:
+        return parse_json(text)
+    except RefusedJSON as exc:
+        raise LineError(f"line is refused: {str(exc)[:200]}") from None
+    except (ValueError, RecursionError) as exc:  # also duplicate keys and NaN
+        raise LineError(f"line is not valid JSON: {str(exc)[:200]}") from None
+
+
+GZIP_MAGIC = b"\x1f\x8b"  # the first two bytes of every gzip file
+MAX_GZIP_LINE = 64 * 1024 * 1024  # the longest line taken out of a gzip file: a small file can unpack to any size
+
+
+class GzipError(ValueError):
+    """A gzip file that could not be read to its end. The message says why."""
+
+
+# A whole string, which may hold brackets of its own and may be cut off, or one bracket. As in ``canonical``,
+# the closing quote is optional so that text with no end to a string is passed over once.
+_TAIL_TOKEN = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"?|[\[\]{}]', re.DOTALL)
+
+
+def closed_object(tail: bytes) -> bool:
+    """Whether bytes are a closed JSON object: they start with ``{`` and the ``}`` that closes that object is
+    the last byte. This alone decides whether the bytes after the last LF of a file are a line. It is decided on
+    the bytes, not by whether they parse: brackets outside strings are counted, their kinds are not matched, and
+    inside a string a backslash takes the next byte with it."""
+    if not tail.startswith(b"{") or not tail.endswith(b"}"):  # the cheap test first: a long tail is rarely either
+        return False
+    depth = 0
+    for match in _TAIL_TOKEN.finditer(tail):
+        token = match.group()
+        if token in (b"{", b"["):
+            depth += 1
+        elif token in (b"}", b"]"):
+            depth -= 1
+            if depth == 0:  # the first byte is the opening brace, so this is where its object closes
+                return match.end() == len(tail)
+    return False
+
+
+class EvidenceLines:
+    """The lines of an evidence file, as every reader in this package must split it.
+
+    A record is a line that ends with LF. The bytes after the last LF of the file are a line too when they are a
+    closed JSON object (``closed_object``): a whole record whose line end something took away. That line is
+    yielded like any other, and ``no_final_newline`` says so. Any other bytes there are a fragment, as a write
+    that was cut leaves, or a copy taken while the file was being written. A fragment is not yielded, so nothing
+    parses or counts it, and ``incomplete_tail_bytes`` says how long it was. Both are known once the lines have
+    all been read.
+
+    ``stream`` yields the file's bytes in pieces that end at each LF, as a file opened in binary mode does."""
+
+    def __init__(self, stream: Iterable[bytes]) -> None:
+        self.stream = stream
+        self.incomplete_tail_bytes = 0
+        self.no_final_newline = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for raw in self.stream:
+            if raw.endswith(b"\n"):
+                yield raw
+            elif closed_object(raw):  # only the end of the file has no line end
+                self.no_final_newline = True
+                yield raw
+            else:
+                self.incomplete_tail_bytes += len(raw)
+
+
+def is_gzip(stream: BinaryIO) -> bool:
+    """Whether a file opened in binary mode, or an ``io.BytesIO``, starts with the gzip magic bytes. The stream
+    is left where it stood."""
+    if hasattr(stream, "peek"):  # a file: looked at without moving, so a pipe works too
+        return cast(io.BufferedReader, stream).peek(2)[:2] == GZIP_MAGIC
+    start = stream.tell()
+    magic = stream.read(2)
+    stream.seek(start)
+    return magic == GZIP_MAGIC
+
+
+def file_lines(stream: BinaryIO) -> EvidenceLines:
+    """The complete lines of an evidence file opened in binary mode. A gzip file is unpacked as it is read,
+    never as a whole, and its lines are the lines of what it unpacks to."""
+    return EvidenceLines(_gzip_lines(stream) if is_gzip(stream) else stream)
+
+
+def _gzip_lines(stream: BinaryIO) -> Iterator[bytes]:
+    """The lines a gzip file unpacks to. Raises ``GzipError`` where it cannot be unpacked, and at a line longer
+    than ``MAX_GZIP_LINE``: a few kilobytes of gzip can hold one line of many gigabytes."""
+    with gzip.GzipFile(fileobj=stream, mode="rb") as unpacked:
+        while True:
+            try:
+                raw = unpacked.readline(MAX_GZIP_LINE + 1)
+            except (OSError, EOFError, zlib.error) as exc:  # cut short, damaged, or other bytes after its end
+                raise GzipError(f"it is damaged or cut short ({type(exc).__name__})") from None
+            if not raw:
+                return
+            if len(raw) > MAX_GZIP_LINE:
+                raise GzipError(f"one line of it is longer than {MAX_GZIP_LINE} bytes once unpacked")
+            yield raw
 
 
 def version_key(version: Any) -> tuple[int, int] | None:
@@ -182,7 +315,42 @@ def _any_of(validator: Any, subschemas: list, instance: Any, schema: dict) -> It
     yield ValidationError(f"{instance!r} is not valid under any of the given schemas", context=context)
 
 
-_BoundedValidator = validators.extend(Draft202012Validator, {"oneOf": _one_of, "anyOf": _any_of})
+@lru_cache(maxsize=256)
+def _schema_pattern(pattern: str) -> re.Pattern[str]:
+    """A pattern of the schema, compiled to mean in Python what it means in JSON Schema (ECMA 262).
+
+    Two things differ in the patterns this schema uses. ``$`` is the true end of the text there, and in Python it
+    also matches before a last newline, so a salt or a time with a newline after it passed. ``\\d`` is the ten
+    ASCII digits there, and in Python any digit of any script. Both are rewritten. Nothing else is changed."""
+    out: list[str] = []
+    in_class = False
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            escaped = pattern[i + 1]
+            out.append(("0-9" if in_class else "[0-9]") if escaped == "d" else ch + escaped)
+            i += 2
+            continue
+        if ch == "[" and not in_class:
+            in_class = True
+        elif ch == "]" and in_class:
+            in_class = False
+        elif ch == "$" and not in_class:
+            ch = r"\Z"
+        out.append(ch)
+        i += 1
+    return re.compile("".join(out))
+
+
+def _pattern(validator: Any, pattern: str, instance: Any, schema: dict) -> Iterator[ValidationError]:
+    """The schema's pattern, as jsonschema checks it, with the pattern read as JSON Schema means it."""
+    if validator.is_type(instance, "string") and not _schema_pattern(pattern).search(instance):
+        yield ValidationError(f"{instance!r} does not match {pattern!r}")
+
+
+_BoundedValidator = validators.extend(Draft202012Validator, {"oneOf": _one_of, "anyOf": _any_of,
+                                                             "pattern": _pattern})
 
 
 def _schema_errors(record: Any) -> list[ValidationError]:
@@ -218,8 +386,14 @@ def _validator(record: Any = None) -> Draft202012Validator:
 def schema_problem(record: dict, show_value: bool = True) -> str | None:
     """The first way a record breaks the schema, or None if it is valid. ``show_value=False`` names the
     field and the rule only: the message is then safe for an application log, since a schema error
-    otherwise quotes the value, which can be anything the agent handled (an API key, a document)."""
-    instance = json.loads(canonical_json(record))
+    otherwise quotes the value, which can be anything the agent handled (an API key, a document).
+
+    A record nested deeper than the verifier reads is a problem too. The recorder asks here before it writes,
+    so it never writes a line its own verifier would refuse."""
+    text = canonical_json(record).decode("utf-8")
+    if nested_too_deep(text):
+        return f"record: nested more than {MAX_DEPTH} levels deep"
+    instance = json.loads(text)
     error = best_match(islice(_validator(instance).iter_errors(instance), MAX_SCHEMA_ERRORS))
     if error is None:
         # The schema leaves room for what later minor versions add. A record of a version this verifier
@@ -234,8 +408,22 @@ def schema_problem(record: dict, show_value: bool = True) -> str | None:
 
 def verify_file(path: str | Path, trusted_keys: Iterable[str] = (), head: dict | None = None,
                 tsa_roots: Iterable[x509.Certificate] | None = None, witness: str | Path | None = None) -> Report:
+    """Verify an evidence file. A gzip file (first bytes 1f 8b) is unpacked as it is read, and every rule holds
+    for the bytes it unpacks to. Bytes after the last line end are read as the last line when they are a whole
+    record (``closed_object``), and are not read otherwise: see ``Report.incomplete_tail_bytes``.
+    A pinned key that cannot be used raises ``ValueError`` before the file is opened."""
+    verifier = ChainVerifier(trusted_keys, tsa_roots, witness=witness)
     with open(path, "rb") as fh:
-        return verify_lines(fh, trusted_keys, head, tsa_roots, witness)
+        verifier.feed_file(fh)
+    return verifier.result(head)
+
+
+def verify_stream(stream: BinaryIO, trusted_keys: Iterable[str] = (), head: dict | None = None,
+                  tsa_roots: Iterable[x509.Certificate] | None = None, witness: str | Path | None = None) -> Report:
+    """``verify_file`` for a file that is already open in binary mode, or for bytes in an ``io.BytesIO``."""
+    verifier = ChainVerifier(trusted_keys, tsa_roots, witness=witness)
+    verifier.feed_file(stream)
+    return verifier.result(head)
 
 
 def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (), head: dict | None = None,
@@ -245,7 +433,10 @@ def verify_lines(lines: Iterable[bytes | str], trusted_keys: Iterable[str] = (),
     ``tsa_roots`` are the roots RFC 3161 timestamp tokens must chain to (default: those of
     the default timestamp authorities, see ``mnestiq.timestamps``).
     ``witness`` is a witness log of a signing service, or a folder holding them: the chain must agree
-    with what the service saw of it, as far as it saw."""
+    with what the service saw of it, as far as it saw.
+
+    Each item of ``lines`` is one line, with or without its line end. To verify the bytes of a file, use
+    ``verify_file`` or ``verify_stream``: they split it, and decide what the bytes after the last line end are."""
     verifier = ChainVerifier(trusted_keys, tsa_roots, witness=witness)
     verifier.feed(lines)
     return verifier.result(head)
@@ -265,7 +456,7 @@ class ChainVerifier:
         self.report = Report()
         self.schema = schema
         self.witness = _WitnessCheck(witness) if witness is not None else None
-        self.pins = {_full_id(k) for k in trusted_keys}
+        self.pins = {_pinned_id(k) for k in trusted_keys}
         self.keys = _Keys(trusted=set(self.pins), pinned=bool(self.pins),
                           tsa_roots=list(tsa_roots) if tsa_roots is not None else None)
         self.version: str | None = None
@@ -284,32 +475,48 @@ class ChainVerifier:
         self.unverified_tail = 0  # of those, the ones after the last checkpoint this verifier could check
         self.restart = None
         self.last_checkpoint: int | None = None  # the seq of the latest checkpoint seen
-        self.lines = 0  # lines read so far, blank ones included: error line numbers count on from here
+        self.lines = 0  # lines read so far, refused ones included: error line numbers count on from here
+        # What whoever split the file found after its last line end (``end_of_file`` takes it from the
+        # splitter, and ``feed_file`` calls that). The result then says so. A fragment there is not a line: this is
+        # its length. A whole record there was fed as the last line, and only lacks its line end.
+        self.incomplete_tail_bytes = 0
+        self.no_final_newline = False
         # The checkpoints that verified with no error at all, in order: seq, and the from_seq and to_seq they cover
         self.sealed: list[dict[str, int]] = []
 
     def feed(self, lines: Iterable[bytes | str]) -> None:
+        """Lines of the chain, each with or without its line end. A line that is blank, holds a carriage return
+        other than in its line end, or is not JSON this format accepts is an error, and is not skipped."""
         report = self.report
         for raw in lines:
             self.lines += 1
             line_no = self.lines
-            if isinstance(raw, bytes):
-                try:
-                    raw = raw.decode("utf-8")
-                except UnicodeDecodeError:  # the recorder writes UTF-8 only: other bytes were put there later
-                    report.error("parse", "line is not valid UTF-8", line_no)
-                    continue
-            if is_blank(raw):
-                continue
             try:
-                rec = parse_json(raw)
-            except (ValueError, RecursionError) as exc:  # also duplicate keys, NaN, and nesting too deep
-                report.error("parse", f"line is not valid JSON: {str(exc)[:200]}", line_no)
+                rec = parse_line(raw)
+            except LineError as exc:
+                report.error("parse", str(exc), line_no)
                 continue
             if not isinstance(rec, dict):
                 report.error("parse", "record is not a JSON object", line_no)
                 continue
             self._take(rec, line_no)
+
+    def feed_file(self, stream: BinaryIO) -> None:
+        """The bytes of an evidence file opened in binary mode, from where the stream stands to its end. Its
+        lines are fed. Bytes after the last line end are fed as the last line when they are a whole record, and
+        are counted and not read otherwise (see ``EvidenceLines``). A gzip file is unpacked as it is read."""
+        lines = file_lines(stream)
+        try:
+            self.feed(lines)
+        except GzipError as exc:
+            self.report.error("gzip", f"this is a gzip file and it could not be read to its end: {exc}. The lines "
+                                      "before that point were checked, the rest was not")
+        self.end_of_file(lines)
+
+    def end_of_file(self, lines: EvidenceLines) -> None:
+        """Take over what ``lines`` found after the last line end of the file, once its lines have been fed."""
+        self.incomplete_tail_bytes = lines.incomplete_tail_bytes
+        self.no_final_newline = lines.no_final_newline
 
     def feed_parsed(self, rec: dict) -> None:
         """One record a sink has already parsed, as the next line of the chain."""
@@ -384,11 +591,24 @@ class ChainVerifier:
         # has its own salt, so a short value can't be found again from its digest by guessing.
         v1 = vkey is None or vkey >= (1, 0)
         omitted = _omitted_paths(rec, report, line_no, seq)
+        salts: dict[str, str] = {}  # salt -> the slot of this record that has it
         for obj, fld, path in iter_redactable_paths(rec):
             committed = obj.get(f"{fld}_hash")
             has_salt = fld + SALT_SUFFIX in obj
             if has_salt and not v1:
                 report.error("spec_version", f"{fld}{SALT_SUFFIX} needs spec_version 1.0", line_no, seq)
+            if has_salt:
+                # With its value or without: a salt whose value is not in the file is covered by no hash, so
+                # this is the only check it gets.
+                salt = obj[fld + SALT_SUFFIX]
+                if not _is_exact_b64(salt):
+                    report.error("salt", f"{path}{SALT_SUFFIX} is not base64 in its one canonical spelling",
+                                 line_no, seq)
+                elif salt in salts:
+                    report.error("salt", f"{path}{SALT_SUFFIX} is also the salt of {salts[salt]}: in one record "
+                                         "every value has a salt of its own", line_no, seq)
+                else:
+                    salts[salt] = path
             if fld in obj:
                 if v1 and not has_salt:
                     report.error("salt", f"{fld} has no {fld}{SALT_SUFFIX}: its digest could be guessed",
@@ -405,8 +625,15 @@ class ChainVerifier:
             else:
                 self.redacted += 1
                 if has_salt and path not in omitted:
-                    report.warn("salt", f"{path} was redacted but its salt was kept, so its digest can be "
-                                        "checked against guesses. Remove the salt too", line_no, seq)
+                    report.warn("salt", f"{path} has a salt and not its value. With that salt the digest can be "
+                                        "checked against guesses of the value. A salt without its value is not "
+                                        "covered by the signature, so nothing shows it is the one the recorder "
+                                        "made. Remove the salt too", line_no, seq)
+                elif not has_salt and path in omitted and v1:
+                    report.warn("omitted_salt", f"{path} is listed as left out (x-omitted) and has no salt, so "
+                                                "the original can no longer be checked against its digest. This is "
+                                                "expected in a copy made by `mnestiq redact`, which removes those "
+                                                "salts", line_no, seq)
         if rec.get("event_type") == "llm_call" and seq is not None:
             self._check_context_base(rec, v1, report, line_no, seq)
         elif "context_base" in rec:
@@ -568,6 +795,16 @@ class ChainVerifier:
         state, and each result is a separate copy."""
         report = copy.deepcopy(self.report)
         report.unsigned_tail = len(self.pending) + self.unverified_tail
+        report.incomplete_tail_bytes = self.incomplete_tail_bytes
+        if self.incomplete_tail_bytes:  # the verdict is for the complete lines: this says what it leaves out
+            report.warn("incomplete_last_line",
+                        f"the last {self.incomplete_tail_bytes} byte(s) of the file have no line end, so they are "
+                        "not a record and were not read: a write that was cut, or a copy taken while the file was "
+                        "being written. The verdict is for the complete lines before them")
+        if self.no_final_newline:
+            report.warn("no_final_newline",
+                        "the last line of the file has no line end. It is a whole record and was read like every "
+                        "other line. A recorder ends every line with a line end, so something took this one away")
         if self.not_checked:
             report.warn("newer_version", f"written by a newer minor version ({self.newest or 'later than 1.0'}): "
                                          f"not checked by this verifier: {', '.join(sorted(self.not_checked))}. "
@@ -1056,6 +1293,9 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _K
         report.error("spec_version", "P-256 signatures and key hand-overs need spec_version 0.2", line_no, seq)
     try:
         kid = key_id(pub)
+    except WeakKeyError as exc:  # the library accepts such a key, and anyone can write a signature it accepts
+        report.error("signature", f"public_key is refused: {exc}", line_no, seq)
+        return
     except (ValueError, KeyError):
         report.error("signature", "public_key is not a valid Ed25519 or P-256 key", line_no, seq)
         return
@@ -1088,19 +1328,30 @@ def _check_checkpoint(rec: dict, pending: list[tuple[int, str | None]], keys: _K
         next_full = _generic_id(nxt.get("key_id"), nxt.get("public_key"))
         if next_full is None:
             report.error("next_key", "next_key is not a valid key (key_id must match public_key)", line_no, seq)
+        elif next_full.split(":")[0] in KEY_ID_PREFIXES:
+            # The key_id says Ed25519 or P-256, and the next checkpoint would be checked as that.
+            report.error("next_key", "next_key.sig_alg is not the algorithm of next_key.public_key", line_no, seq)
         elif signed:
             keys.expected = next_full
             report.rotations.append({"seq": seq, "from_key": kid, "to_key": nxt.get("key_id")})
             if full in keys.trusted:
                 keys.trusted.add(next_full)
     elif isinstance(nxt, dict):
+        next_pub = str(nxt.get("public_key") or "")
+        problem: str | None = "next_key is not a valid key (key_id must match public_key)"
         try:
-            next_kid = key_id(str(nxt.get("public_key") or ""))
+            next_kid = key_id(next_pub)
+        except WeakKeyError as exc:
+            next_kid = None
+            problem = f"next_key.public_key is refused: {exc}"
         except (ValueError, KeyError):
             next_kid = None
-        if next_kid is None or nxt.get("key_id") != next_kid or nxt.get("sig_alg") not in ("ed25519",
-                                                                                            "ecdsa-p256-sha256"):
-            report.error("next_key", "next_key is not a valid key (key_id must match public_key)", line_no, seq)
+        if next_kid is not None and nxt.get("key_id") == next_kid:
+            # The label must be the kind of key it is on: a checkpoint by this key is checked by the key's kind.
+            problem = (None if nxt.get("sig_alg") == alg_of_public(next_pub)
+                       else "next_key.sig_alg is not the algorithm of next_key.public_key")
+        if problem is not None:
+            report.error("next_key", problem, line_no, seq)
         elif signed:
             next_full = _full_id(str(nxt.get("public_key")))
             keys.expected = next_full
@@ -1120,9 +1371,29 @@ def _exact_b64(text: str) -> bytes:
     return raw
 
 
+def _is_exact_b64(value: Any) -> bool:
+    """Whether ``value`` is text that ``_exact_b64`` reads."""
+    if not isinstance(value, str):
+        return False
+    try:
+        _exact_b64(value)
+    except ValueError:  # also text that is not ASCII
+        return False
+    return True
+
+
 def _full_id(public_b64: str) -> str:
     """The whole key, for deciding trust: its algorithm and the full SHA-256 of its raw bytes."""
     return key_id(public_b64).split(":", 1)[0] + ":" + hashlib.sha256(base64.b64decode(public_b64)).hexdigest()
+
+
+def _pinned_id(public_b64: str) -> str:
+    """``_full_id`` of a key the user pins. A key that must not be used raises ``ValueError`` here, before
+    anything is verified against it."""
+    try:
+        return _full_id(public_b64)
+    except WeakKeyError as exc:
+        raise WeakKeyError(f"a trusted key is refused: {exc}") from None
 
 
 def _short(full: str) -> str:

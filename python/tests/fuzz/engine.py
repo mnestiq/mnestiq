@@ -5,7 +5,8 @@ Standard library only, and deterministic: the same seed file and case number giv
 The promises (``check`` reports a ``Violation`` when one breaks):
 
 no_crash        No input ends in an exception, on any surface.
-exit_code       verify exits 0 or 1, and 0 only when the report is ok. inspect exits 0 or 1. redact exits 0 or 2.
+exit_code       verify exits 0 or 1, and 0 only when the report is ok. inspect exits 0 or 1, or 2 for a gzip
+                file, which only verify unpacks. redact exits 0 or 2.
 signed_changed  With a pinned key, a VALID file holds exactly the signed records of the original, up to and
                 including its last checkpoint. Only redaction may differ. What follows is counted as unsigned.
 head            With the original's last checkpoint as the head, VALID means nothing signed is missing.
@@ -14,7 +15,8 @@ unreadable      A line that cannot be read is never VALID. The rules never repor
 redact_left     A redacted copy holds no redactable value, salt or marker text, and a VALID file stays VALID.
 redact_partial  A refused redaction leaves no output and no partial file behind.
 folder          One file never takes down the folder view, and a clean file beside it still loads.
-parity          The dashboard and the command line give the same verdict for the same bytes.
+parity          The dashboard and the command line give the same verdict for the same bytes. A gzip file is the
+                one exception: only verify unpacks it, and the dashboard must not call it valid.
 page            The dashboard page renders every payload the server sends without an uncaught error.
 """
 
@@ -53,9 +55,10 @@ from mnestiq.hashing import (
 )
 from mnestiq.keys import P256, generate_private_key, key_id, public_key_b64
 from mnestiq.merkle import merkle_root
-from mnestiq.verify import verify_lines
+from mnestiq.verify import GZIP_MAGIC, LineError, closed_object, parse_line, verify_stream
 
 ATTACKER = "dump@attacker.example"
+LF = bytes([10])  # the one byte that ends a line
 
 
 @dataclass
@@ -776,14 +779,22 @@ def _site(exc: BaseException) -> str:
 
 
 def _lines_as_verified(data: bytes) -> list[Any]:
-    """Every non-blank line, parsed the way the verifier parses it. A line it would refuse comes back as an Ellipsis."""
-    out: list[Any] = []
-    for raw in io.BytesIO(data):
+    """Every line, parsed the way the verifier parses it. A line it would refuse, a blank one too, comes back as
+    an Ellipsis. Bytes after the last LF are a line only when they are a closed JSON object, a whole record with
+    its line end taken away. A gzip file is unpacked first, as verify does."""
+    if data[:2] == GZIP_MAGIC:
         try:
-            text = raw.decode("utf-8")
-            if text.strip():
-                out.append(parse_json(text))
-        except (ValueError, RecursionError):
+            data = gzip.decompress(data)
+        except (OSError, EOFError, ValueError):  # never VALID: the verifier reports it
+            return []
+    *lines, last = data.split(LF)
+    if closed_object(last):
+        lines.append(last)
+    out: list[Any] = []
+    for raw in lines:
+        try:
+            out.append(parse_line(raw))
+        except LineError:
             out.append(...)
     return out
 
@@ -889,9 +900,10 @@ class Checker:
                 if self.slow_s is not None and spent > self.slow_s:
                     out.append(Violation("slow", surface, f"took more than {self.slow_s:g} s :: {spent:.1f}"))
 
-        pinned = guarded("verify pinned", lambda: verify_lines(io.BytesIO(data), [seed.pub]))
-        free = guarded("verify no pin", lambda: verify_lines(io.BytesIO(data)))
-        headed = guarded("verify head", lambda: verify_lines(io.BytesIO(data), [seed.pub], seed.head))
+        packed = data[:2] == GZIP_MAGIC
+        pinned = guarded("verify pinned", lambda: verify_stream(io.BytesIO(data), [seed.pub]))
+        free = guarded("verify no pin", lambda: verify_stream(io.BytesIO(data)))
+        headed = guarded("verify head", lambda: verify_stream(io.BytesIO(data), [seed.pub], seed.head))
         if pinned is not None:
             guarded("report json", lambda: json.dumps(pinned.to_dict()))
         parsed = _lines_as_verified(data)
@@ -940,7 +952,7 @@ class Checker:
         if code not in (0, 1, None):
             out.append(Violation("exit_code", "cli verify json", f"exit {code}"))
         code = guarded("cli inspect", _run_cli, "inspect", str(path))
-        if code not in (0, 1, None):
+        if code not in ((2, None) if packed else (0, 1, None)):
             out.append(Violation("exit_code", "cli inspect", f"exit {code}"))
         code = guarded("cli redact", _run_cli, "redact", str(path), str(redacted))
         if code not in (0, 2, None):
@@ -955,7 +967,7 @@ class Checker:
         loaded = guarded("folder load", lambda: EvidenceStore(path, [seed.pub]).load(path))
         if loaded is not None:
             guarded("folder payload", lambda: json.loads(loaded.payload))
-            if pinned is not None and loaded.summary["ok"] != pinned.ok:
+            if pinned is not None and loaded.summary["ok"] != (pinned.ok and not packed):
                 out.append(
                     Violation("parity", "dashboard", f"dashboard ok={loaded.summary['ok']}, verify ok={pinned.ok}")
                 )
@@ -1005,7 +1017,7 @@ class Checker:
                 if name in obj or name + SALT_SUFFIX in obj:
                     out.append(Violation("redact_left", "cli redact", f"{name} or its salt left in the copy"))
         if pinned is not None and pinned.ok:
-            again = verify_lines(io.BytesIO(body), [case.seed.pub])
+            again = verify_stream(io.BytesIO(body), [case.seed.pub])
             if not again.ok:
                 out.append(Violation("redact_left", "verify redacted", "a VALID file is not VALID after redaction"))
         return out

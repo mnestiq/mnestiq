@@ -10,13 +10,23 @@ import re
 import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .canonical import canonical_json, parse_json
 from .context import expand
 from .hashing import iter_redactable_paths, redact, slot_digest
 from .keys import ED25519, SIG_ALGS, generate_private_key, key_id, load_public_key_b64, public_key_b64, save_keypair
-from .verify import _unknown_fields, is_blank, schema_problem, verify_file
+from .verify import (
+    ChainVerifier,
+    EvidenceLines,
+    LineError,
+    Report,
+    _unknown_fields,
+    is_gzip,
+    parse_line,
+    schema_problem,
+    verify_file,
+)
 
 EXIT_OK, EXIT_INVALID, EXIT_USAGE = 0, 1, 2
 
@@ -179,7 +189,7 @@ def _verify(args: argparse.Namespace) -> int:
         print(json.dumps(report.to_dict(), indent=2))
         return EXIT_OK if report.ok else EXIT_INVALID
 
-    _say_line(f"{'VALID' if report.ok else 'INVALID'}  {args.file}")
+    _say_line(f"{'VALID' if report.ok else 'INVALID'}  {args.file}{_tail_note(report)}")
     _say_line(f"  chain     {report.chain_id}")
     _say_line(f"  records   {report.records} ({report.events} events, {report.checkpoints} checkpoints)")
     if report.signed_through_seq is not None:
@@ -199,6 +209,16 @@ def _verify(args: argparse.Namespace) -> int:
     for issue in report.warnings:
         _say_line(f"  warning {_where(issue)}{issue.code}: {issue.message}")
     return EXIT_OK if report.ok else EXIT_INVALID
+
+
+def _tail_note(report: Report) -> str:
+    """For the headline, what the file has after its last line end. A fragment there is left out of the verdict.
+    A whole record there is part of it."""
+    if report.incomplete_tail_bytes:
+        return f"  (the last {report.incomplete_tail_bytes} byte(s) have no line end and were not read)"
+    if any(issue.code == "no_final_newline" for issue in report.warnings):
+        return "  (the last line has no line end and was read)"
+    return ""
 
 
 def _witness_reach(witness: dict) -> str:
@@ -329,8 +349,12 @@ def _stop_cleanly_on_signals() -> None:
 
 def _inspect(args: argparse.Namespace) -> int:
     unreadable = 0
-    with open(args.file, "rb") as fh:
-        for rec in expand(_parsed_lines(fh)):
+    # The listing shows what the file says, whatever state it is in. The verifier reads the same lines as they go
+    # past, so that the last line printed can say whether the file verifies.
+    verifier = ChainVerifier()
+    with _open_plain(args.file) as fh:
+        lines = EvidenceLines(fh)
+        for rec in expand(_parsed_lines(lines, verifier)):
             try:
                 if args.run and rec.get("run_id") != args.run:
                     continue
@@ -339,19 +363,40 @@ def _inspect(args: argparse.Namespace) -> int:
                 unreadable += 1
                 seq = rec.get("seq") if isinstance(rec, dict) else None
                 _say(f"?  #{seq if isinstance(seq, int) else '?':<5} could not be read: not what the recorder writes")
+    verifier.end_of_file(lines)
+    report = verifier.result()
     if unreadable:
         _say(f"{unreadable} record(s) could not be read. Run `mnestiq verify` on this file.")
+    if report.incomplete_tail_bytes:
+        _say(f"The last {report.incomplete_tail_bytes} byte(s) of the file have no line end and are not listed.")
+    if report.ok:
+        _say("This listing is not a check. The file verified without a pinned key, so who signed it was not "
+             "checked. Run `mnestiq verify --trusted-key` for that.")
+    else:
+        _say(f"This file does NOT verify: {len(report.errors)} problem(s). The listing shows what the file says, "
+             "not what was recorded. Run `mnestiq verify` on it.")
     return EXIT_INVALID if unreadable else EXIT_OK
 
 
-def _parsed_lines(lines: Iterable[bytes]) -> Iterator[Any]:
-    """Each line parsed. A line that does not parse comes through as None, in its place."""
+@contextlib.contextmanager
+def _open_plain(path: str | Path) -> Iterator[BinaryIO]:
+    """An evidence file opened for reading. A gzip file is refused: only ``mnestiq verify`` unpacks one."""
+    with open(path, "rb") as fh:
+        if is_gzip(fh):
+            raise ValueError(f"{path} is a gzip file. Unpack it first: only `mnestiq verify` reads a gzip file")
+        yield fh
+
+
+def _parsed_lines(lines: Iterable[bytes], verifier: ChainVerifier | None = None) -> Iterator[Any]:
+    """Each line parsed, as the verifier reads it. A line it refuses comes through as None, in its place.
+    ``verifier`` is fed every line too."""
     for raw in lines:
-        if not is_blank(raw):
-            try:
-                yield parse_json(raw)
-            except (ValueError, RecursionError):
-                yield None
+        if verifier is not None:
+            verifier.feed([raw])
+        try:
+            yield parse_line(raw)
+        except LineError:
+            yield None
 
 
 def _inspect_line(rec: dict) -> str:
@@ -429,25 +474,47 @@ def _redact(args: argparse.Namespace) -> int:
         raise ValueError(f"{dst} already exists")
     count = 0
     partial = dst.with_name(dst.name + ".partial")
+    # A copy is made only of a file that verifies. Redacting takes out the values, and with them what shows that
+    # a line was changed: from an input with an error, the copy could verify. The verifier reads each line as it
+    # is redacted, so the bytes it judged are the bytes that were copied.
+    verifier = ChainVerifier()
     try:
-        with open(src, "rb") as fin, open(partial, "wb") as fout:
-            for line_no, raw in enumerate(fin, start=1):
-                if not is_blank(raw):
-                    fout.write(_redacted_line(raw, line_no))
-                    count += 1
+        with _open_plain(src) as fin, open(partial, "wb") as fout:
+            lines = EvidenceLines(fin)
+            for line_no, raw in enumerate(lines, start=1):
+                verifier.feed([raw])
+                _refuse_unverified(verifier.report, src)
+                fout.write(_redacted_line(raw, line_no))
+                count += 1
+            verifier.end_of_file(lines)
+            _refuse_unverified(verifier.result(), src)
         os.replace(partial, dst)
     finally:  # a failure leaves no half-written file in the way of the next try
         partial.unlink(missing_ok=True)
     print(f"wrote {count} redacted records to {dst}")
+    if lines.incomplete_tail_bytes:
+        print(f"the last {lines.incomplete_tail_bytes} byte(s) of {src} have no line end, so they are not a record "
+              "and were not copied")
     return EXIT_OK
+
+
+def _refuse_unverified(report: Report, src: Path) -> None:
+    """Stop the redaction of a file the verifier has found an error in. By code only: a verifier's message can
+    quote the record, and a redacted copy is made to keep such values from whoever reads on."""
+    if report.ok:
+        return
+    first = report.errors[0]
+    raise ValueError(f"{src} does not verify ({len(report.errors)} problem(s) so far, the first: "
+                     f"{_where(first)}{first.code}), so no redacted copy was written. "
+                     f"Run `mnestiq verify` on it to see what is wrong")
 
 
 def _redacted_line(raw: bytes, line_no: int) -> bytes:
     """One line, redacted. A line that isn't a well-formed record stops the whole redaction: content in
     a shape the redactor doesn't expect would pass through it and reach whoever gets the copy."""
     try:
-        # parse_json keeps numbers exactly as the hashes saw them (json.loads would not)
-        rec = parse_json(raw)
+        # parse_line keeps numbers exactly as the hashes saw them (json.loads would not)
+        rec = parse_line(raw)
         problem = schema_problem(rec, show_value=False) if isinstance(rec, dict) else "not a JSON object"
         problem = problem or _not_redactable(rec)
         if problem is None:
