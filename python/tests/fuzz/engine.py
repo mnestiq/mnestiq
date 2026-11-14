@@ -5,8 +5,9 @@ Standard library only, and deterministic: the same seed file and case number giv
 The promises (``check`` reports a ``Violation`` when one breaks):
 
 no_crash        No input ends in an exception, on any surface.
-exit_code       verify exits 0 or 1, and 0 only when the report is ok. inspect exits 0 or 1, or 2 for a gzip
-                file, which only verify unpacks. redact exits 0 or 2.
+exit_code       verify exits 0 or 1, and 0 only when the report is ok. inspect exits 0 or 1. redact exits 0 or 2.
+gzip            No reader unpacks a gzip file. The Python calls raise GzipFileError. verify, inspect and redact
+                exit 2 and write nothing. The dashboard does not call it valid. Nothing else is asked of it.
 signed_changed  With a pinned key, a VALID file holds exactly the signed records of the original, up to and
                 including its last checkpoint. Only redaction may differ. What follows is counted as unsigned.
 head            With the original's last checkpoint as the head, VALID means nothing signed is missing.
@@ -15,8 +16,7 @@ unreadable      A line that cannot be read is never VALID. The rules never repor
 redact_left     A redacted copy holds no redactable value, salt or marker text, and a VALID file stays VALID.
 redact_partial  A refused redaction leaves no output and no partial file behind.
 folder          One file never takes down the folder view, and a clean file beside it still loads.
-parity          The dashboard and the command line give the same verdict for the same bytes. A gzip file is the
-                one exception: only verify unpacks it, and the dashboard must not call it valid.
+parity          The dashboard and the command line give the same verdict for the same bytes.
 page            The dashboard page renders every payload the server sends without an uncaught error.
 """
 
@@ -55,7 +55,7 @@ from mnestiq.hashing import (
 )
 from mnestiq.keys import P256, generate_private_key, key_id, public_key_b64
 from mnestiq.merkle import merkle_root
-from mnestiq.verify import GZIP_MAGIC, LineError, closed_object, parse_line, verify_stream
+from mnestiq.verify import GZIP_MAGIC, GzipFileError, LineError, closed_object, parse_line, verify_stream
 
 ATTACKER = "dump@attacker.example"
 LF = bytes([10])  # the one byte that ends a line
@@ -781,12 +781,7 @@ def _site(exc: BaseException) -> str:
 def _lines_as_verified(data: bytes) -> list[Any]:
     """Every line, parsed the way the verifier parses it. A line it would refuse, a blank one too, comes back as
     an Ellipsis. Bytes after the last LF are a line only when they are a closed JSON object, a whole record with
-    its line end taken away. A gzip file is unpacked first, as verify does."""
-    if data[:2] == GZIP_MAGIC:
-        try:
-            data = gzip.decompress(data)
-        except (OSError, EOFError, ValueError):  # never VALID: the verifier reports it
-            return []
+    its line end taken away."""
     *lines, last = data.split(LF)
     if closed_object(last):
         lines.append(last)
@@ -900,7 +895,8 @@ class Checker:
                 if self.slow_s is not None and spent > self.slow_s:
                     out.append(Violation("slow", surface, f"took more than {self.slow_s:g} s :: {spent:.1f}"))
 
-        packed = data[:2] == GZIP_MAGIC
+        if data[:2] == GZIP_MAGIC:
+            return out + self._gzip_refused(data, path, pub_file, redacted, guarded)
         pinned = guarded("verify pinned", lambda: verify_stream(io.BytesIO(data), [seed.pub]))
         free = guarded("verify no pin", lambda: verify_stream(io.BytesIO(data)))
         headed = guarded("verify head", lambda: verify_stream(io.BytesIO(data), [seed.pub], seed.head))
@@ -952,7 +948,7 @@ class Checker:
         if code not in (0, 1, None):
             out.append(Violation("exit_code", "cli verify json", f"exit {code}"))
         code = guarded("cli inspect", _run_cli, "inspect", str(path))
-        if code not in ((2, None) if packed else (0, 1, None)):
+        if code not in (0, 1, None):
             out.append(Violation("exit_code", "cli inspect", f"exit {code}"))
         code = guarded("cli redact", _run_cli, "redact", str(path), str(redacted))
         if code not in (0, 2, None):
@@ -967,12 +963,38 @@ class Checker:
         loaded = guarded("folder load", lambda: EvidenceStore(path, [seed.pub]).load(path))
         if loaded is not None:
             guarded("folder payload", lambda: json.loads(loaded.payload))
-            if pinned is not None and loaded.summary["ok"] != (pinned.ok and not packed):
+            if pinned is not None and loaded.summary["ok"] != pinned.ok:
                 out.append(
                     Violation("parity", "dashboard", f"dashboard ok={loaded.summary['ok']}, verify ok={pinned.ok}")
                 )
         if store is not None:
             guarded("folder clean file", lambda: EvidenceStore(clean, [seed.pub]).load(clean))
+        return out
+
+    @staticmethod
+    def _gzip_refused(data: bytes, path: Path, pub_file: Path, redacted: Path, guarded: Any) -> list[Violation]:
+        """What every reader owes a gzip file: a refusal by name, and nothing unpacked, written or called valid."""
+        out: list[Violation] = []
+        try:
+            verify_stream(io.BytesIO(data))
+            out.append(Violation("gzip", "verify", "a gzip file was read, not refused"))
+        except GzipFileError:
+            pass
+        except Exception as exc:
+            out.append(Violation("no_crash", "verify", _site(exc)))
+        for surface, args in (("cli verify", ("verify", str(path), "--trusted-key", str(pub_file))),
+                              ("cli verify json", ("verify", "--json", str(path))),
+                              ("cli inspect", ("inspect", str(path))),
+                              ("cli redact", ("redact", str(path), str(redacted)))):
+            code = guarded(surface, _run_cli, *args)
+            if code not in (2, None):
+                out.append(Violation("gzip", surface, f"exit {code} for a gzip file"))
+        if redacted.exists() or redacted.with_name(redacted.name + ".partial").exists():
+            out.append(Violation("redact_partial", "cli redact", "refused, but left a file behind"))
+        loaded = guarded("folder load", lambda: EvidenceStore(path, []).load(path))
+        if loaded is not None and loaded.summary["ok"]:
+            out.append(Violation("gzip", "dashboard", "the dashboard calls a gzip file valid"))
+        guarded("folder files", lambda: EvidenceStore(path.parent, []).files())
         return out
 
     @staticmethod

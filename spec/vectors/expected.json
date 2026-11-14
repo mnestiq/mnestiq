@@ -134,6 +134,22 @@
         "no_final_newline"
       ]
     },
+    "integer-with-fraction.jsonl": {
+      "about": "step_id of the record at seq 1 written 1.0. An integer field is written without a fraction or an exponent, in every field the schema types as an integer.",
+      "ok": false,
+      "errors": [
+        "schema"
+      ],
+      "warnings": []
+    },
+    "integer-minus-zero.jsonl": {
+      "about": "seq of the first record written -0. Zero has one spelling in an integer field, 0.",
+      "ok": false,
+      "errors": [
+        "schema"
+      ],
+      "warnings": []
+    },
     "large-numbers.jsonl": {
       "about": "Whole numbers past 2^53 - 1 in a record, written as canonical JSON writes them: 9007199254740992 and 9223372036854776000.",
       "ok": true,

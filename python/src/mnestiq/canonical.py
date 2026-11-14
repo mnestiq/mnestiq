@@ -72,6 +72,19 @@ def nested_too_deep(text: str) -> bool:
     return False
 
 
+class MinusZero(int):
+    """The integer 0 as read from the text ``-0``. It is 0 to everything that computes, compares or writes with it,
+    and canonical JSON writes it ``0``, so no hash can tell the two apart. The schema check can: a field typed as
+    an integer has one spelling for each integer, and refuses this one."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "-0"
+
+
+MINUS_ZERO = MinusZero(0)
+
 _MAX_PLAIN_DIGITS = 21  # canonical JSON writes a number of 1e21 or more with an exponent, never as digits alone
 
 
@@ -83,7 +96,7 @@ def _number(text: str) -> int | float:
     number to one with exact integers. Past 2^53 - 1 only the text canonical JSON writes for the double is
     accepted, so a number has one spelling there and every reader gets the value that was hashed."""
     if len(text) <= 15:  # too short to be past 2^53 - 1
-        return int(text)
+        return MINUS_ZERO if text == "-0" else int(text)
     if len(text.lstrip("-")) > _MAX_PLAIN_DIGITS:  # also keeps int() away from text of any length
         raise RefusedJSON(f"the whole number {text[:24]}... is not written as canonical JSON writes a number "
                           "of that size")

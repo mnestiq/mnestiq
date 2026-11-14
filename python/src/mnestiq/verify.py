@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import copy
-import gzip
 import hashlib
 import heapq
 import io
@@ -12,7 +11,6 @@ import json
 import os
 import re
 import stat
-import zlib
 from datetime import datetime, timezone
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -20,13 +18,22 @@ from importlib import resources
 from itertools import islice
 from pathlib import Path
 from collections.abc import Iterable, Iterator
-from typing import TYPE_CHECKING, Any, BinaryIO, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, TypeGuard, cast
 
 from cryptography.exceptions import InvalidSignature
 from jsonschema import Draft202012Validator, validators
 from jsonschema.exceptions import ValidationError, best_match
 
-from .canonical import MAX_DEPTH, CanonicalizationError, RefusedJSON, canonical_json, nested_too_deep, parse_json
+from .canonical import (
+    MAX_DEPTH,
+    MAX_SAFE_INTEGER,
+    CanonicalizationError,
+    MinusZero,
+    RefusedJSON,
+    canonical_json,
+    nested_too_deep,
+    parse_json,
+)
 from .hashing import (
     GENESIS_HASH,
     SALT_SUFFIX,
@@ -41,6 +48,12 @@ from .merkle import merkle_root
 
 if TYPE_CHECKING:
     from cryptography import x509
+
+
+# How many problems a verifier keeps. A file can hold a problem on every line, and a line can be one byte: with no
+# limit, a megabyte of line ends became hundreds of megabytes of problems. After this many errors the verifier
+# stops reading, and of the warnings about single records it keeps this many. The dashboard stops at the same number.
+MAX_PROBLEMS = 1_000
 
 
 @dataclass
@@ -74,12 +87,18 @@ class Report:
     # Bytes after the last line end of the file that are not a whole record: not read, not counted. A whole record
     # there is read as the last line, leaves this at 0 and gets the warning no_final_newline.
     incomplete_tail_bytes: int = 0
+    more_warnings: int = 0  # warnings about single records past the first MAX_PROBLEMS, which are not kept
+
+    keep_every_warning = False  # set for the few warnings about the file as a whole, which are always kept
 
     def error(self, code: str, message: str, line: int | None = None, seq: int | None = None) -> None:
         self.ok = False
         self.errors.append(Issue(code, message, line, seq))
 
     def warn(self, code: str, message: str, line: int | None = None, seq: int | None = None) -> None:
+        if len(self.warnings) >= MAX_PROBLEMS and not self.keep_every_warning:
+            self.more_warnings += 1  # a warning for every line of a large file must not fill memory
+            return
         self.warnings.append(Issue(code, message, line, seq))
 
     def to_dict(self) -> dict:
@@ -135,11 +154,20 @@ def parse_line(raw: bytes | str) -> Any:
 
 
 GZIP_MAGIC = b"\x1f\x8b"  # the first two bytes of every gzip file
-MAX_GZIP_LINE = 64 * 1024 * 1024  # the longest line taken out of a gzip file: a small file can unpack to any size
 
 
-class GzipError(ValueError):
-    """A gzip file that could not be read to its end. The message says why."""
+class GzipFileError(ValueError):
+    """A gzip file where an evidence file was expected. Nothing in this package unpacks one: a few kilobytes of
+    gzip can unpack to gigabytes, and a verifier that reads them can be made to run out of memory. The file is
+    not verified, and is not called damaged. The message names it and says to unpack it first."""
+
+
+def refuse_gzip(stream: BinaryIO, name: str | Path | None = None) -> None:
+    """Raise ``GzipFileError`` if a file opened in binary mode starts with the gzip magic bytes. Nothing more
+    of it is read."""
+    if is_gzip(stream):
+        said = name if name is not None else getattr(stream, "name", None)
+        raise GzipFileError(f"{said if isinstance(said, (str, Path)) else 'this'} is a gzip file. Unpack it first")
 
 
 # A whole string, which may hold brackets of its own and may be cut off, or one bracket. As in ``canonical``,
@@ -203,28 +231,6 @@ def is_gzip(stream: BinaryIO) -> bool:
     magic = stream.read(2)
     stream.seek(start)
     return magic == GZIP_MAGIC
-
-
-def file_lines(stream: BinaryIO) -> EvidenceLines:
-    """The complete lines of an evidence file opened in binary mode. A gzip file is unpacked as it is read,
-    never as a whole, and its lines are the lines of what it unpacks to."""
-    return EvidenceLines(_gzip_lines(stream) if is_gzip(stream) else stream)
-
-
-def _gzip_lines(stream: BinaryIO) -> Iterator[bytes]:
-    """The lines a gzip file unpacks to. Raises ``GzipError`` where it cannot be unpacked, and at a line longer
-    than ``MAX_GZIP_LINE``: a few kilobytes of gzip can hold one line of many gigabytes."""
-    with gzip.GzipFile(fileobj=stream, mode="rb") as unpacked:
-        while True:
-            try:
-                raw = unpacked.readline(MAX_GZIP_LINE + 1)
-            except (OSError, EOFError, zlib.error) as exc:  # cut short, damaged, or other bytes after its end
-                raise GzipError(f"it is damaged or cut short ({type(exc).__name__})") from None
-            if not raw:
-                return
-            if len(raw) > MAX_GZIP_LINE:
-                raise GzipError(f"one line of it is longer than {MAX_GZIP_LINE} bytes once unpacked")
-            yield raw
 
 
 def version_key(version: Any) -> tuple[int, int] | None:
@@ -349,8 +355,35 @@ def _pattern(validator: Any, pattern: str, instance: Any, schema: dict) -> Itera
         yield ValidationError(f"{instance!r} does not match {pattern!r}")
 
 
-_BoundedValidator = validators.extend(Draft202012Validator, {"oneOf": _one_of, "anyOf": _any_of,
-                                                             "pattern": _pattern})
+def is_written_integer(value: Any) -> bool:
+    """Whether a value read from an evidence file is an integer written as one: digits alone, no fraction and
+    no exponent, and not ``-0``. JSON Schema calls ``1.0`` an integer too. The format does not: a number has one
+    spelling in a field the schema types as an integer, so that no reader can take ``1.0`` or ``-0`` for another
+    text than ``1`` or ``0`` and the bytes of a signed record cannot be changed there without a trace."""
+    return isinstance(value, int) and not isinstance(value, (bool, MinusZero))
+
+
+def _type(validator: Any, types: Any, instance: Any, schema: dict) -> Iterator[ValidationError]:
+    """The schema's type, as jsonschema checks it, with words for a number that an integer field refuses only
+    for the way it is written."""
+    wanted = [types] if isinstance(types, str) else list(types)
+    if any(validator.is_type(instance, each) for each in wanted):
+        return
+    if "integer" in wanted and isinstance(instance, MinusZero):
+        yield ValidationError("-0 is not accepted in an integer field: zero is written 0")
+    elif "integer" in wanted and isinstance(instance, float) and instance.is_integer():
+        if abs(instance) > MAX_SAFE_INTEGER:
+            yield ValidationError(f"{instance!r} is past 2^53 - 1, the largest whole number an integer field holds")
+        else:
+            yield ValidationError(f"{instance!r} is a whole number written with a fraction or an exponent: an "
+                                  "integer field holds it written as an integer")
+    else:
+        yield ValidationError(f"{instance!r} is not of type {', '.join(repr(each) for each in wanted)}")
+
+
+_BoundedValidator = validators.extend(
+    Draft202012Validator, {"oneOf": _one_of, "anyOf": _any_of, "pattern": _pattern, "type": _type},
+    type_checker=Draft202012Validator.TYPE_CHECKER.redefine("integer", lambda _, value: is_written_integer(value)))
 
 
 def _schema_errors(record: Any) -> list[ValidationError]:
@@ -383,17 +416,24 @@ def _validator(record: Any = None) -> Draft202012Validator:
     return _validators()[kind if kind in ("event", "checkpoint") else None]
 
 
-def schema_problem(record: dict, show_value: bool = True) -> str | None:
+def schema_problem(record: dict, show_value: bool = True, as_read: bool = False) -> str | None:
     """The first way a record breaks the schema, or None if it is valid. ``show_value=False`` names the
     field and the rule only: the message is then safe for an application log, since a schema error
     otherwise quotes the value, which can be anything the agent handled (an API key, a document).
 
     A record nested deeper than the verifier reads is a problem too. The recorder asks here before it writes,
-    so it never writes a line its own verifier would refuse."""
-    text = canonical_json(record).decode("utf-8")
-    if nested_too_deep(text):
-        return f"record: nested more than {MAX_DEPTH} levels deep"
-    instance = json.loads(text)
+    so it never writes a line its own verifier would refuse: the record is judged as the verifier will read the
+    line it becomes. A whole number given as a float is written as an integer there, and passes.
+
+    ``as_read=True`` is for a record that was read from a file (``parse_line``): it is judged as it was written,
+    so that an integer field spelled ``1.0`` or ``-0`` in the file is a problem here as it is to the verifier."""
+    if as_read:
+        instance = record
+    else:
+        text = canonical_json(record).decode("utf-8")
+        if nested_too_deep(text):
+            return f"record: nested more than {MAX_DEPTH} levels deep"
+        instance = parse_json(text)
     error = best_match(islice(_validator(instance).iter_errors(instance), MAX_SCHEMA_ERRORS))
     if error is None:
         # The schema leaves room for what later minor versions add. A record of a version this verifier
@@ -408,13 +448,15 @@ def schema_problem(record: dict, show_value: bool = True) -> str | None:
 
 def verify_file(path: str | Path, trusted_keys: Iterable[str] = (), head: dict | None = None,
                 tsa_roots: Iterable[x509.Certificate] | None = None, witness: str | Path | None = None) -> Report:
-    """Verify an evidence file. A gzip file (first bytes 1f 8b) is unpacked as it is read, and every rule holds
-    for the bytes it unpacks to. Bytes after the last line end are read as the last line when they are a whole
-    record (``closed_object``), and are not read otherwise: see ``Report.incomplete_tail_bytes``.
-    A pinned key that cannot be used raises ``ValueError`` before the file is opened."""
+    """Verify an evidence file. Bytes after the last line end are read as the last line when they are a whole
+    record (``closed_object``), and are not read otherwise: see ``Report.incomplete_tail_bytes``. Reading stops
+    after ``MAX_PROBLEMS`` errors, and the report then says where (``too_many_problems``).
+
+    A gzip file (first bytes 1f 8b) is not unpacked and not verified: ``GzipFileError``, a ``ValueError``, says to
+    unpack it first. A pinned key that cannot be used raises ``ValueError`` before the file is opened."""
     verifier = ChainVerifier(trusted_keys, tsa_roots, witness=witness)
     with open(path, "rb") as fh:
-        verifier.feed_file(fh)
+        verifier.feed_file(fh, name=path)
     return verifier.result(head)
 
 
@@ -476,6 +518,7 @@ class ChainVerifier:
         self.restart = None
         self.last_checkpoint: int | None = None  # the seq of the latest checkpoint seen
         self.lines = 0  # lines read so far, refused ones included: error line numbers count on from here
+        self.stopped_at: int | None = None  # the line at which checking stopped for too many errors
         # What whoever split the file found after its last line end (``end_of_file`` takes it from the
         # splitter, and ``feed_file`` calls that). The result then says so. A fragment there is not a line: this is
         # its length. A whole record there was fed as the last line, and only lacks its line end.
@@ -486,31 +529,46 @@ class ChainVerifier:
 
     def feed(self, lines: Iterable[bytes | str]) -> None:
         """Lines of the chain, each with or without its line end. A line that is blank, holds a carriage return
-        other than in its line end, or is not JSON this format accepts is an error, and is not skipped."""
-        report = self.report
+        other than in its line end, or is not JSON this format accepts is an error, and is not skipped.
+
+        After ``MAX_PROBLEMS`` errors nothing more is read: the loop ends with the line that brought the count
+        there, no further item is taken from ``lines``, and a later call takes none at all (``stopped_at``)."""
+        if self.stopped_at is not None:
+            return
         for raw in lines:
             self.lines += 1
-            line_no = self.lines
-            try:
-                rec = parse_line(raw)
-            except LineError as exc:
-                report.error("parse", str(exc), line_no)
-                continue
-            if not isinstance(rec, dict):
-                report.error("parse", "record is not a JSON object", line_no)
-                continue
-            self._take(rec, line_no)
+            self._feed_line(raw, self.lines)
+            if self._stop_if_too_many():
+                return
 
-    def feed_file(self, stream: BinaryIO) -> None:
-        """The bytes of an evidence file opened in binary mode, from where the stream stands to its end. Its
-        lines are fed. Bytes after the last line end are fed as the last line when they are a whole record, and
-        are counted and not read otherwise (see ``EvidenceLines``). A gzip file is unpacked as it is read."""
-        lines = file_lines(stream)
+    def _feed_line(self, raw: bytes | str, line_no: int) -> None:
         try:
-            self.feed(lines)
-        except GzipError as exc:
-            self.report.error("gzip", f"this is a gzip file and it could not be read to its end: {exc}. The lines "
-                                      "before that point were checked, the rest was not")
+            rec = parse_line(raw)
+        except LineError as exc:
+            self.report.error("parse", str(exc), line_no)
+            return
+        if not isinstance(rec, dict):
+            self.report.error("parse", "record is not a JSON object", line_no)
+            return
+        self._take(rec, line_no)
+
+    def _stop_if_too_many(self) -> bool:
+        """Whether the errors have reached the limit. From then on this verifier reads nothing."""
+        if len(self.report.errors) >= MAX_PROBLEMS:
+            self.stopped_at = self.lines
+        return self.stopped_at is not None
+
+    def feed_file(self, stream: BinaryIO, name: str | Path | None = None) -> None:
+        """The bytes of an evidence file opened in binary mode, from where the stream stands to its end, or to
+        the line where checking stops (``feed``). Bytes after the last line end are fed as the last line when they
+        are a whole record, and are counted and not read otherwise (see ``EvidenceLines``).
+
+        A gzip file is not unpacked: ``GzipFileError`` before anything is read. ``name`` is what the message
+        calls the file."""
+        if not self.lines:
+            refuse_gzip(stream, name)
+        lines = EvidenceLines(stream)
+        self.feed(lines)
         self.end_of_file(lines)
 
     def end_of_file(self, lines: EvidenceLines) -> None:
@@ -519,9 +577,13 @@ class ChainVerifier:
         self.no_final_newline = lines.no_final_newline
 
     def feed_parsed(self, rec: dict) -> None:
-        """One record a sink has already parsed, as the next line of the chain."""
+        """One record a sink has already parsed, as the next line of the chain. Not taken once checking has
+        stopped for too many errors."""
+        if self.stopped_at is not None:
+            return
         self.lines += 1
         self._take(rec, self.lines)
+        self._stop_if_too_many()
 
     def _take(self, rec: dict, line_no: int) -> None:
         report = self.report
@@ -711,7 +773,7 @@ class ChainVerifier:
         checkpoint. It only ever adds a warning. Any other note of this shape is a note."""
         claim = recorder_claim(rec, UNCLEAN_RESUME_FIELD)
         after = claim.get("after_checkpoint_seq") if isinstance(claim, dict) else None
-        if type(after) is not int or after != self.last_checkpoint:
+        if not _is_int(after) or after != self.last_checkpoint:
             return
         self.report.unclean_restarts.append({"note_seq": seq, "checkpoint_seq": after})
         self.report.warn(UNCLEAN_RESUME_FIELD,
@@ -745,7 +807,7 @@ class ChainVerifier:
         if not isinstance(claim, dict):
             return
         first, last, count = claim.get("first_seq"), claim.get("last_seq"), claim.get("count")
-        if not (type(first) is int and type(last) is int and type(count) is int):
+        if not (_is_int(first) and _is_int(last) and _is_int(count)):
             return
         if (1 <= count <= len(self.pending) and count == last - first + 1 and self.pending[0][0] == first
                 and self.pending[count - 1][0] == last and (self.restart is None or last > self.restart[0])):
@@ -794,6 +856,12 @@ class ChainVerifier:
         """The report for the lines fed so far. Feeding can go on afterwards: the verifier keeps its own
         state, and each result is a separate copy."""
         report = copy.deepcopy(self.report)
+        stopped = self.stopped_at is not None
+        if report.more_warnings:
+            report.warnings.append(Issue("too_many_warnings",
+                                         f"{report.more_warnings} more warning(s) about single records are not "
+                                         f"listed: only the first {len(report.warnings)} are kept"))
+        report.keep_every_warning = True  # what follows is about the file as a whole, a handful at most
         report.unsigned_tail = len(self.pending) + self.unverified_tail
         report.incomplete_tail_bytes = self.incomplete_tail_bytes
         if self.incomplete_tail_bytes:  # the verdict is for the complete lines: this says what it leaves out
@@ -821,7 +889,9 @@ class ChainVerifier:
         if self.redacted:  # still verifies, by design: but the content, and what rules find in it, is gone
             report.warn("redacted", f"{self.redacted} field(s) are redacted: their content cannot be checked, and "
                                     "detection rules cannot see it")
-        if report.records == 0:
+        if stopped:
+            pass  # the rest of the file was not read: nothing is said about what the whole file holds or lacks
+        elif report.records == 0:
             report.error("empty", "no records found")
         elif report.checkpoints == 0 and self.pins:
             # A pinned key that signed nothing proves nothing: anyone can write a consistent unsigned file.
@@ -837,11 +907,27 @@ class ChainVerifier:
         if report.checkpoints and not self.pins:
             report.warn("untrusted_key", "no --trusted-key given; signatures prove internal consistency only, "
                                          "not who signed. Pin the recorder's public key.")
+        if stopped:
+            # A head or a witness is compared with the whole file. Compared with a part of it, they would say
+            # that records were removed from the end, which nobody has looked at.
+            left_out = [name for name, given in (("the head", head), ("the witness log", self.witness))
+                        if given is not None]
+            report.error("too_many_problems",
+                         f"checking stopped at line {self.stopped_at}, after {len(report.errors)} problems. The "
+                         "rest of the file was not read, so this report is for the lines up to there only"
+                         + (f". The file was not compared with {' or '.join(left_out)}" if left_out else ""))
+            return report
         if head is not None:
             _check_head(head, report, self.checkpoint_hashes, self.last_seq)
         if self.witness is not None:
             self.witness.finish(report, self.last_seq, self.pending)
         return report
+
+
+def _is_int(value: Any) -> TypeGuard[int]:
+    """Whether a value read from JSON is an integer, however it was written: ``-0`` is one here, ``true`` is
+    not. For values that are compared and counted with, outside the fields the schema types."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def plain_text(text: str, limit: int = 200) -> str:
@@ -991,10 +1077,10 @@ def _witness_header_problem(header: Any) -> str | None:
     if not isinstance(header, dict) or header.get("kind") != WITNESS_KIND:
         return "it does not start with a witness log header"
     version = header.get("version")
-    if version != WITNESS_VERSION or type(version) is not int:
+    if version != WITNESS_VERSION or not _is_int(version):
         return f"it has version {str(version)[:20]}, and this verifier reads version {WITNESS_VERSION}"
     chain, thinned = header.get("chain_id"), header.get("thinned", 0)
-    if not isinstance(chain, str) or not header.keys() <= _WITNESS_HEADER or type(thinned) is not int or thinned < 0:
+    if not isinstance(chain, str) or not header.keys() <= _WITNESS_HEADER or not _is_int(thinned) or thinned < 0:
         return "its header is malformed"
     return None
 
@@ -1004,7 +1090,7 @@ def _take_witness_entry(log: WitnessLog, entry: Any) -> str | None:
     if not isinstance(entry, dict) or not isinstance(entry.get("at"), str):
         return "a line is not a witness entry"
     seq, by = entry.get("seq"), entry.get("by")
-    if type(seq) is not int or seq < 0:
+    if not _is_int(seq) or seq < 0:
         return "a line has no usable seq"
     if by == "head":
         if entry.keys() != _WITNESSED_HEAD or not _matches(_RECORD_HASH, entry["record_hash"]):
@@ -1017,7 +1103,7 @@ def _take_witness_entry(log: WitnessLog, entry: Any) -> str | None:
         low = covers.get("from_seq") if isinstance(covers, dict) else None
         if (entry.keys() != _WITNESSED_CHECKPOINT or not isinstance(covers, dict)
                 or covers.keys() != {"from_seq", "to_seq"}
-                or type(low) is not int or low < 0 or type(covers["to_seq"]) is not int
+                or not _is_int(low) or low < 0 or not _is_int(covers["to_seq"])
                 or covers["to_seq"] != seq - 1 or low > seq - 1
                 or not _matches(_RECORD_HASH, entry["merkle_root"]) or not _matches(_REQUEST_HASH, entry["request"])):
             return f"the line for seq {seq} is malformed"
@@ -1389,7 +1475,11 @@ def _full_id(public_b64: str) -> str:
 
 def _pinned_id(public_b64: str) -> str:
     """``_full_id`` of a key the user pins. A key that must not be used raises ``ValueError`` here, before
-    anything is verified against it."""
+    anything is verified against it. So does a pin in any spelling but the canonical base64 of the key: a spare
+    bit set in its last letter decodes to the same bytes, and two verifiers must not differ on whether that is
+    the key."""
+    if not _is_exact_b64(public_b64):
+        raise ValueError("a trusted key is refused: it is not a public key written in canonical base64")
     try:
         return _full_id(public_b64)
     except WeakKeyError as exc:

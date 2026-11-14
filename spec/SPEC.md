@@ -68,13 +68,17 @@ was cut, or a copy taken while the file was being written. A part of a record is
 object, so a write that was cut is never read as a record.
 
 An evidence file MAY be stored or sent compressed with gzip (RFC 1952). Every rule in this document
-applies to the decompressed bytes. A verifier that does not read gzip MUST say that the file is
-compressed, and MUST NOT report it as a damaged evidence file.
+applies to the decompressed bytes. A verifier need not read gzip. One that does not MUST say that the
+file is compressed, and MUST NOT report it as a damaged evidence file or give a verdict on it.
+
+A verifier MAY stop reading a file after a number of problems. It MUST then report the file as not
+verified, and say where it stopped.
 
 Integers MUST be within +/-(2^53-1). Values that may exceed this (nanosecond
 timestamps, 64-bit ids) MUST be encoded as strings. Floating-point NaN and
-Infinity MUST NOT appear. A field the schema types as `integer` MUST be written without a
-fraction or exponent, and a verifier MUST reject `1.0` or `1e0` there.
+Infinity MUST NOT appear. A field the schema types as `integer` MUST be written as an integer:
+digits, with a minus sign only before a number that is not zero, and no fraction or exponent. A
+verifier MUST reject `1.0`, `1e0` or `-0` there, in every such field.
 
 A record MUST NOT be nested more than 128 levels deep. The record itself is level 1, and every
 object or array inside another adds one level. Readers MUST reject a deeper record.
@@ -219,7 +223,8 @@ still letting them check the value if it is disclosed separately.
 
 A `*_salt`, wherever it is present, MUST be the canonical base64 of its bytes, and a verifier MUST
 reject any other text there. A `*_salt` without its `*_hash` is an error. A verifier MUST reject the
-same salt on two values of one record, and MAY check for it across a file. A verifier SHOULD warn
+same salt on two values of one record. It does not look for the same salt in two records, and MUST NOT
+report that as an error: a producer that repeats a salt weakens only its own redaction. A verifier SHOULD warn
 when a value listed in `x-omitted` has no salt, because its original can then no longer be checked.
 A verifier MUST report how many values of a file are redacted.
 
@@ -266,6 +271,10 @@ that chain. A hand-over signed by an untrusted key extends nothing.
 
 When keys are pinned, a file with no checkpoint signed by a trusted key MUST be reported as an
 error: a pinned key that signed nothing proves nothing.
+
+A pinned key is given as the base64 of the raw public key, in its one canonical spelling. A verifier
+MUST refuse a pin in any other spelling before it verifies anything. Space and a line end around the
+text are not part of it.
 
 A verifier MUST refuse an Ed25519 public key of small order (a point that 8 times itself gives the
 identity), as a pinned key, as a checkpoint's `public_key` and in `next_key`. For such a key a
@@ -452,8 +461,8 @@ move back. A v0.1 record MUST NOT use P-256, `next_key` or `heartbeat`.
 
 In November 2026 this document was made explicit in places where it did not decide, with no new
 version: how a line ends, blank lines, bytes after the last line feed, whole numbers beyond 2^53,
-nesting and gzip (section 3), salts (section 5.3), keys of small order and files with no trusted
-checkpoint (section 6.4), `next_key.sig_alg` (section 6.7) and the form of `timestamp_token`
+nesting, integer fields, gzip and a stop after many problems (section 3), salts (section 5.3), keys
+of small order, the spelling of a pinned key and files with no trusted checkpoint (section 6.4), `next_key.sig_alg` (section 6.7) and the form of `timestamp_token`
 (section 6.9). Nothing a conforming producer writes is read differently. A file changed by hand in
 one of these ways, which an earlier verifier accepted, is rejected. A file whose last write was cut
 is no longer rejected for that reason alone: the cut bytes are reported and not read.

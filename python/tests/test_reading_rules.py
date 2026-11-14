@@ -1,16 +1,19 @@
-"""Reading rules: how a file is split into lines, what a line may hold, salts, keys, gzip, and the commands
-that read a file. One regression test, at least, for each change of behaviour."""
+"""Reading rules: how a file is split into lines, what a line may hold, salts, keys, integers, what stops a
+reader, and the commands that read a file. One regression test, at least, for each change of behaviour."""
 
 import base64
 import gzip
 import hashlib
+import io
 import json
 import os
 import random
+import re
 from pathlib import Path
 
 import pytest
 
+import mnestiq.dashboard
 import mnestiq.recorder
 import mnestiq.verify
 from conftest import dump, load, record_demo
@@ -35,6 +38,7 @@ from mnestiq.signers import LocalSigner
 from mnestiq.verify import (
     ChainVerifier,
     EvidenceLines,
+    GzipFileError,
     LineError,
     _schema_pattern,
     closed_object,
@@ -357,9 +361,6 @@ def test_every_reader_takes_a_whole_last_record_with_no_line_end(evidence, tmp_p
     report = verify_file(copy, [pub])
     assert report.ok and "no_final_newline" not in warnings(report) and copy.read_bytes().endswith(b"}\n")
     assert len(_records(evidence)) == count
-    packed = tmp_path / "e.jsonl.gz"
-    packed.write_bytes(gzip.compress(whole[:-1]))
-    assert verify_file(packed, [pub]).to_dict() == verify_file(evidence, [pub]).to_dict()
 
 
 def test_a_recorder_keeps_a_whole_last_record_and_starts_the_next_on_a_new_line(evidence, tmp_path, key, pub):
@@ -911,68 +912,62 @@ def test_a_pinned_key_of_small_order_is_refused_before_anything_is_verified(evid
         assert "VALID" not in said.out
 
 
-# --- 9. gzip -------------------------------------------------------------------------------------------------------
+# --- 9. gzip is not read --------------------------------------------------------------------------------------------
 
-def test_verify_reads_a_gzip_file(evidence, tmp_path, pub, capsys):
-    plain = verify_file(evidence, [pub])
+def test_verify_does_not_read_a_gzip_file(evidence, tmp_path, pub, capsys):
+    whole = gzip.compress(evidence.read_bytes())
     for name in ("e.jsonl.gz", "named-as-plain.jsonl"):  # told by its first two bytes, not by its name
         packed = tmp_path / name
-        packed.write_bytes(gzip.compress(evidence.read_bytes()))
-        assert verify_file(packed, [pub]).to_dict() == plain.to_dict()
-        assert main(["verify", str(packed), "--trusted-key", pub]) == 0
-        assert capsys.readouterr().out.startswith("VALID")
-    with open(evidence, "rb") as fh:
-        assert verify_stream(fh, [pub]).to_dict() == plain.to_dict()
+        packed.write_bytes(whole)
+        with pytest.raises(GzipFileError) as refused:
+            verify_file(packed, [pub])
+        assert isinstance(refused.value, ValueError)
+        assert str(refused.value) == f"{packed} is a gzip file. Unpack it first"
+        copy = tmp_path / "copy.jsonl"
+        for command in (["verify", str(packed), "--trusted-key", pub], ["verify", str(packed), "--json"],
+                        ["inspect", str(packed)], ["redact", str(packed), str(copy)]):
+            assert main(command) == 2
+            said = capsys.readouterr()
+            assert said.err.strip() == f"error: {packed} is a gzip file. Unpack it first"
+            assert said.out == ""  # no verdict, and not called damaged or INVALID
+        assert not copy.exists() and packed.read_bytes() == whole
+    with open(packed, "rb") as fh:
+        with pytest.raises(GzipFileError, match="is a gzip file"):
+            verify_stream(fh, [pub])
+        assert fh.tell() == 0  # refused before anything was read
+    with pytest.raises(GzipFileError) as unnamed:
+        verify_stream(io.BytesIO(whole))
+    assert str(unnamed.value) == "this is a gzip file. Unpack it first"
+    with pytest.raises(GzipFileError):
+        ChainVerifier().feed_file(io.BytesIO(whole))
 
 
-def test_every_rule_holds_for_what_a_gzip_file_unpacks_to(evidence, tmp_path, pub):
-    whole = evidence.read_bytes()
-    first, rest = whole.split(b"\n", 1)
-    packed = tmp_path / "e.jsonl.gz"
-    for data in (whole + CUT, whole[:-1], first + b"\n\n" + rest, first.replace(b",", b",\r", 1) + b"\n" + rest,
-                 whole.replace(b"\n", b"\r\n"), whole.replace(b"auto-approve-email", b"human-approved"), b""):
-        evidence.write_bytes(data)
-        packed.write_bytes(gzip.compress(data))
-        assert verify_file(packed, [pub]).to_dict() == verify_file(evidence, [pub]).to_dict()
+@pytest.mark.parametrize("unpacked", [b"\n" * 100_000, b"{}\n" * 20_000, b"[]," * 300_000, b""],
+                         ids=["line-ends", "empty-objects", "one-long-line", "nothing"])
+def test_a_gzip_file_is_refused_whatever_it_unpacks_to(tmp_path, pub, unpacked):
+    """The files that took gigabytes when gzip was read, made small. None of them is unpacked now."""
+    path = tmp_path / "e.jsonl"
+    for data in (gzip.compress(unpacked), gzip.compress(unpacked)[:12], gzip.compress(unpacked) + b"more bytes"):
+        path.write_bytes(data)
+        with pytest.raises(GzipFileError):
+            verify_file(path, [pub])
+        assert main(["verify", str(path)]) == 2
 
 
-@pytest.mark.parametrize("damage", [lambda packed: packed[:-30], lambda packed: packed[:len(packed) // 2],
-                                    lambda packed: packed + b"more bytes", lambda packed: packed[:10]],
-                         ids=["end-cut", "half", "bytes-after", "header-only"])
-def test_a_gzip_file_that_cannot_be_read_to_its_end_is_invalid(evidence, tmp_path, pub, damage):
-    packed = tmp_path / "e.jsonl.gz"
-    packed.write_bytes(damage(gzip.compress(evidence.read_bytes())))
-    report = verify_file(packed, [pub])
-    assert not report.ok and "gzip" in errors(report)
-    (said,) = messages(report, "gzip")
-    assert said.startswith("this is a gzip file and it could not be read to its end: it is damaged or cut short")
+def test_the_gzip_bytes_only_count_at_the_start_of_a_file(evidence, pub):
+    evidence.write_bytes(evidence.read_bytes() + b"\x1f\x8b\x08\n")
+    report = verify_file(evidence, [pub])
+    assert not report.ok and errors(report) == ["parse"]
 
 
-def test_one_line_of_a_gzip_file_has_a_limit(evidence, tmp_path, pub, monkeypatch):
-    assert mnestiq.verify.MAX_GZIP_LINE == 64 * 1024 * 1024
-    longest = max(len(line) for line in lines_of(evidence))
-    packed = tmp_path / "e.jsonl.gz"
-    packed.write_bytes(gzip.compress(evidence.read_bytes()))
-    monkeypatch.setattr(mnestiq.verify, "MAX_GZIP_LINE", longest)
-    assert verify_file(packed, [pub]).ok  # a line of exactly the limit is read
-    monkeypatch.setattr(mnestiq.verify, "MAX_GZIP_LINE", longest - 1)
-    report = verify_file(packed, [pub])
-    assert not report.ok and "gzip" in errors(report)
-    assert f"one line of it is longer than {longest - 1} bytes once unpacked" in messages(report, "gzip")[0]
-    # A small file that unpacks to one endless line stops at the limit and is not read into memory.
-    monkeypatch.setattr(mnestiq.verify, "MAX_GZIP_LINE", 4096)
-    packed.write_bytes(gzip.compress(b" " * 5_000_000))
-    report = verify_file(packed, [pub])
-    assert errors(report) == ["empty", "gzip"] and report.records == 0
+def test_nothing_of_the_gzip_reader_is_left():
+    for name in ("MAX_GZIP_LINE", "GzipError", "file_lines", "_gzip_lines"):
+        assert not hasattr(mnestiq.verify, name)
 
 
-def test_the_other_commands_say_to_unpack_a_gzip_file_first(evidence, tmp_path, pub, capsys):
+def test_the_dashboard_says_that_it_does_not_read_a_gzip_file(evidence, tmp_path, pub):
     packed = tmp_path / "packed.jsonl"
     packed.write_bytes(gzip.compress(evidence.read_bytes()))
-    for command in (["inspect", str(packed)], ["redact", str(packed), str(tmp_path / "copy.jsonl")]):
-        assert main(command) == 2
-        assert "is a gzip file. Unpack it first" in capsys.readouterr().err
-    assert not (tmp_path / "copy.jsonl").exists()
     body = page(packed, pub)
     assert not body["report"]["ok"] and body["records"] == []
     assert "gzip file, which the dashboard does not read" in body["report"]["errors"][0]["message"]
@@ -1103,3 +1098,377 @@ def test_an_integer_field_written_with_a_fraction_or_an_exponent_is_an_error(evi
     evidence.write_bytes(b"".join(lines))
     report = verify_file(evidence, [pub])
     assert not report.ok and "seq" in errors(report)
+
+
+# --- 14. checking stops after a fixed number of problems ------------------------------------------------------------
+
+STOPPED = ("checking stopped at line {line}, after {count} problems. The rest of the file was not read, so this "
+           "report is for the lines up to there only")
+
+
+def test_the_verifier_and_the_dashboard_stop_at_the_same_number():
+    assert mnestiq.verify.MAX_PROBLEMS == 1000
+    assert not hasattr(mnestiq.dashboard, "MAX_ERRORS") and not hasattr(mnestiq.dashboard, "_VERIFY_BATCH")
+
+
+def test_verify_stops_after_a_thousand_problems(tmp_path, pub, capsys):
+    """The finding: a megabyte of line ends kept a problem for every line, about 820 MB of them."""
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(b"\n" * 1_000_000)
+    report = verify_file(path, [pub])
+    assert not report.ok and len(report.errors) == 1001
+    assert errors(report) == ["parse", "too_many_problems"]  # and not "empty": the rest was not read
+    last = report.errors[-1]
+    assert last.code == "too_many_problems" and last.message == STOPPED.format(line=1000, count=1000)
+    assert main(["verify", str(path), "--trusted-key", pub]) == 1
+    out = capsys.readouterr().out
+    assert len(out) < 200_000 and out.splitlines()[-1].endswith(STOPPED.format(line=1000, count=1000))
+    assert main(["verify", str(path), "--json"]) == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["ok"] is False and body["errors"][-1]["code"] == "too_many_problems"
+
+
+def test_a_line_that_is_no_record_counts_towards_the_stop(tmp_path, pub):
+    """The finding: every line of {} went through the schema check, with no stop: 46 s for a megabyte."""
+    stream = io.BytesIO(b"{}\n" * 300_000)
+    verifier = ChainVerifier([pub])
+    verifier.feed_file(stream)
+    assert verifier.stopped_at is not None and verifier.stopped_at <= 1000
+    assert stream.tell() == 3 * verifier.stopped_at  # not one byte past the line it stopped at
+    report = verifier.result()
+    assert report.records == verifier.stopped_at and report.errors[-1].code == "too_many_problems"
+    assert report.errors[-1].message == STOPPED.format(line=verifier.stopped_at, count=len(report.errors) - 1)
+
+
+def test_no_line_is_taken_after_the_stop(pub):
+    taken = []
+
+    def lines():
+        for n in range(5000):
+            taken.append(n)
+            yield b"not json"
+
+    verifier = ChainVerifier([pub])
+    verifier.feed(lines())
+    assert len(taken) == 1000 and verifier.stopped_at == 1000 and verifier.lines == 1000
+    more = iter([b"a", b"b", b"c"])
+    verifier.feed(more)  # a later pass over a growing file: nothing is taken
+    assert list(more) == [b"a", b"b", b"c"] and verifier.lines == 1000
+    verifier.feed_parsed({"kind": "event"})
+    verifier.feed_file(io.BytesIO(b"x\n"))
+    assert verifier.lines == 1000 and len(verifier.report.errors) == 1000
+    for report in (verifier.result(), verifier.result(), verify_lines(lines(), [pub])):
+        assert [e.code for e in report.errors[-2:]] == ["parse", "too_many_problems"] and len(report.errors) == 1001
+
+
+def test_the_records_before_the_stop_are_reported_and_nothing_is_said_about_the_rest(evidence, pub):
+    full = verify_file(evidence, [pub])
+    evidence.write_bytes(evidence.read_bytes() + b"x\n" * 3000 + CUT)
+    report = verify_file(evidence, [pub])
+    assert not report.ok and report.records == full.records and report.checkpoints == full.checkpoints
+    assert errors(report) == ["parse", "too_many_problems"]
+    assert report.errors[-1].message == STOPPED.format(line=full.records + 1000, count=1000)
+    assert report.incomplete_tail_bytes == 0 and "incomplete_last_line" not in warnings(report)  # never reached
+
+
+def test_after_a_stop_the_head_and_the_witness_are_not_compared(evidence, tmp_path, pub):
+    """Compared with a part of the file they would say that records were removed from its end."""
+    head = load(evidence)[-1]
+    assert verify_file(evidence, [pub], head).head_seq == head["seq"]
+    evidence.write_bytes(b"\n" * 1000 + evidence.read_bytes())
+    report = verify_file(evidence, [pub], head)
+    assert errors(report) == ["parse", "too_many_problems"] and report.head_seq is None
+    assert report.errors[-1].message == (STOPPED.format(line=1000, count=1000)
+                                         + ". The file was not compared with the head")
+    report = verify_file(evidence, [pub], head, witness=tmp_path)
+    assert errors(report) == ["parse", "too_many_problems"] and report.witness is None
+    assert report.errors[-1].message.endswith(". The file was not compared with the head or the witness log")
+    report = verify_file(evidence, [pub], witness=tmp_path)
+    assert report.errors[-1].message.endswith(". The file was not compared with the witness log")
+
+
+def test_inspect_and_the_dashboard_stop_where_the_verifier_stops(tmp_path, pub, capsys):
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(b"x\n" * 50_000)
+    assert main(["inspect", str(path)]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 1000 + 3
+    assert out[-3] == "1000 record(s) could not be read. Run `mnestiq verify` on this file."
+    assert out[-2] == "The listing stops at line 1000: too many problems. The rest of the file was not read."
+    assert out[-1].startswith("This file does NOT verify: 1001 problem(s).")
+    body = page(path, pub)
+    assert body["records_total"] == 1000 and body["report"]["errors_total"] == 1001
+    assert body["report"]["errors"][0]["code"] == "too_many_problems"  # first, where the page shows it
+    assert body["report"]["errors"][0]["message"] == STOPPED.format(line=1000, count=1000)
+    copy = tmp_path / "copy.jsonl"
+    assert main(["redact", str(path), str(copy)]) == 2 and not copy.exists()
+
+
+def test_only_the_first_thousand_warnings_about_single_records_are_kept(tmp_path, key, pub, capsys):
+    path = tmp_path / "e.jsonl"
+    with Recorder(FileSink(path), agent_id="a", signing_key=key, context_delta=False) as rec, rec.run() as run:
+        for _ in range(300):
+            run.llm_call(provider="p", model="m", output="ok",
+                         context=[Segment("user", text) for text in ("one", "two", "three", "four")])
+    records = load(path)
+    for r in records:
+        for segment in r.get("context") or []:
+            del segment["content"]  # redacted by hand, the salt left: one warning for each, and no hash changes
+    dump(path, records)
+    report = verify_file(path, [pub])
+    assert report.ok, report.errors
+    assert [w.code for w in report.warnings[:1000]] == ["salt"] * 1000 and report.more_warnings == 200
+    assert report.warnings[1000].code == "too_many_warnings"
+    assert report.warnings[1000].message == ("200 more warning(s) about single records are not listed: only the "
+                                             "first 1000 are kept")
+    assert [w.code for w in report.warnings[1001:]] == ["redacted"]  # what is said of the whole file is kept
+    assert verify_file(path, [pub]).to_dict() == report.to_dict()
+    assert main(["verify", str(path), "--trusted-key", pub]) == 0
+    assert "warning too_many_warnings: 200 more warning(s)" in capsys.readouterr().out
+
+
+# --- 15. a recorder decides before it changes a file ----------------------------------------------------------------
+
+def _refused_and_untouched(path, key, before, match):
+    """Open ``path`` as a recorder would. Nothing in the folder may change, and every use must say why."""
+    folder = sorted(p.name for p in path.parent.iterdir())
+    sink = FileSink(path)
+    try:
+        assert path.read_bytes() == before and sink.recovered is None  # opening it changed nothing
+        with pytest.raises(SinkError, match=match):
+            list(sink.existing())
+        with pytest.raises(SinkError, match=match):
+            sink.append({"seq": 0})
+        with pytest.raises(RecorderError, match=match):
+            Recorder(sink, agent_id="a", signing_key=key)
+    finally:
+        sink.close()
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in path.parent.iterdir()) == folder  # no side file, and none set aside
+
+
+def test_a_recorder_leaves_a_gzip_evidence_file_as_it_was(evidence, key, pub):
+    """The finding: the last bytes of a gzip file look like a cut write. They were cut into a side file, and the
+    file was then refused."""
+    before = gzip.compress(evidence.read_bytes())
+    evidence.write_bytes(before)
+    _refused_and_untouched(evidence, key, before, "is a gzip file. Unpack it first")
+
+
+def test_a_recorder_leaves_a_file_with_a_blank_line_and_a_part_of_a_record_as_it_was(evidence, key):
+    before = evidence.read_bytes() + b"\n" + b'{"a'
+    evidence.write_bytes(before)
+    line = before.count(b"\n")
+    _refused_and_untouched(evidence, key, before, rf"line {line} cannot be read \(line is blank")
+
+
+def test_a_recorder_leaves_a_file_that_ends_in_an_empty_object_as_it_was(evidence, key):
+    before = evidence.read_bytes() + b"{}"
+    evidence.write_bytes(before)
+    line = before.count(b"\n") + 1
+    _refused_and_untouched(evidence, key, before,
+                           rf"line {line} cannot be read \(it is not a record of an evidence chain\)")
+
+
+def test_a_recorder_leaves_a_text_file_that_is_no_evidence_as_it_was(tmp_path, key):
+    path = tmp_path / "e.jsonl"
+    before = b"notes on the run\nmore to come"
+    path.write_bytes(before)
+    _refused_and_untouched(path, key, before, r"line 1 cannot be read \(line is not valid JSON")
+
+
+def test_a_recorder_leaves_a_file_that_ends_in_a_record_of_another_chain_as_it_was(evidence, key):
+    other = dict(load(evidence)[-1], chain_id="another")
+    before = evidence.read_bytes() + canonical_json(other)
+    evidence.write_bytes(before)
+    _refused_and_untouched(evidence, key, before, "it belongs to another chain than the lines before it")
+
+
+def test_a_cut_write_after_whole_records_is_still_set_aside(evidence, tmp_path, key, pub):
+    whole = evidence.read_bytes()
+    evidence.write_bytes(whole + CUT)
+    with Recorder(FileSink(evidence), agent_id="support-bot", signing_key=key) as rec, rec.run() as run:
+        run.note("back")
+    (side,) = tmp_path.glob("e.jsonl.torn-*")
+    assert side.read_bytes() == CUT and evidence.read_bytes().startswith(whole + b"{")
+    assert verify_file(evidence, [pub]).ok
+
+
+def test_a_file_that_is_only_a_cut_first_record_is_still_recovered(tmp_path, key, pub):
+    path = tmp_path / "e.jsonl"
+    path.write_bytes(CUT)
+    with Recorder(FileSink(path), agent_id="a", signing_key=key) as rec, rec.run() as run:
+        run.note("first")
+    (side,) = tmp_path.glob("e.jsonl.torn-*")
+    assert side.read_bytes() == CUT and verify_file(path, [pub]).ok
+
+
+def test_a_refused_file_is_set_aside_whole_when_the_recorder_is_told_to(evidence, tmp_path, key, pub):
+    for n, before in enumerate((gzip.compress(evidence.read_bytes()), evidence.read_bytes() + b"\n" + b'{"a')):
+        folder = tmp_path / str(n)
+        folder.mkdir()
+        path = folder / "e.jsonl"
+        path.write_bytes(before)
+        rec = Recorder(FileSink(path), agent_id="a", signing_key=key, on_damaged="new_file")
+        with rec.run() as run:
+            run.note("a new chain")
+        rec.close()
+        (aside,) = folder.glob("e.jsonl.damaged-*")
+        assert aside.read_bytes() == before  # the whole file, byte for byte, and no part of it in a side file
+        assert not list(folder.glob("*.torn-*")) and verify_file(path, [pub]).ok
+
+
+# --- 16. an integer field is written as an integer, in every field -----------------------------------------------
+
+INTEGER_FIELDS = [rb'"step_id":(\d+)', rb'"mono_us":(\d+)', rb'"from_seq":(\d+)', rb'"to_seq":(\d+)',
+                  rb'"latency_ms":(\d+)']
+
+
+@pytest.mark.parametrize("field", INTEGER_FIELDS, ids=lambda f: f.split(b'"')[1].decode())
+@pytest.mark.parametrize("spelling", [b".0", b"e0", b"E0", b".00", b"e+0"])
+def test_an_integer_written_with_a_fraction_or_an_exponent_is_an_error_in_every_field(evidence, pub, field, spelling):
+    """The finding: JSON Schema calls 1.0 an integer, so only seq was refused. The canonical bytes are those of
+    the integer, so no hash and no signature changes: only this rule can refuse it."""
+    data = evidence.read_bytes()
+    assert re.search(field, data)
+    changed = re.sub(field, lambda m: m.group(0) + spelling, data, count=1)
+    assert changed != data
+    evidence.write_bytes(changed)
+    report = verify_file(evidence, [pub])
+    assert not report.ok and "schema" in errors(report)
+    assert not {"record_hash", "signature", "merkle_root", "link"} & set(errors(report))
+    assert any("is a whole number written with a fraction or an exponent: an integer field holds it written as "
+               "an integer" in said for said in messages(report, "schema"))
+
+
+@pytest.mark.parametrize("field", [b'"seq":0,', b'"step_id":0,', b'"from_seq":0,'],
+                         ids=["seq", "step_id", "from_seq"])
+def test_minus_zero_in_an_integer_field_is_an_error(evidence, pub, field):
+    data = evidence.read_bytes()
+    assert data.count(field) >= 1
+    evidence.write_bytes(data.replace(field, field.replace(b":0,", b":-0,"), 1))
+    report = verify_file(evidence, [pub])
+    assert errors(report) == ["schema"]
+    name = field.split(b'"')[1].decode()
+    where = "covers/from_seq" if name == "from_seq" else name
+    assert messages(report, "schema") == [f"{where}: -0 is not accepted in an integer field: zero is written 0"]
+
+
+def test_minus_zero_stays_what_it_was_in_a_field_that_is_not_typed_as_an_integer(tmp_path, key, pub):
+    path = tmp_path / "e.jsonl"
+    with Recorder(FileSink(path), agent_id="a", signing_key=key) as rec, rec.run() as run:
+        run.note("a count", count=0)
+    data = path.read_bytes()
+    assert data.count(b'"count":0,') == 1
+    path.write_bytes(data.replace(b'"count":0,', b'"count":-0,'))
+    report = verify_file(path, [pub])
+    assert report.ok and report.warnings == []
+    assert parse_json("-0") == 0 and canonical_json(parse_json('{"a":-0}')) == b'{"a":0}'
+    assert json.dumps(parse_json("[-0]")) == "[0]"
+
+
+def test_minus_zero_cannot_take_a_warning_away(tmp_path, key, pub):
+    """A note of the recorder is read by its numbers. Written -0, a 0 in it is still the 0 it was."""
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signing_key=key, checkpoint_every=1000)
+    with rec.run() as run:
+        run.note("not signed yet")
+    rec._sink.close()  # as a crash leaves it: records from seq 0 with no checkpoint
+    with Recorder(FileSink(path), agent_id="a", signing_key=key):
+        pass
+    report = verify_file(path, [pub])
+    assert report.ok and "signed_after_restart" in warnings(report)
+    data = path.read_bytes()
+    assert data.count(b'"first_seq":0,') == 1
+    path.write_bytes(data.replace(b'"first_seq":0,', b'"first_seq":-0,'))
+    again = verify_file(path, [pub])
+    assert again.ok and warnings(again) == warnings(report) and again.restarts == report.restarts
+
+
+def test_the_recorder_still_writes_a_whole_number_it_was_given_as_a_float(tmp_path, key, pub):
+    path = tmp_path / "e.jsonl"
+    with Recorder(FileSink(path), agent_id="a", signing_key=key, strict=True) as rec, rec.run() as run:
+        run.tool_call("fetch", {"u": "x"}, "ok", latency_ms=12.0)
+        run.llm_call(provider="p", model="m", context=[Segment("user", "hi")], output="ok", latency_ms=250.0,
+                     usage={"input_tokens": 7.0, "output_tokens": 3})
+    data = path.read_bytes()
+    assert b'"latency_ms":12,' in data and b'"latency_ms":250,' in data and b"12.0" not in data
+    assert verify_file(path, [pub]).ok
+    record = load(path)[1]
+    assert schema_problem({**record, "step_id": 1.0}) is None  # written as 1, which is what the verifier reads
+    assert (schema_problem({**record, "step_id": 1.0}, as_read=True) or "").startswith("step_id:")
+    assert (schema_problem({**record, "step_id": 1.5}) or "").startswith("step_id:")
+
+
+def test_a_recorder_does_not_continue_an_unsigned_record_with_an_integer_respelled(tmp_path, key):
+    path = record_demo(tmp_path / "e.jsonl", key, close=False)  # three records after the last checkpoint
+    lines = lines_of(path)
+    changed, count = re.subn(rb'"step_id":(\d+)', lambda m: m.group(0) + b".0", lines[-1], count=1)
+    assert count == 1
+    before = b"".join([*lines[:-1], changed])
+    path.write_bytes(before)
+    sink = FileSink(path)
+    try:
+        with pytest.raises(RecorderError, match=r"failed verification \(schema\)"):
+            Recorder(sink, agent_id="support-bot", signing_key=key)
+    finally:
+        sink.close()
+    assert path.read_bytes() == before
+
+
+def test_the_smallest_files_of_the_finding_would_be_refused():
+    for value in (1.0, 0.0, 1000000.0):
+        assert not mnestiq.verify.is_written_integer(value)
+    assert mnestiq.verify.is_written_integer(0) and mnestiq.verify.is_written_integer(2 ** 53 - 1)
+    assert not mnestiq.verify.is_written_integer(True) and not mnestiq.verify.is_written_integer(parse_json("-0"))
+    assert not mnestiq.verify.is_written_integer(parse_json("9007199254740992"))  # past 2^53 - 1: read as a double
+
+
+# --- 17. a pinned key is given in canonical base64 ---------------------------------------------------------------
+
+BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+
+def _spare_bit(pin):
+    """The same key bytes with a spare bit of the last letter set."""
+    at = len(pin.rstrip("=")) - 1
+    other = pin[:at] + BASE64[BASE64.index(pin[at]) + 1] + pin[at + 1:]
+    assert other != pin and base64.b64decode(other) == base64.b64decode(pin)
+    return other
+
+
+@pytest.mark.parametrize("kind", ["ed25519", P256])
+def test_a_pinned_key_in_any_other_spelling_is_refused(tmp_path, capsys, kind):
+    key = generate_private_key(kind)
+    pub = public_key_b64(key)
+    path = record_demo(tmp_path / "e.jsonl", key)
+    others = [_spare_bit(pub), pub.rstrip("="), pub + "=", pub[:10] + " " + pub[10:], pub[:10] + "\n" + pub[10:],
+              pub.replace("+", "-").replace("/", "_"), "not a key"]
+    for other in [o for o in others if o != pub]:
+        for use in (lambda pin=other: verify_file(path, [pin]), lambda pin=other: ChainVerifier([pin]),
+                    lambda pin=other: verify_lines([], [pub, pin])):
+            with pytest.raises(ValueError, match="a trusted key is refused: it is not a public key written in "
+                                                 "canonical base64"):
+                use()
+        # given as one word: a key written in the URL alphabet can start with "-", which reads as an option
+        assert main(["verify", str(path), f"--trusted-key={other}"]) == 2
+        said = capsys.readouterr()
+        assert "is refused: it is not a file, and it is not a public key written in canonical base64" in said.err
+        assert said.out == ""
+    assert verify_file(path, [pub]).ok
+
+
+def test_a_pinned_key_with_space_around_it_or_in_a_file_is_accepted_as_before(evidence, tmp_path, pub, capsys):
+    for given in (pub, " " + pub, pub + "\n", "\t" + pub + " \r\n"):
+        assert load_public_key_b64(given) == pub
+        assert main(["verify", str(evidence), "--trusted-key", given]) == 0
+    for text in (pub, pub + "\n", "  " + pub + "\r\n"):
+        keyfile = tmp_path / "pin.pub"
+        keyfile.write_text(text, "ascii", newline="")
+        assert main(["verify", str(evidence), "--trusted-key", str(keyfile)]) == 0
+    assert "VALID" in capsys.readouterr().out
+    keyfile.write_text(_spare_bit(pub) + "\n", "ascii")
+    assert main(["verify", str(evidence), "--trusted-key", str(keyfile)]) == 2
+    assert "canonical base64" in capsys.readouterr().err
+    assert main(["dashboard", str(evidence), "--trusted-key", _spare_bit(pub), "--no-open"]) == 2
+    assert "canonical base64" in capsys.readouterr().err

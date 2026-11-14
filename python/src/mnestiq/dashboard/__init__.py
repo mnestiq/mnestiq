@@ -36,16 +36,14 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..context import expand
 from ..findings import findings
-from ..verify import GZIP_MAGIC, ChainVerifier, EvidenceLines, Issue, LineError, Report, is_blank, parse_line
+from ..verify import GZIP_MAGIC, ChainVerifier, EvidenceLines, LineError, Report, is_blank, parse_line
 
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 MAX_RECORDS = 20_000   # sent to the browser per file, verification and the rules still read everything
 MAX_EARLIER_FINDINGS = 20_000  # findings on records before those sent, listed on the page: the page says how many more
-MAX_ERRORS = 1_000     # a file is checked until it has this many problems
 MAX_LOAD_BYTES = 256 * 1024 * 1024  # the largest file read into memory and verified here
-_VERIFY_BATCH = 1_024  # lines verified between looks at how many problems were found
 MAX_CACHED = 32        # files whose prepared answer is kept in memory
 SNIFF_LINES = 200      # lines read to tell an evidence file from other JSON lines in the folder
 SNIFF_BYTES = 64 * 1024 * 1024  # how far into a file to look for evidence: past this, it cannot be ruled out
@@ -138,25 +136,24 @@ class EvidenceStore:
                 return cached
         if data[:2] == GZIP_MAGIC:
             return self._unrecognised(path, st, "this is a gzip file, which the dashboard does not read. It was not "
-                                                "verified. Run mnestiq verify on it, or unpack it first")
+                                                "verified. Unpack it first")
         # As the verifier splits a file: at LF only, and bytes after the last LF are a line only as a whole record.
         split = EvidenceLines(io.BytesIO(data))
-        stream = iter(split)
         lines: list[bytes] = []
-        # Verification covers the whole file unless it is past saving. The browser only gets the most recent records.
+
+        def read() -> Iterator[bytes]:
+            for raw in split:  # only the lines the verifier takes: it stops at too many problems
+                lines.append(raw)
+                yield raw
+
+        # Verification covers the whole file unless it is past saving: the verifier stops after MAX_PROBLEMS
+        # errors and says where. The browser only gets the most recent records.
         verifier = ChainVerifier(self.trusted_keys)
-        while len(verifier.report.errors) < MAX_ERRORS and (batch := list(islice(stream, _VERIFY_BATCH))):
-            verifier.feed(batch)
-            lines.extend(batch)
-        unchecked = sum(1 for _ in stream)  # also reads to the end, which is where the last bytes are judged
+        verifier.feed(read())
         verifier.end_of_file(split)
-        if unchecked:  # a last line with no line end was then not read, and must not be said to have been
-            verifier.no_final_newline = False
         report = verifier.result()
-        if unchecked:  # first in the list, so that the cut below keeps it
-            report.errors.insert(0, Issue("too_many_errors", f"checking stopped at line {len(lines)}, after "
-                                          f"{len(report.errors)} problems. The rest of this file was not checked. "
-                                          "Run mnestiq verify on it"))
+        # The error that says checking stopped comes first, where the page shows it without scrolling.
+        report.errors.sort(key=lambda issue: issue.code != "too_many_problems")
         records: deque[dict] = deque(maxlen=self.max_records)
         total = 0
         # A record of a shape the recorder never writes goes to the page as text only: the page reads fields
@@ -191,7 +188,6 @@ class EvidenceStore:
         }
         report_dict = report.to_dict()
         report_dict["errors_total"] = len(report.errors)
-        report_dict["errors"] = report_dict["errors"][:MAX_ERRORS]
         body = {"file": summary, "report": report_dict, "pinned": bool(self.trusted_keys),
                 "records": list(records), "records_total": total,
                 "records_shown_from": total - len(records),

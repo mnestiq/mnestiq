@@ -217,11 +217,19 @@ def load_private_key(path: str | Path) -> PrivateKey:
 
 
 def load_public_key_b64(value: str) -> str:
-    """Accept a path to a .pub file or a literal base64 key; return base64."""
+    """Accept a path to a .pub file or a literal base64 key, with spaces or a line end around it. Returns the
+    base64 text. The key must be in the canonical base64 of its bytes: any other spelling is refused."""
     candidate = Path(value)
     if candidate.is_file():
         value = candidate.read_text(encoding="ascii")
     value = value.strip()
+    try:
+        canonical = base64.b64encode(base64.b64decode(value, validate=True)).decode("ascii") == value
+    except ValueError:  # also text that is not ASCII
+        canonical = False
+    if not canonical:
+        raise ValueError(f"the public key {value[:12]}... is refused: it is not a file, and it is not a public key "
+                         "written in canonical base64")
     try:
         load_public_key(value)  # validates length/encoding
     except WeakKeyError as exc:

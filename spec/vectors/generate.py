@@ -181,6 +181,24 @@ def reading_variants(good: list[dict]) -> dict[str, tuple[bytes, str, dict]]:
                                  "missing.",
                                  {"ok": True, "errors": [], "warnings": ["no_final_newline"]})
 
+    # A field the schema types as an integer holds an integer written as one. Both spellings below have the
+    # canonical bytes of the integer, so every hash and the signature still hold: only this rule refuses them.
+    fraction = list(lines)
+    assert fraction[1].count(b'"step_id":1,') == 1
+    fraction[1] = fraction[1].replace(b'"step_id":1,', b'"step_id":1.0,')
+    out["integer-with-fraction"] = (b"\n".join(fraction) + b"\n",
+                                    "step_id of the record at seq 1 written 1.0. An integer field is written "
+                                    "without a fraction or an exponent, in every field the schema types as an "
+                                    "integer.",
+                                    {"ok": False, "errors": ["schema"], "warnings": []})
+    minus = list(lines)
+    assert minus[0].count(b'"seq":0,') == 1
+    minus[0] = minus[0].replace(b'"seq":0,', b'"seq":-0,')
+    out["integer-minus-zero"] = (b"\n".join(minus) + b"\n",
+                                 "seq of the first record written -0. Zero has one spelling in an integer "
+                                 "field, 0.",
+                                 {"ok": False, "errors": ["schema"], "warnings": []})
+
     # Whole numbers past 2^53 - 1 are doubles. Canonical JSON writes each in one way: 2^53 in full, and 2^63 as
     # its shortest digits and zeros, which is not the exact integer of that double (9223372036854775808).
     large = chain(with_attributes({"bytes_sent": 2.0 ** 53, "bytes_limit": 2.0 ** 63}))

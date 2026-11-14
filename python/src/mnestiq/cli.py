@@ -22,8 +22,8 @@ from .verify import (
     LineError,
     Report,
     _unknown_fields,
-    is_gzip,
     parse_line,
+    refuse_gzip,
     schema_problem,
     verify_file,
 )
@@ -369,6 +369,9 @@ def _inspect(args: argparse.Namespace) -> int:
         _say(f"{unreadable} record(s) could not be read. Run `mnestiq verify` on this file.")
     if report.incomplete_tail_bytes:
         _say(f"The last {report.incomplete_tail_bytes} byte(s) of the file have no line end and are not listed.")
+    if verifier.stopped_at is not None:
+        _say(f"The listing stops at line {verifier.stopped_at}: too many problems. The rest of the file was not "
+             "read.")
     if report.ok:
         _say("This listing is not a check. The file verified without a pinned key, so who signed it was not "
              "checked. Run `mnestiq verify --trusted-key` for that.")
@@ -380,16 +383,16 @@ def _inspect(args: argparse.Namespace) -> int:
 
 @contextlib.contextmanager
 def _open_plain(path: str | Path) -> Iterator[BinaryIO]:
-    """An evidence file opened for reading. A gzip file is refused: only ``mnestiq verify`` unpacks one."""
+    """An evidence file opened for reading. A gzip file is refused, as ``mnestiq verify`` refuses it: no command
+    unpacks one."""
     with open(path, "rb") as fh:
-        if is_gzip(fh):
-            raise ValueError(f"{path} is a gzip file. Unpack it first: only `mnestiq verify` reads a gzip file")
+        refuse_gzip(fh, path)
         yield fh
 
 
 def _parsed_lines(lines: Iterable[bytes], verifier: ChainVerifier | None = None) -> Iterator[Any]:
     """Each line parsed, as the verifier reads it. A line it refuses comes through as None, in its place.
-    ``verifier`` is fed every line too."""
+    ``verifier`` is fed every line too, and the lines end where it stops reading."""
     for raw in lines:
         if verifier is not None:
             verifier.feed([raw])
@@ -397,6 +400,8 @@ def _parsed_lines(lines: Iterable[bytes], verifier: ChainVerifier | None = None)
             yield parse_line(raw)
         except LineError:
             yield None
+        if verifier is not None and verifier.stopped_at is not None:
+            return  # too many problems: the verifier reads no further, and neither does the listing
 
 
 def _inspect_line(rec: dict) -> str:

@@ -1272,9 +1272,11 @@ def _damage_reason(damage: Exception) -> str:
 
 
 def _refuse_bad_schema(records: list[dict]) -> None:
-    """Raise ``RecorderError`` for the first of ``records`` that breaks the schema."""
+    """Raise ``RecorderError`` for the first of ``records`` that breaks the schema. They were read from the file
+    and are judged as they were written there: an integer field spelled ``1.0`` is refused, as by the verifier."""
     for record in records:
-        if schema_problem(record, show_value=False):  # by code only: this message goes to the agent's logs
+        # By code only: this message goes to the agent's logs.
+        if schema_problem(record, show_value=False, as_read=True):
             raise RecorderError(f"record {record.get('seq')!r} failed verification (schema). {_REFUSED}")
 
 
