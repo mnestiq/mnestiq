@@ -14,7 +14,9 @@ import pytest
 from mnestiq import FileSink, HeadFile, Recorder, SinkError, verify_file
 from mnestiq.canonical import canonical_json
 
-BEFORE = b"line one\nline two with no newline"
+# A file a recorder can continue, as far as a sink can tell: one record of a chain, then a part of the next.
+FIRST = b'{"chain_id":"c","record_hash":"h","seq":0}\n'
+BEFORE = FIRST + b'{"chain_id":"c","rec'
 
 
 @pytest.fixture
@@ -60,22 +62,22 @@ def test_a_file_replaced_before_recovery_is_not_cut_and_stays_unlocked(torn, mon
             FileSink(torn)
     assert torn.read_bytes() == BEFORE
     FileSink(torn).close()  # the failed open left no lock behind, and recovery runs as usual
-    assert torn.read_bytes() == b"line one\n"
+    assert torn.read_bytes() == FIRST
 
 
 # Which tails are one torn record
 
 
-WHOLE = b'{"prev_hash":"aa","result":{"prev_hash":"ab"},"seq":1}'
+WHOLE = b'{"chain_id":"c","prev_hash":"aa","record_hash":"h","result":{"prev_hash":"ab"},"seq":1}'
 
 
 def test_a_torn_record_that_holds_a_prev_hash_key_of_its_own_is_set_aside(tmp_path):
     path = tmp_path / "e.jsonl"
     torn = WHOLE[:-4]
-    path.write_bytes(b'{"seq":0}\n' + torn)
+    path.write_bytes(FIRST + torn)
     sink = FileSink(path)
     sink.close()
-    assert path.read_bytes() == b'{"seq":0}\n'
+    assert path.read_bytes() == FIRST
     assert (tmp_path / sink.recovered["sidecar"]).read_bytes() == torn
 
 
@@ -106,16 +108,16 @@ def test_a_recorder_starts_over_a_torn_tool_result_that_holds_a_prev_hash_key(tm
                          ids=["brackets_in_a_string", "an_escaped_quote", "still_open", "cut_inside_an_escape"])
 def test_brackets_inside_a_string_do_not_make_a_torn_record_look_like_several(tmp_path, tail):
     path = tmp_path / "e.jsonl"
-    path.write_bytes(b'{"seq":0}\n' + tail)
+    path.write_bytes(FIRST + tail)
     FileSink(path).close()
-    assert path.read_bytes() == b'{"seq":0}\n'
+    assert path.read_bytes() == FIRST
 
 
 @pytest.mark.parametrize("tail", [b'{"seq":1}{"seq":2', b'{"seq":1} {"seq":2}', b'[1]x', b'{"a":"}"}{'],
                          ids=["torn_second", "two_whole", "array_then_text", "string_then_open"])
 def test_a_value_that_closes_before_the_end_of_the_line_is_damage_and_stays(tmp_path, tail):
     path = tmp_path / "e.jsonl"
-    before = b'{"seq":0}\n' + tail
+    before = FIRST + tail
     path.write_bytes(before)
     FileSink(path).close()
     assert path.read_bytes() == before and not list(tmp_path.glob("*.torn-*"))
@@ -159,7 +161,7 @@ def test_a_hard_linked_file_with_a_torn_tail_is_refused_and_keeps_every_byte(tmp
     assert not list(tmp_path.glob("*.torn-*"))
     other.unlink()
     FileSink(torn).close()  # the failed open left no lock behind, and with one name the cut is safe
-    assert torn.read_bytes() == b"line one\n"
+    assert torn.read_bytes() == FIRST
 
 
 def test_a_hard_linked_file_that_needs_no_cut_is_opened(tmp_path):
@@ -173,10 +175,10 @@ def test_a_hard_linked_file_that_needs_no_cut_is_opened(tmp_path):
 
 def test_a_hard_linked_file_missing_only_its_newline_gets_it(tmp_path):
     path = tmp_path / "e.jsonl"
-    path.write_bytes(b'{"seq":0}')
+    path.write_bytes(FIRST[:-1])
     os.link(path, tmp_path / "snapshot.jsonl")
     FileSink(path).close()
-    assert path.read_bytes() == b'{"seq":0}\n'
+    assert path.read_bytes() == FIRST
 
 
 def test_a_path_that_names_another_file_than_the_one_opened_is_refused(torn, monkeypatch):

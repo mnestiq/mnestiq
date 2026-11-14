@@ -51,11 +51,11 @@ removed for sharing without breaking the chain. The format is in [SPEC.md](../sp
 | Cover rewritten records with a checkpoint "signed" with an algorithm the verifier doesn't know | Such records count as unsigned, and with a pinned key they are an error. A chain signed by a known key can't switch without a signed hand-over | `test_review_fixes.py::test_an_unknown_algorithm_checkpoint_cannot_hide_a_rewritten_tail` |
 | Point a model call at another call's context, or mix two files so the rules read the wrong one | The verifier checks every `context_base`, and readers look the base up by chain and run | `test_format_v1.py::test_a_wrong_base_is_an_error`, `test_review_fixes.py::test_records_of_two_chains_mixed_keep_their_own_context` |
 | A small file that makes readers copy one large context thousands of times | Carried context is budgeted, and a call cut short is marked, never shown as complete | `test_review_fixes.py::test_a_context_bomb_is_cut_off_not_expanded` |
-| A small file built to make a reader's patterns or lookups take minutes | Patterns take time in proportion to their text, and lookups have a work limit: what it stops comes back as MNQ-000, here and on the page | `test_redteam.py::test_quadratic_values_against_context` |
-| A number respelled (`4100` as `4100.0`) so the rules miss it while the hash stays the same | Numbers read as one text however the file spells them, in Python and on the page | `test_redteam.py::test_respelled_number_keeps_mnq004` |
-| A long run whose context can't be carried, so a finding quietly disappears | The rules report the call as MNQ-000: its context is incomplete | `test_redteam.py::test_carry_budget_marks_the_call_as_incomplete` |
-| Change a value, then redact it so the copy verifies | `redact` checks each value against its digest and refuses the file | `test_redteam.py::test_redact_refuses_a_changed_value` |
-| Redact a record holding a field this version does not know | `redact` refuses and says to upgrade: what such a field holds must not reach the copy | `test_redteam.py::test_redact_refuses_an_unknown_field_of_a_newer_minor` |
+| A small file built to make a reader's patterns or lookups take minutes | Patterns take time in proportion to their text, and lookups have a work limit: what it stops comes back as MNQ-000, here and on the page | `test_tampered_files.py::test_quadratic_values_against_context` |
+| A number respelled (`4100` as `4100.0`) so the rules miss it while the hash stays the same | Numbers read as one text however the file spells them, in Python and on the page | `test_tampered_files.py::test_respelled_number_keeps_mnq004` |
+| A long run whose context can't be carried, so a finding quietly disappears | The rules report the call as MNQ-000: its context is incomplete | `test_tampered_files.py::test_carry_budget_marks_the_call_as_incomplete` |
+| Change a value, then redact it so the copy verifies | `redact` checks each value against its digest and refuses the file | `test_tampered_files.py::test_redact_refuses_a_changed_value` |
+| Redact a record holding a field this version does not know | `redact` refuses and says to upgrade: what such a field holds must not reach the copy | `test_tampered_files.py::test_redact_refuses_an_unknown_field_of_a_newer_minor` |
 | A damaged or crafted file meant to crash the verifier, the rules or the dashboard | Every field of a valid file, and every optional or extension field it could carry, on appended lines too, is tried with values of the wrong type: each is reported as an error with everything found so far kept. A record the rules cannot read comes back as an MNQ-000 entry instead of being passed over, the dashboard shows it as text only, and `redact` refuses the file | `test_hostile_input.py` |
 
 ## The Evidence Vault
@@ -126,6 +126,12 @@ These are limits by design. We would rather you hear them from us.
    a plain digest that redaction leaves in place, so a guessed system prompt can still be confirmed. Only prompts, documents, model
    answers and tool arguments and results can be redacted: URLs, error messages and approval text
    stay. `verify` says how many fields were redacted, since the detection rules cannot see them.
+   Redaction is itself a change that verifies: anyone who holds the file can remove a redactable value.
+   No other value can take its place, because the digest stays. The salt of a value that is not in the
+   file (redacted, or left out by the recorder as too large) is not signed, since redaction has to be able
+   to remove it. Someone who holds the file can change or remove that salt and the file still verifies. They
+   cannot pass off another value as the recorded one, but they can make the true original fail its check.
+   Keep the salt with the original if you keep an original that the recorder left out.
 8. **The last checkpoint's timestamp.** A signature cannot cover its own timestamp token, and nothing
    signs the last checkpoint's `record_hash`. So the token of the final checkpoint can be removed and the
    file still verifies, with no warning. A head kept elsewhere (`--head`) or the vault shows the change.
@@ -140,7 +146,15 @@ These are limits by design. We would rather you hear them from us.
    chain id has no log to differ from, and `verify` only warns `witness_none`.
 12. **A record's hash covers its canonical form.** Respelling a number (`5` as `5.0`), changing the key order or
    JSON spacing, or writing a character as an escape (`\u0061`) leaves the hash the same. The bytes of the line
-   change and its values do not.
+   change and its values do not. `verify` refuses the respellings that another reader could take for another
+   value or another line: a whole number beyond 2^53 in any spelling but the canonical one, a
+   fraction or exponent in a field that holds an integer, a carriage return inside a record, and a blank line.
+13. **The end of a file.** A record is a line that ends with a line feed. A last line with no line feed is
+   read only if it is a whole record, and `verify` says that its line end is missing. Anything else after the
+   last line feed is not read as a record, and `verify` says how many bytes there are. A recorder that crashed
+   in the middle of a write leaves such bytes, and so does a copy taken while the file was being written. So
+   does someone who cuts the file there, which removes nothing that removing the whole unsigned line would not
+   (see 4).
 
 ## Detection is not perfect
 

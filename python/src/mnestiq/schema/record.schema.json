@@ -258,8 +258,9 @@
         },
         "signature": { "type": "string", "contentEncoding": "base64" },
         "timestamp_token": {
-          "description": "Optional RFC 3161 TimeStampToken (DER, base64) over the signature bytes.",
-          "type": ["string", "null"],
+          "description": "Optional RFC 3161 TimeStampToken (DER, base64) over the signature bytes. A checkpoint with no token leaves the field out.",
+          "type": "string",
+          "minLength": 1,
           "contentEncoding": "base64"
         }
       },

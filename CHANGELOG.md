@@ -7,6 +7,64 @@ different values: a missing model name, a role this version does not know, and a
 record are each written one way on every path. The rules find planted links and images they used to miss.
 Commands report the library's own errors in one line.
 
+### Stricter reading of evidence files
+
+A test of the verifier against about 148,000 changed files found no way to change a signed value or forge a
+signature and keep VALID. It did find ways to respell a file so that another program reads it differently, and
+places where the spec did not decide. `spec/SPEC.md` now decides them, with no new format version, and `verify`
+follows it. Nothing a recorder writes is read differently, with the one exception in the first point.
+
+- **A record is a line that ends with a line feed.** A last line with no line feed is read only if it is a
+  whole record, and `mnestiq verify` then warns `no_final_newline`. Anything else after the last line feed is
+  a part of a record: it is not read, and `mnestiq verify` reports it (warning `incomplete_last_line`, and
+  `incomplete_tail_bytes` in `--json`) and gives its verdict for the lines before it. Before, a file cut in
+  the middle of a write was INVALID. A file from a recorder that crashed in the middle of a write now
+  verifies, with that notice.
+- A blank line is an error. It used to be skipped. A recorder does not continue a file that holds records and
+  a blank line. A file that holds nothing but spaces and line ends is emptied and started as a new file.
+- `mnestiq verify` stops after 1,000 problems, says at which line (error `too_many_problems`), and does not
+  read the rest. It gives no verdict about a head or a witness for such a file. Warnings about single records
+  are kept up to 1,000 and the rest are counted. `inspect`, `redact` and the dashboard stop at the same point.
+  Before, every bad line was kept: a megabyte of them took most of a gigabyte of memory.
+- A carriage return is accepted only directly before the line feed. Anywhere else in a line it is an error.
+- A whole number beyond 2^53 - 1 that is written with digits alone is accepted only in the spelling canonical
+  JSON gives it. Before, `9007199254740993` was read as `9007199254740992` and the file stayed VALID.
+- A field the schema types as an integer must be written as an integer, in every such field. `1.0`, `1e0`
+  and `-0` are errors there. Before, only `seq` and the fields of `context_base` were held to this.
+- A record nested more than 128 levels deep is an error, and the recorder refuses to write one.
+- A salt must be base64 in its one canonical spelling wherever it stands, also next to a value that is redacted
+  or was left out. The same salt on two values of one record is an error. The `salt` warning no longer suggests
+  that a salt left without its value is the recorder's own. New warning `omitted_salt` for a value the recorder
+  left out whose salt is gone. A copy made by `mnestiq redact` gets it for each such value, since `redact`
+  removes those salts, and the warning says that this is expected there.
+- The schema's patterns are read as JSON Schema means them: a time or a salt with a newline after it no longer
+  passes. `timestamp_token` must be a non-empty string.
+- `next_key.sig_alg` must be the algorithm of the key it names.
+- An Ed25519 public key of small order is refused as a pinned key, in a checkpoint and in a hand-over. For such a
+  key anyone can write a signature that verifies. Thirty-two bytes that are not a point of the curve are refused
+  where the key is read.
+- A gzip file gets no verdict. `mnestiq verify`, `inspect` and `redact` print
+  `error: <file> is a gzip file. Unpack it first` and exit with code 2, and the Python calls raise
+  `GzipFileError`. Before, such a file was called INVALID. The dashboard shows a gzip file opened by name as
+  not verified, and does not list one in a folder. A recorder refuses a gzip file by name.
+- A pinned key must be the base64 of the key in its one canonical spelling. Space and a line end around it,
+  and the path of a `.pub` file, are accepted as before.
+- A recorder changes nothing in a file it refuses to continue. It decides first, and only then sets a part of
+  a record aside or adds a missing line end.
+- `mnestiq redact` verifies what it reads and writes nothing from a file that does not verify.
+- `mnestiq inspect` ends with a line that says whether the file verifies. Its listing was never a check, and it
+  now says so. Its exit code is unchanged.
+- The dashboard reuses a verdict only when the content of the file is unchanged. Before, an unchanged size and
+  modification time were enough.
+- New conformance vectors in `spec/vectors/` for these rules.
+
+Two limits are now stated in the spec and in `docs/threat-model.md`. The salt of a value that is not in the file
+is not signed: someone who holds the file can make the true original fail its check, and cannot make another
+value pass. And redaction is itself a change that verifies.
+
+The test suite gained 61 tests for checks of the verifier that no test covered. They were found by removing each
+check in turn and seeing whether a test failed.
+
 ### Changes you may notice
 
 - `mnestiq` commands report a `RecorderError`, `SinkError`, `SignerError` or `TimestampError` as one `error:`

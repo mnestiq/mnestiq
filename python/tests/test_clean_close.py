@@ -735,12 +735,11 @@ def test_a_file_over_the_size_limit_is_not_read(tmp_path, key, monkeypatch):
 
 
 def test_checking_stops_at_the_cap_and_says_so(tmp_path, monkeypatch):
-    monkeypatch.setattr(mnestiq.dashboard, "MAX_ERRORS", 5)
-    monkeypatch.setattr(mnestiq.dashboard, "_VERIFY_BATCH", 10)
+    monkeypatch.setattr(mnestiq.verify, "MAX_PROBLEMS", 5)  # the verifier's own limit, which the dashboard uses
     path = tmp_path / "e.jsonl"
     path.write_bytes(b'{"spec_version":"1.0","chain_id":"x"}\n' + b"x\n" * 5000)
     body = json.loads(EvidenceStore(tmp_path, []).load(path.resolve()).payload)
-    assert body["report"]["errors"][0]["code"] == "too_many_errors" and body["file"]["ok"] is False
+    assert body["report"]["errors"][0]["code"] == "too_many_problems" and body["file"]["ok"] is False
     assert body["records_total"] < 100
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import io
 import json
 import sys
 from pathlib import Path
@@ -28,7 +29,7 @@ from mnestiq.hashing import (
 )
 from mnestiq.keys import key_id, public_key_b64
 from mnestiq.merkle import merkle_root
-from mnestiq.verify import verify_lines
+from mnestiq.verify import verify_stream
 
 HERE = Path(__file__).resolve().parent
 CHAIN_ID = "vectors-1.0"
@@ -121,10 +122,114 @@ def chain(bodies: list[dict], key: Ed25519PrivateKey = KEY, version: str = "1.0"
     return [*records, cp]
 
 
-def variants() -> dict[str, tuple[list[dict], str, dict]]:
-    """name -> (records, what it shows, expected verdict with the vectors' key pinned)."""
+def as_bytes(records: list[dict]) -> bytes:
+    """The file a recorder writes for these records: one canonical line each, every line ended by LF."""
+    return b"".join(canonical_json(r) + b"\n" for r in records)
+
+
+def nested(levels: int) -> list:
+    """Arrays inside each other, ``levels`` of them, the innermost empty."""
+    value: list = []
+    for _ in range(levels - 1):
+        value = [value]
+    return value
+
+
+def with_attributes(attributes: dict) -> list[dict]:
+    """The events, with free-form attributes on the tool call that sent the email (seq 5)."""
+    bodies = events()
+    bodies[5]["attributes"] = attributes
+    return bodies
+
+
+def reading_variants(good: list[dict]) -> dict[str, tuple[bytes, str, dict]]:
+    """Vectors about how the bytes of a file are read, before any hash is checked. These are bytes, not
+    records: a recorder writes none of the refused ones."""
+    whole = as_bytes(good)
+    lines = whole.split(b"\n")[:-1]
+    out: dict[str, tuple[bytes, str, dict]] = {}
+
+    out["crlf-line-ends"] = (whole.replace(b"\n", b"\r\n"),
+                             "Every line ended by CR LF. A carriage return directly before the line end is "
+                             "part of the line end.",
+                             {"ok": True, "errors": [], "warnings": []})
+
+    out["blank-line"] = (b"\n".join([lines[0], b"", *lines[1:]]) + b"\n",
+                         "An empty line between two records. A blank line is refused, not skipped.",
+                         {"ok": False, "errors": ["parse"], "warnings": []})
+
+    with_cr = list(lines)
+    with_cr[4] = with_cr[4].replace(b",", b",\r", 1)
+    out["lone-cr"] = (b"\n".join(with_cr) + b"\n",
+                      "One carriage return inside the record at seq 4, after its first comma. JSON reads it as "
+                      "white space, and a reader that ends lines at CR sees two lines. The line is refused, so "
+                      "the record is missing from the chain.",
+                      {"ok": False, "errors": ["link", "merkle_root", "parse", "seq"], "warnings": []})
+
+    cut = canonical_json({"agent_id": "support-bot", "chain_id": CHAIN_ID, "event_type": "note"})[:-12]
+    out["incomplete-last-line"] = (whole + cut,
+                                   f"The valid chain, then {len(cut)} bytes of a next record with no line end, "
+                                   "as a write that was cut leaves them. Bytes after the last LF that are not a "
+                                   "closed JSON object are not a record: they are not read, and the verdict is "
+                                   "for the complete lines.",
+                                   {"ok": True, "errors": [], "warnings": ["incomplete_last_line"]})
+
+    out["no-final-line-feed"] = (whole[:-1],
+                                 "The valid chain without the LF that ends its last line, the checkpoint. The "
+                                 "bytes after the last LF are a closed JSON object, a whole record, so they are "
+                                 "read as the last line like any other, with a warning that the line end is "
+                                 "missing.",
+                                 {"ok": True, "errors": [], "warnings": ["no_final_newline"]})
+
+    # A field the schema types as an integer holds an integer written as one. Both spellings below have the
+    # canonical bytes of the integer, so every hash and the signature still hold: only this rule refuses them.
+    fraction = list(lines)
+    assert fraction[1].count(b'"step_id":1,') == 1
+    fraction[1] = fraction[1].replace(b'"step_id":1,', b'"step_id":1.0,')
+    out["integer-with-fraction"] = (b"\n".join(fraction) + b"\n",
+                                    "step_id of the record at seq 1 written 1.0. An integer field is written "
+                                    "without a fraction or an exponent, in every field the schema types as an "
+                                    "integer.",
+                                    {"ok": False, "errors": ["schema"], "warnings": []})
+    minus = list(lines)
+    assert minus[0].count(b'"seq":0,') == 1
+    minus[0] = minus[0].replace(b'"seq":0,', b'"seq":-0,')
+    out["integer-minus-zero"] = (b"\n".join(minus) + b"\n",
+                                 "seq of the first record written -0. Zero has one spelling in an integer "
+                                 "field, 0.",
+                                 {"ok": False, "errors": ["schema"], "warnings": []})
+
+    # Whole numbers past 2^53 - 1 are doubles. Canonical JSON writes each in one way: 2^53 in full, and 2^63 as
+    # its shortest digits and zeros, which is not the exact integer of that double (9223372036854775808).
+    large = chain(with_attributes({"bytes_sent": 2.0 ** 53, "bytes_limit": 2.0 ** 63}))
+    out["large-numbers"] = (as_bytes(large),
+                            "Whole numbers past 2^53 - 1 in a record, written as canonical JSON writes them: "
+                            "9007199254740992 and 9223372036854776000.",
+                            {"ok": True, "errors": [], "warnings": []})
+    respelled = as_bytes(large).replace(b'"bytes_sent":9007199254740992', b'"bytes_sent":9007199254740993')
+    out["respelled-integer"] = (respelled,
+                                "The same file with 9007199254740992 written 9007199254740993. Both read as "
+                                "the same double, so every hash still matches, and a reader with exact integers "
+                                "sees another number. Past 2^53 - 1 only the canonical spelling is accepted: the "
+                                "line is refused, so the record at seq 5 is missing from the chain.",
+                                {"ok": False, "errors": ["link", "merkle_root", "parse", "seq"], "warnings": []})
+
+    # The record is level 1 and its attributes level 2, so the arrays start at level 3.
+    out["nesting-128"] = (as_bytes(chain(with_attributes({"deep": nested(126)}))),
+                          "A value nested 128 levels deep, the deepest that is read: the record is level 1, "
+                          "its attributes level 2, and 126 arrays inside each other follow.",
+                          {"ok": True, "errors": [], "warnings": []})
+    out["nesting-129"] = (as_bytes(chain(with_attributes({"deep": nested(127)}))),
+                          "The same with one array more, 129 levels. The line is refused, so the record at "
+                          "seq 5 is missing from the chain.",
+                          {"ok": False, "errors": ["link", "merkle_root", "parse", "seq"], "warnings": []})
+    return out
+
+
+def variants() -> dict[str, tuple[list[dict] | bytes, str, dict]]:
+    """name -> (records or the bytes of the file, what it shows, expected verdict with the vectors' key pinned)."""
     good = chain(events())
-    out: dict[str, tuple[list[dict], str, dict]] = {
+    out: dict[str, tuple[list[dict] | bytes, str, dict]] = {
         "valid": (good, "A complete signed chain. The second model call records only what changed.",
                   {"ok": True, "errors": [], "warnings": []}),
         "redacted": ([redact(r) if r["kind"] == "event" else r for r in good],
@@ -177,6 +282,18 @@ def variants() -> dict[str, tuple[list[dict], str, dict]]:
                                                        "doesn't know. Verifies, with the field reported as not "
                                                        "checked."),
                           {"ok": True, "errors": [], "warnings": ["newer_version"]})
+
+    # A salt is not covered by the record hash, so this check is the only one a salt gets. The last letter
+    # before the padding has spare bits: with one set the text still decodes to the same 16 bytes, and the
+    # digest still matches.
+    respelt = copy.deepcopy(good)
+    user = respelt[1]["context"][1]
+    user["content_salt"] = user["content_salt"][:21] + {"A": "B", "Q": "R", "g": "h", "w": "x"}[
+        user["content_salt"][21]] + "=="
+    out["malformed-salt"] = (respelt, "A salt that is not base64 in its one canonical spelling: a spare bit of "
+                                      "its last letter is set. No hash covers a salt, so nothing else shows it.",
+                             {"ok": False, "errors": ["salt", "schema"], "warnings": []})
+    out.update(reading_variants(good))
     return out
 
 
@@ -206,15 +323,15 @@ def build() -> dict[str, bytes]:
     pub = public_key_b64(KEY)
     files: dict[str, bytes] = {}
     expected: dict = {"spec_version": "1.0", "trusted_key": pub, "trusted_key_id": key_id(pub), "vectors": {}}
-    for name, (records, about, verdict) in variants().items():
-        data = b"".join(canonical_json(r) + b"\n" for r in records)
-        report = verify_lines(data.splitlines(), [pub])
+    for name, (content, about, verdict) in variants().items():
+        data = content if isinstance(content, bytes) else as_bytes(content)
+        report = verify_stream(io.BytesIO(data), [pub])  # the bytes, read as a file is read
         got = {"ok": report.ok, "errors": codes(report.errors), "warnings": codes(report.warnings)}
         if got != verdict:
             raise SystemExit(f"{name}: verifier says {got}, the vector was made for {verdict}")
         files[f"{name}.jsonl"] = data
         expected["vectors"][f"{name}.jsonl"] = {"about": about, **verdict}
-    expected["worked_example"] = worked_example(variants()["valid"][0])
+    expected["worked_example"] = worked_example(chain(events()))
     files["expected.json"] = (json.dumps(expected, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
     return files
 

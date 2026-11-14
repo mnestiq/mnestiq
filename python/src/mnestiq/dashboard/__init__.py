@@ -34,19 +34,16 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import parse_qs, urlsplit
 
-from ..canonical import parse_json
 from ..context import expand
 from ..findings import findings
-from ..verify import ChainVerifier, Issue, Report, is_blank
+from ..verify import GZIP_MAGIC, ChainVerifier, EvidenceLines, LineError, Report, is_blank, parse_line
 
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
 MAX_RECORDS = 20_000   # sent to the browser per file, verification and the rules still read everything
 MAX_EARLIER_FINDINGS = 20_000  # findings on records before those sent, listed on the page: the page says how many more
-MAX_ERRORS = 1_000     # a file is checked until it has this many problems
 MAX_LOAD_BYTES = 256 * 1024 * 1024  # the largest file read into memory and verified here
-_VERIFY_BATCH = 1_024  # lines verified between looks at how many problems were found
 MAX_CACHED = 32        # files whose prepared answer is kept in memory
 SNIFF_LINES = 200      # lines read to tell an evidence file from other JSON lines in the folder
 SNIFF_BYTES = 64 * 1024 * 1024  # how far into a file to look for evidence: past this, it cannot be ruled out
@@ -57,7 +54,7 @@ KEY_HEADER = "X-Mnestiq-Key"
 
 @dataclass
 class _Loaded:
-    stamp: tuple[int, int]
+    digest: bytes  # SHA-256 of the bytes this answer was made from
     summary: dict
     payload: bytes
     etag: str
@@ -111,44 +108,52 @@ class EvidenceStore:
         # Only names we listed ourselves, never a path built from user input.
         return next((p for p in self.files() if self.name(p) == name), None)
 
-    def _unrecognised(self, path: Path, st: os.stat_result) -> _Loaded:
+    def _unrecognised(self, path: Path, st: os.stat_result, why: str | None = None) -> _Loaded:
         """The entry for a file that could not be looked through: listed and said so, never read in whole."""
         report = Report()
-        report.error("unrecognised", "this file may be evidence, but it is too large to look through here or could "
-                                     "not be read. It was not verified. Run mnestiq verify on it")
+        report.error("unrecognised", why or "this file may be evidence, but it is too large to look through here or "
+                                            "could not be read. It was not verified. Run mnestiq verify on it")
         summary = {"name": self.name(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns, "ok": False,
                    "records": 0, "errors": 1, "warnings": 0, "unrecognised": True}
         body = {"file": summary, "report": {**report.to_dict(), "errors_total": 1}, "pinned": bool(self.trusted_keys),
                 "records": [], "records_total": 0, "records_shown_from": 0, "sealed": [], "findings": None}
         payload = json.dumps(body).encode("utf-8")
-        return _Loaded((st.st_mtime_ns, st.st_size), summary, payload,
-                       '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
+        return _Loaded(b"", summary, payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
 
     def load(self, path: Path) -> _Loaded:
         st = path.stat()
         if st.st_size > MAX_LOAD_BYTES or (not self.root.is_file() and self._sniff(path) is None):
             return self._unrecognised(path, st)
-        stamp = (st.st_mtime_ns, st.st_size)
-        with self._lock:
-            cached = self._cache.get(path)
-            if cached and cached.stamp == stamp:
-                self._cache.move_to_end(path)
-                return cached
         # One read: the records shown are the ones verified, even while the file grows.
         data = path.read_bytes()
-        stamp = (st.st_mtime_ns, len(data))
-        stream = io.BytesIO(data)  # as a file is read: split at newlines only, as the verifier sees it
+        # A verdict is used again only for the same bytes. Size and modification time can both be put back
+        # after a change, so neither is asked: the file is read and hashed every time.
+        digest = hashlib.sha256(data).digest()
+        with self._lock:
+            cached = self._cache.get(path)
+            if cached and cached.digest == digest:
+                self._cache.move_to_end(path)
+                return cached
+        if data[:2] == GZIP_MAGIC:
+            return self._unrecognised(path, st, "this is a gzip file, which the dashboard does not read. It was not "
+                                                "verified. Unpack it first")
+        # As the verifier splits a file: at LF only, and bytes after the last LF are a line only as a whole record.
+        split = EvidenceLines(io.BytesIO(data))
         lines: list[bytes] = []
-        # Verification covers the whole file unless it is past saving. The browser only gets the most recent records.
+
+        def read() -> Iterator[bytes]:
+            for raw in split:  # only the lines the verifier takes: it stops at too many problems
+                lines.append(raw)
+                yield raw
+
+        # Verification covers the whole file unless it is past saving: the verifier stops after MAX_PROBLEMS
+        # errors and says where. The browser only gets the most recent records.
         verifier = ChainVerifier(self.trusted_keys)
-        while len(verifier.report.errors) < MAX_ERRORS and (batch := list(islice(stream, _VERIFY_BATCH))):
-            verifier.feed(batch)
-            lines.extend(batch)
+        verifier.feed(read())
+        verifier.end_of_file(split)
         report = verifier.result()
-        if stream.read(1):  # first in the list, so that the cut below keeps it
-            report.errors.insert(0, Issue("too_many_errors", f"checking stopped at line {len(lines)}, after "
-                                          f"{len(report.errors)} problems. The rest of this file was not checked. "
-                                          "Run mnestiq verify on it"))
+        # The error that says checking stopped comes first, where the page shows it without scrolling.
+        report.errors.sort(key=lambda issue: issue.code != "too_many_problems")
         records: deque[dict] = deque(maxlen=self.max_records)
         total = 0
         # A record of a shape the recorder never writes goes to the page as text only: the page reads fields
@@ -159,14 +164,12 @@ class EvidenceStore:
         def parsed() -> Iterator[dict]:
             nonlocal total
             for line_no, raw in enumerate(lines, start=1):
-                if is_blank(raw):
-                    continue
                 total += 1
                 try:
-                    rec = parse_json(raw)
+                    rec = parse_line(raw)
                     if not isinstance(rec, dict) or line_no in malformed:
-                        raise ValueError
-                except (ValueError, RecursionError):
+                        raise LineError
+                except LineError:
                     rec = {"_unparseable": True, "_line": line_no, "_raw": raw[:300].decode("utf-8", "replace")}
                 yield rec
 
@@ -185,7 +188,6 @@ class EvidenceStore:
         }
         report_dict = report.to_dict()
         report_dict["errors_total"] = len(report.errors)
-        report_dict["errors"] = report_dict["errors"][:MAX_ERRORS]
         body = {"file": summary, "report": report_dict, "pinned": bool(self.trusted_keys),
                 "records": list(records), "records_total": total,
                 "records_shown_from": total - len(records),
@@ -195,7 +197,7 @@ class EvidenceStore:
                 "findings": _findings(lines, shown)}
         # "replace": a lone surrogate parses from JSON (the verifier reports it) but has no UTF-8 form
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8", "replace")
-        loaded = _Loaded(stamp, summary, payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
+        loaded = _Loaded(digest, summary, payload, '"' + hashlib.sha256(payload).hexdigest()[:32] + '"')
         with self._lock:
             self._cache[path] = loaded
             while len(self._cache) > MAX_CACHED:
@@ -218,11 +220,10 @@ def _findings(lines: list[bytes], shown: set[int]) -> dict | None:
 
     def every_record() -> Iterator[Any]:
         for raw in lines:
-            if not is_blank(raw):
-                try:
-                    yield parse_json(raw)
-                except (ValueError, RecursionError):
-                    yield None  # in its place, so that the rules say it was not evaluated
+            try:
+                yield parse_line(raw)
+            except LineError:
+                yield None  # in its place, so that the rules say it was not evaluated
 
     try:
         found = findings(every_record())
