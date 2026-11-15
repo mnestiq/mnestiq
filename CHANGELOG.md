@@ -1,11 +1,15 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 (2026-11-15)
 
-Fixes found in a review of 1.1.0. The record format and spec version are unchanged. Some records now carry
-different values: a missing model name, a role this version does not know, and an answer that is not all in its
-record are each written one way on every path. The rules find planted links and images they used to miss.
-Commands report the library's own errors in one line.
+A security fix, and fixes found in a review of 1.1.0. The security fix: a file named like the pinned key, in
+the folder `mnestiq verify` was run in, was trusted in the key's place. See the
+[security note](docs/security-notes/1.1.1.md).
+
+The record format and spec version are unchanged. Some records now carry different values: a missing model
+name, a role this version does not know, and an answer that is not all in its record are each written one way
+on every path. The rules find planted links and images they used to miss. Commands report the library's own
+errors in one line.
 
 ### Stricter reading of evidence files
 
@@ -24,19 +28,30 @@ follows it. Nothing a recorder writes is read differently, with the one exceptio
   a blank line. A file that holds nothing but spaces and line ends is emptied and started as a new file.
 - `mnestiq verify` stops after 1,000 problems, says at which line (error `too_many_problems`), and does not
   read the rest. It gives no verdict about a head or a witness for such a file. Warnings about single records
-  are kept up to 1,000 and the rest are counted. `inspect`, `redact` and the dashboard stop at the same point.
+  are kept up to 1,000 of each kind and the rest are counted, so that many warnings of one kind cannot push
+  out a warning of another. `inspect`, `redact` and the dashboard stop at the same point.
   Before, every bad line was kept: a megabyte of them took most of a gigabyte of memory.
 - A carriage return is accepted only directly before the line feed. Anywhere else in a line it is an error.
-- A whole number beyond 2^53 - 1 that is written with digits alone is accepted only in the spelling canonical
-  JSON gives it. Before, `9007199254740993` was read as `9007199254740992` and the file stayed VALID.
-- A field the schema types as an integer must be written as an integer, in every such field. `1.0`, `1e0`
-  and `-0` are errors there. Before, only `seq` and the fields of `context_base` were held to this.
+- **A number has one accepted spelling, the one canonical JSON gives it, in every field.** `4100.0`, `41e2`,
+  `0.50`, `-0` and a number with more digits than a double keeps (`88412.000000000000000000001`) are errors,
+  and the line that holds one is refused. So is a whole number beyond 2^53 - 1 in any spelling but the
+  canonical one, and `1.0` in a field that holds an integer. Before, such a number hashed like the canonical
+  spelling and the file stayed VALID, while a reader with exact decimals saw another value, and
+  `9007199254740993` was read as `9007199254740992`. Every release of the recorder has written numbers in
+  this spelling, so no file a recorder wrote is affected. Spacing, the order of keys and escapes in text can
+  differ as before.
 - A record nested more than 128 levels deep is an error, and the recorder refuses to write one.
 - A salt must be base64 in its one canonical spelling wherever it stands, also next to a value that is redacted
   or was left out. The same salt on two values of one record is an error. The `salt` warning no longer suggests
   that a salt left without its value is the recorder's own. New warning `omitted_salt` for a value the recorder
   left out whose salt is gone. A copy made by `mnestiq redact` gets it for each such value, since `redact`
   removes those salts, and the warning says that this is expected there.
+- A salt is held to its 16 bytes where its digest is checked, also by a `ChainVerifier` made with
+  `schema=False`. Before, only the schema held it to that length, and without the schema a byte could be moved
+  between a salt and its value under the same digest.
+- `mnestiq inspect` prints the warnings that `mnestiq verify` gives for the file, and says after which record
+  no checked signature covers what it lists. For a checkpoint signed with an algorithm it does not know it
+  prints `signature NOT CHECKED`. Before, it printed `signed by` and the key id there, and no warnings.
 - The schema's patterns are read as JSON Schema means them: a time or a salt with a newline after it no longer
   passes. `timestamp_token` must be a non-empty string.
 - `next_key.sig_alg` must be the algorithm of the key it names.
@@ -49,8 +64,23 @@ follows it. Nothing a recorder writes is read differently, with the one exceptio
   not verified, and does not list one in a folder. A recorder refuses a gzip file by name.
 - A pinned key must be the base64 of the key in its one canonical spelling. Space and a line end around it,
   and the path of a `.pub` file, are accepted as before.
-- A recorder changes nothing in a file it refuses to continue. It decides first, and only then sets a part of
-  a record aside or adds a missing line end.
+- **Security: a pinned key given as text is never opened as a file.** `--trusted-key` tried its argument as
+  a file name before it read it as a key. A file with the key's text as its name, in the folder `verify` was
+  run in, was read in its place, and the key inside it was the one trusted: evidence signed by someone else
+  then verified under the pin. Whoever could put a file into that folder, a folder of evidence sent by another
+  party for one, could do this. For a key with a `/` in its base64 it takes a folder and a file. The same
+  held for a key given in a wrong spelling, such as without its padding. The argument is now opened as a file
+  only when it is written as a path: a name that ends in an extension (`signing.pub`, `keys/signing.pub`) or
+  one that starts with `./` or `../`. Text that starts with a key (`<key>.pub`) is not a path. Anything
+  else is the key, or is refused. **A key file whose name has no
+  extension must now be given as `./name`.** The Python call `verify_file` was not affected. In 1.1.0 and
+  earlier.
+- A recorder changes nothing in a file it refuses to continue, whether the file is refused for the form of
+  its lines or for its hashes, its signatures or its key. A part of a record at the end is set aside, and a
+  missing line end added, only once the recorder has read the chain and will continue it. `FileSink` no
+  longer does either when it is opened: `FileSink.mend()` does, and `append` does before the first record.
+  With `on_damaged="new_file"` a refused file is set aside whole, and the note in the new chain no longer has
+  `torn_tail`.
 - `mnestiq redact` verifies what it reads and writes nothing from a file that does not verify.
 - `mnestiq inspect` ends with a line that says whether the file verifies. Its listing was never a check, and it
   now says so. Its exit code is unchanged.

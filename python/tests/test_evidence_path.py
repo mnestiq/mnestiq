@@ -26,6 +26,39 @@ def torn(tmp_path):
     return path
 
 
+def _mended(path):
+    """Open a file and do to its end what a recorder does once it has read the chain."""
+    sink = FileSink(path)
+    try:
+        sink.mend()
+    finally:
+        sink.close()
+    return sink
+
+
+def test_opening_a_file_and_closing_it_changes_nothing(tmp_path, torn):
+    for before in (BEFORE, FIRST[:-1]):  # a part of a record at the end, and a whole record with no line end
+        torn.write_bytes(before)
+        sink = FileSink(torn)
+        assert [r["seq"] for r in sink.existing()] == [0]  # the part of a record is not one of the records
+        sink.close()
+        assert torn.read_bytes() == before and sink.recovered is None
+        assert not list(tmp_path.glob("*.torn-*"))
+
+
+def test_a_file_another_program_added_to_since_it_was_opened_is_not_mended(tmp_path, torn):
+    sink = FileSink(torn)
+    with open(torn, "ab") as other:  # a writer that does not take the lock
+        other.write(b'ord_hash":"x","seq":1}\n')
+    after = torn.read_bytes()
+    with pytest.raises(SinkError, match="changed by another program"):
+        sink.append({"seq": 2})
+    with pytest.raises(SinkError, match="changed by another program"):
+        sink.mend()
+    sink.close()
+    assert torn.read_bytes() == after and not list(tmp_path.glob("*.torn-*"))
+
+
 def test_a_link_at_the_evidence_path_is_refused_and_its_target_keeps_every_byte(tmp_path, torn):
     link = tmp_path / "link.jsonl"
     try:
@@ -61,7 +94,7 @@ def test_a_file_replaced_before_recovery_is_not_cut_and_stays_unlocked(torn, mon
         with pytest.raises(SinkError, match="replaced"):
             FileSink(torn)
     assert torn.read_bytes() == BEFORE
-    FileSink(torn).close()  # the failed open left no lock behind, and recovery runs as usual
+    _mended(torn)  # the failed open left no lock behind, and recovery runs as usual
     assert torn.read_bytes() == FIRST
 
 
@@ -75,8 +108,7 @@ def test_a_torn_record_that_holds_a_prev_hash_key_of_its_own_is_set_aside(tmp_pa
     path = tmp_path / "e.jsonl"
     torn = WHOLE[:-4]
     path.write_bytes(FIRST + torn)
-    sink = FileSink(path)
-    sink.close()
+    sink = _mended(path)
     assert path.read_bytes() == FIRST
     assert (tmp_path / sink.recovered["sidecar"]).read_bytes() == torn
 
@@ -109,7 +141,7 @@ def test_a_recorder_starts_over_a_torn_tool_result_that_holds_a_prev_hash_key(tm
 def test_brackets_inside_a_string_do_not_make_a_torn_record_look_like_several(tmp_path, tail):
     path = tmp_path / "e.jsonl"
     path.write_bytes(FIRST + tail)
-    FileSink(path).close()
+    _mended(path)
     assert path.read_bytes() == FIRST
 
 
@@ -160,7 +192,7 @@ def test_a_hard_linked_file_with_a_torn_tail_is_refused_and_keeps_every_byte(tmp
     assert torn.read_bytes() == BEFORE and other.read_bytes() == BEFORE
     assert not list(tmp_path.glob("*.torn-*"))
     other.unlink()
-    FileSink(torn).close()  # the failed open left no lock behind, and with one name the cut is safe
+    _mended(torn)  # the failed open left no lock behind, and with one name the cut is safe
     assert torn.read_bytes() == FIRST
 
 
@@ -177,7 +209,7 @@ def test_a_hard_linked_file_missing_only_its_newline_gets_it(tmp_path):
     path = tmp_path / "e.jsonl"
     path.write_bytes(FIRST[:-1])
     os.link(path, tmp_path / "snapshot.jsonl")
-    FileSink(path).close()
+    _mended(path)
     assert path.read_bytes() == FIRST
 
 

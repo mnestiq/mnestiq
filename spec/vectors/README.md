@@ -24,6 +24,9 @@ verify, and the error and warning codes the reference verifier (`mnestiq verify`
 | `no-final-line-feed.jsonl` | The valid chain without the LF that ends its last line. | yes, with a "no_final_newline" warning |
 | `integer-with-fraction.jsonl` | An integer field (`step_id`) written `1.0`. | no |
 | `integer-minus-zero.jsonl` | An integer field (`seq`) written `-0`. | no |
+| `fractions.jsonl` | Numbers with a fraction or an exponent, written as canonical JSON writes them. | yes |
+| `respelled-number.jsonl` | One of those numbers, `4100`, written `4100.0`. | no |
+| `number-lost-digits.jsonl` | The same number written with a digit a double cannot keep. | no |
 | `large-numbers.jsonl` | Whole numbers past 2^53 - 1, written as canonical JSON writes them. | yes |
 | `respelled-integer.jsonl` | One of those numbers written as a neighbouring integer that reads as the same double. | no |
 | `nesting-128.jsonl` | A value nested 128 levels deep, the deepest that is read. | yes |

@@ -107,8 +107,11 @@ def test_a_resume_refuses_bytes_moved_from_a_value_into_its_salt(tmp_path):
     assert records[-1]["kind"] == "checkpoint"  # the changed record is under a signature
     _write(path, _moved_into_salt(records))
     assert not verify_file(path, [public_key_b64(key)]).ok
-    with pytest.raises(RecorderError, match="failed verification"):
+    before = path.read_bytes()
+    # The verifier now holds a salt to its length without the schema too, so it is the one that refuses
+    with pytest.raises(RecorderError, match="was changed after it was written"):
         Recorder(FileSink(path), agent_id="bot", signing_key=key, checkpoint_every=2, sandbox_id=None)
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("salt", ["", "AAAA", "A" * 22 + "B=", "A" * 21 + "B==", "A" * 24, None, 7])

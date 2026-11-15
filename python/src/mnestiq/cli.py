@@ -372,6 +372,12 @@ def _inspect(args: argparse.Namespace) -> int:
     if verifier.stopped_at is not None:
         _say(f"The listing stops at line {verifier.stopped_at}: too many problems. The rest of the file was not "
              "read.")
+    for issue in report.warnings:  # what `mnestiq verify` would say about the file, so that the listing hides none
+        if issue.code != "untrusted_key":  # no key is pinned here, ever: the last line says so in its own words
+            _say_line(f"warning {_where(issue)}{issue.code}: {issue.message}")
+    if report.unsigned_tail and report.signed_through_seq is not None:
+        _say(f"No signature that was checked covers what is listed after seq {report.signed_through_seq}: "
+             f"{report.unsigned_tail} record(s).")
     if report.ok:
         _say("This listing is not a check. The file verified without a pinned key, so who signed it was not "
              "checked. Run `mnestiq verify --trusted-key` for that.")
@@ -408,8 +414,11 @@ def _inspect_line(rec: dict) -> str:
     ts = rec.get("ts", {}).get("wall", "?")
     if rec.get("kind") == "checkpoint":
         c = rec.get("covers", {})
-        return (f"{ts}  #{rec['seq']:<5} ---- checkpoint seq {c.get('from_seq')}..{c.get('to_seq')} "
-                f"signed by {rec.get('key_id')}")
+        covers = f"{ts}  #{rec['seq']:<5} ---- checkpoint seq {c.get('from_seq')}..{c.get('to_seq')} "
+        alg = rec.get("sig_alg", ED25519)
+        if alg not in SIG_ALGS:  # the verifier cannot check it: what it covers counts as unsigned
+            return f"{covers}signature NOT CHECKED: this version does not know the algorithm {str(alg)[:40]!r}"
+        return f"{covers}signed by {rec.get('key_id')}"
     return (f"{ts}  #{rec['seq']:<5} {rec.get('run_id', '')[:8]}/{rec.get('step_id', '-'):<3} "
             f"{rec.get('event_type', '?'):<10} {_summary(rec)}")
 

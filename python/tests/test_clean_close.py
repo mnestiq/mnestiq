@@ -392,13 +392,17 @@ def test_a_line_that_is_not_json_is_a_damaged_file(tmp_path, key):
     assert load(path)[0]["attributes"]["continues_from"]["reason"] == "a line is not valid JSON"
 
 
-def test_a_torn_last_line_is_named_in_the_note(tmp_path, key):
+def test_a_damaged_file_with_a_torn_last_line_is_set_aside_whole(tmp_path, key):
+    """A file the recorder refuses is never mended: the part of a record at its end stays in it, and the note
+    gives the digest of the whole file."""
     path = tmp_path / "e.jsonl"
-    damaged = _damaged(path, key)
-    path.write_bytes(damaged + b'{"torn')
+    before = _damaged(path, key) + b'{"torn'
+    path.write_bytes(before)
     _resume(path, key, on_damaged="new_file").close()
     told = load(path)[0]["attributes"]["continues_from"]
-    assert (tmp_path / told["torn_tail"]["sidecar"]).read_bytes() == b'{"torn'
+    [aside] = _asides(path)
+    assert aside.read_bytes() == before and told["sha256"] == "sha256:" + hashlib.sha256(before).hexdigest()
+    assert "torn_tail" not in told and not list(tmp_path.glob("*.torn-*"))
 
 
 def test_another_key_is_refused_by_default_and_set_aside_on_request(tmp_path, key):

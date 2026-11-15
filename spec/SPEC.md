@@ -80,6 +80,13 @@ Infinity MUST NOT appear. A field the schema types as `integer` MUST be written 
 digits, with a minus sign only before a number that is not zero, and no fraction or exponent. A
 verifier MUST reject `1.0`, `1e0` or `-0` there, in every such field.
 
+Every number in a record MUST be written as canonical JSON (section 5.1) writes it, in every field,
+typed by the schema or not. Readers MUST reject a line that holds a number in any other spelling:
+`4100.0`, `41e2`, `4.1E3`, `0.50`, `-0`, and a number with more digits than a double keeps, such as
+`88412.000000000000000000001`. Each of these hashes like the canonical spelling of the double it
+reads as, and a reader with exact decimals or another number type would see another value than the
+one that was hashed.
+
 A record MUST NOT be nested more than 128 levels deep. The record itself is level 1, and every
 object or array inside another adds one level. Readers MUST reject a deeper record.
 
@@ -221,8 +228,9 @@ guess. A value disclosed later is checked with its salt, disclosed with it. This
 a third party without disclosing prompts, customer data or tool output, while
 still letting them check the value if it is disclosed separately.
 
-A `*_salt`, wherever it is present, MUST be the canonical base64 of its bytes, and a verifier MUST
-reject any other text there. A `*_salt` without its `*_hash` is an error. A verifier MUST reject the
+A `*_salt`, wherever it is present, MUST be the canonical base64 of its 16 bytes, and a verifier MUST
+reject any other text there, and a salt of any other length: the digest is over the salt and then
+the value with nothing between them, so the length of the salt is what keeps the two apart. A `*_salt` without its `*_hash` is an error. A verifier MUST reject the
 same salt on two values of one record. It does not look for the same salt in two records, and MUST NOT
 report that as an error: a producer that repeats a salt weakens only its own redaction. A verifier SHOULD warn
 when a value listed in `x-omitted` has no salt, because its original can then no longer be checked.
@@ -276,6 +284,11 @@ A pinned key is given as the base64 of the raw public key, in its one canonical 
 MUST refuse a pin in any other spelling before it verifies anything. Space and a line end around the
 text are not part of it.
 
+A tool that takes either a key or the name of a key file in the same place MUST decide from the
+text alone which of the two it is, and never from which files exist. It MUST NOT open as a file the
+text of a key, or of a key in another spelling. Otherwise a file with that text as its name, put
+where the tool runs, would take the place of the pinned key.
+
 A verifier MUST refuse an Ed25519 public key of small order (a point that 8 times itself gives the
 identity), as a pinned key, as a checkpoint's `public_key` and in `next_key`. For such a key a
 signature that verifies can be written without any private key.
@@ -297,9 +310,9 @@ the file can change, remove or add such a salt, and the file still verifies. The
 value pass for the recorded one. They can make the true value fail its check, or make it impossible
 to check. Whoever keeps the original of an omitted value SHOULD keep its salt with it.
 
-Spacing between tokens, the order of keys, an escape in place of a character, and the spelling of a
-number outside an `integer` field can change without changing the canonical bytes, so the bytes of
-a line are not protected, only its values.
+Spacing between tokens, the order of keys and an escape in place of a character can change without
+changing the canonical bytes, so the bytes of a line are not protected, only its values. The
+spelling of a number cannot change: a number has one accepted spelling (section 3).
 
 ### 6.6 Head
 
@@ -461,8 +474,9 @@ move back. A v0.1 record MUST NOT use P-256, `next_key` or `heartbeat`.
 
 In November 2026 this document was made explicit in places where it did not decide, with no new
 version: how a line ends, blank lines, bytes after the last line feed, whole numbers beyond 2^53,
-nesting, integer fields, gzip and a stop after many problems (section 3), salts (section 5.3), keys
-of small order, the spelling of a pinned key and files with no trusted checkpoint (section 6.4), `next_key.sig_alg` (section 6.7) and the form of `timestamp_token`
+nesting, integer fields, the spelling of every number, gzip and a stop after many problems
+(section 3), salts (section 5.3), keys of small order, the spelling of a pinned key, key files and
+files with no trusted checkpoint (section 6.4), `next_key.sig_alg` (section 6.7) and the form of `timestamp_token`
 (section 6.9). Nothing a conforming producer writes is read differently. A file changed by hand in
 one of these ways, which an earlier verifier accepted, is rejected. A file whose last write was cut
 is no longer rejected for that reason alone: the cut bytes are reported and not read.

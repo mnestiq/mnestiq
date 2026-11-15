@@ -8,7 +8,7 @@ import subprocess
 import pytest
 
 from mnestiq import verify_file
-from mnestiq.canonical import CanonicalizationError, canonical_json, parse_json
+from mnestiq.canonical import CanonicalizationError, RefusedJSON, canonical_json, parse_json
 
 from conftest import record_demo
 
@@ -108,7 +108,11 @@ def test_rfc8785_section_3_2_2_example():
     # Input and output exactly as printed in RFC 8785, section 3.2.2.
     text = r"""{"numbers": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001], "string": "\u20ac$\u000F\u000aA'\u0042\u0022\u005c\\\"\/", "literals": [null, true, false]}"""  # noqa: E501 (verbatim from the RFC)
     expected = r"""{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"\u20ac$\u000f\nA'B\"\\\\\"/"}""".replace(r"\u20ac", "\u20ac")  # noqa: E501 (verbatim from the RFC)
-    assert canonical_json(parse_json(text)).decode("utf-8") == expected
+    assert canonical_json(json.loads(text)).decode("utf-8") == expected
+    # An evidence line holds numbers in the canonical spelling only: the output is read back, the input is not
+    assert canonical_json(parse_json(expected)).decode("utf-8") == expected
+    with pytest.raises(RefusedJSON):
+        parse_json(text)
 
 
 def test_large_whole_number_doubles_survive_a_round_trip():

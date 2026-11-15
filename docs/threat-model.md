@@ -39,6 +39,7 @@ removed for sharing without breaking the chain. The format is in [SPEC.md](../sp
 | A line that means two things to two parsers (duplicate keys, NaN) | Strict reading: refused | `test_a6` |
 | Cut the file back to an earlier checkpoint | The head kept elsewhere (`--head`), or the Evidence Vault | `test_a7` |
 | Rewrite everything and sign with your own key | The pinned key (`--trusted-key`) | `test_b1` |
+| Put a file named like the pinned key into the folder `verify` is run in | A key given as text is never opened as a file | `test_reading_rules.py::test_a_file_named_like_the_pinned_key_does_not_take_its_place` |
 | Switch keys part-way | A key change needs a hand-over signed by the old key; error even without a pin | `test_b2` |
 | Hand over to your own key, from your own key | A hand-over vouches only if its signer was trusted | `test_b3` |
 | Make a second valid P-256 signature (malleability) | Only low-s signatures are valid | `test_b4` |
@@ -52,7 +53,7 @@ removed for sharing without breaking the chain. The format is in [SPEC.md](../sp
 | Point a model call at another call's context, or mix two files so the rules read the wrong one | The verifier checks every `context_base`, and readers look the base up by chain and run | `test_format_v1.py::test_a_wrong_base_is_an_error`, `test_review_fixes.py::test_records_of_two_chains_mixed_keep_their_own_context` |
 | A small file that makes readers copy one large context thousands of times | Carried context is budgeted, and a call cut short is marked, never shown as complete | `test_review_fixes.py::test_a_context_bomb_is_cut_off_not_expanded` |
 | A small file built to make a reader's patterns or lookups take minutes | Patterns take time in proportion to their text, and lookups have a work limit: what it stops comes back as MNQ-000, here and on the page | `test_tampered_files.py::test_quadratic_values_against_context` |
-| A number respelled (`4100` as `4100.0`) so the rules miss it while the hash stays the same | Numbers read as one text however the file spells them, in Python and on the page | `test_tampered_files.py::test_respelled_number_keeps_mnq004` |
+| A number respelled (`4100` as `4100.0`) so the rules or another reader miss it while the hash stays the same | A number has one accepted spelling, the canonical one. A line with any other is refused, and the file is INVALID | `test_tampered_files.py::test_a_respelled_number_is_refused` |
 | A long run whose context can't be carried, so a finding quietly disappears | The rules report the call as MNQ-000: its context is incomplete | `test_tampered_files.py::test_carry_budget_marks_the_call_as_incomplete` |
 | Change a value, then redact it so the copy verifies | `redact` checks each value against its digest and refuses the file | `test_tampered_files.py::test_redact_refuses_a_changed_value` |
 | Redact a record holding a field this version does not know | `redact` refuses and says to upgrade: what such a field holds must not reach the copy | `test_tampered_files.py::test_redact_refuses_an_unknown_field_of_a_newer_minor` |
@@ -144,11 +145,11 @@ These are limits by design. We would rather you hear them from us.
 11. **Emptying or replacing a whole file** starts a chain that looks clean, unless a head or the vault says
    otherwise. `--witness` cannot show it, because the log is picked by the chain id in the file. A file with a new
    chain id has no log to differ from, and `verify` only warns `witness_none`.
-12. **A record's hash covers its canonical form.** Respelling a number (`5` as `5.0`), changing the key order or
+12. **A record's hash covers its canonical form.** Changing the key order or
    JSON spacing, or writing a character as an escape (`\u0061`) leaves the hash the same. The bytes of the line
    change and its values do not. `verify` refuses the respellings that another reader could take for another
-   value or another line: a whole number beyond 2^53 in any spelling but the canonical one, a
-   fraction or exponent in a field that holds an integer, a carriage return inside a record, and a blank line.
+   value or another line: a number in any spelling but the canonical one (`5.0` or `5e0` for `5`), a carriage
+   return inside a record, and a blank line.
 13. **The end of a file.** A record is a line that ends with a line feed. A last line with no line feed is
    read only if it is a whole record, and `verify` says that its line end is missing. Anything else after the
    last line feed is not read as a record, and `verify` says how many bytes there are. A recorder that crashed

@@ -2,6 +2,7 @@
 reader, and the commands that read a file. One regression test, at least, for each change of behaviour."""
 
 import base64
+import contextlib
 import gzip
 import hashlib
 import io
@@ -353,8 +354,9 @@ def test_every_reader_takes_a_whole_last_record_with_no_line_end(evidence, tmp_p
     assert "no_final_newline" in [w["code"] for w in body["report"]["warnings"]]
     assert main(["inspect", str(evidence)]) == 0
     out = capsys.readouterr().out.splitlines()
-    assert len(out) == count + 1 and out[-1].startswith("This listing is not a check.")
-    assert "checkpoint" in out[-2]  # the last record is listed
+    assert len(out) == count + 2 and out[-1].startswith("This listing is not a check.")
+    assert out[-2].startswith("warning no_final_newline: ")
+    assert "checkpoint" in out[-3]  # the last record is listed
     copy = tmp_path / "copy.jsonl"
     assert main(["redact", str(evidence), str(copy)]) == 0
     assert f"wrote {count} redacted records" in capsys.readouterr().out
@@ -523,7 +525,8 @@ def test_a_large_whole_number_in_another_spelling_is_an_error(tmp_path, key, pub
     ("9007199254740991", 2 ** 53 - 1), ("-9007199254740991", -(2 ** 53 - 1)), ("123456789012345", 123456789012345),
     ("9007199254740992", 2.0 ** 53), ("-9007199254740992", -(2.0 ** 53)), ("9007199254740994", 2.0 ** 53 + 2),
     ("9223372036854776000", 2.0 ** 63), ("12345678901234567000", 1.2345678901234567e19),
-    ("100000000000000000000", 1e20), ("1e+21", 1e21), ("9007199254740993.0", 2.0 ** 53),
+    ("100000000000000000000", 1e20), ("1e+21", 1e21), ("0.5", 0.5), ("1e-7", 1e-7), ("0.000001", 1e-6),
+    ("5e-324", 5e-324), ("1.7976931348623157e+308", 1.7976931348623157e308), ("-1.5", -1.5), ("0", 0),
 ])
 def test_parse_json_reads_a_number_in_its_canonical_spelling(text, value):
     read = parse_json(text)
@@ -1220,7 +1223,7 @@ def test_only_the_first_thousand_warnings_about_single_records_are_kept(tmp_path
     assert [w.code for w in report.warnings[:1000]] == ["salt"] * 1000 and report.more_warnings == 200
     assert report.warnings[1000].code == "too_many_warnings"
     assert report.warnings[1000].message == ("200 more warning(s) about single records are not listed: only the "
-                                             "first 1000 are kept")
+                                             "first 1000 of each kind are kept")
     assert [w.code for w in report.warnings[1001:]] == ["redacted"]  # what is said of the whole file is kept
     assert verify_file(path, [pub]).to_dict() == report.to_dict()
     assert main(["verify", str(path), "--trusted-key", pub]) == 0
@@ -1328,17 +1331,17 @@ INTEGER_FIELDS = [rb'"step_id":(\d+)', rb'"mono_us":(\d+)', rb'"from_seq":(\d+)'
 @pytest.mark.parametrize("spelling", [b".0", b"e0", b"E0", b".00", b"e+0"])
 def test_an_integer_written_with_a_fraction_or_an_exponent_is_an_error_in_every_field(evidence, pub, field, spelling):
     """The finding: JSON Schema calls 1.0 an integer, so only seq was refused. The canonical bytes are those of
-    the integer, so no hash and no signature changes: only this rule can refuse it."""
+    the integer, so no hash and no signature would change: only the rule that a number has one spelling refuses
+    it. The line is not read, so its record is missing from the chain."""
     data = evidence.read_bytes()
     assert re.search(field, data)
     changed = re.sub(field, lambda m: m.group(0) + spelling, data, count=1)
     assert changed != data
     evidence.write_bytes(changed)
     report = verify_file(evidence, [pub])
-    assert not report.ok and "schema" in errors(report)
-    assert not {"record_hash", "signature", "merkle_root", "link"} & set(errors(report))
-    assert any("is a whole number written with a fraction or an exponent: an integer field holds it written as "
-               "an integer" in said for said in messages(report, "schema"))
+    assert not report.ok and "parse" in errors(report)
+    assert not {"record_hash", "signature", "content_hash"} & set(errors(report))
+    assert any("is not written as canonical JSON writes it" in said for said in messages(report, "parse"))
 
 
 @pytest.mark.parametrize("field", [b'"seq":0,', b'"step_id":0,', b'"from_seq":0,'],
@@ -1348,13 +1351,12 @@ def test_minus_zero_in_an_integer_field_is_an_error(evidence, pub, field):
     assert data.count(field) >= 1
     evidence.write_bytes(data.replace(field, field.replace(b":0,", b":-0,"), 1))
     report = verify_file(evidence, [pub])
-    assert errors(report) == ["schema"]
-    name = field.split(b'"')[1].decode()
-    where = "covers/from_seq" if name == "from_seq" else name
-    assert messages(report, "schema") == [f"{where}: -0 is not accepted in an integer field: zero is written 0"]
+    assert not report.ok and "parse" in errors(report) and "schema" not in errors(report)
+    assert messages(report, "parse") == ["line is refused: the number -0 is not written as canonical JSON writes "
+                                         "it (0)"]
 
 
-def test_minus_zero_stays_what_it_was_in_a_field_that_is_not_typed_as_an_integer(tmp_path, key, pub):
+def test_minus_zero_is_refused_in_a_field_that_is_not_typed_as_an_integer_too(tmp_path, key, pub):
     path = tmp_path / "e.jsonl"
     with Recorder(FileSink(path), agent_id="a", signing_key=key) as rec, rec.run() as run:
         run.note("a count", count=0)
@@ -1362,13 +1364,14 @@ def test_minus_zero_stays_what_it_was_in_a_field_that_is_not_typed_as_an_integer
     assert data.count(b'"count":0,') == 1
     path.write_bytes(data.replace(b'"count":0,', b'"count":-0,'))
     report = verify_file(path, [pub])
-    assert report.ok and report.warnings == []
-    assert parse_json("-0") == 0 and canonical_json(parse_json('{"a":-0}')) == b'{"a":0}'
-    assert json.dumps(parse_json("[-0]")) == "[0]"
+    assert not report.ok and "parse" in errors(report)
+    for text in ("-0", "[-0]", '{"a":-0}', "-0.0", "-0e0"):
+        with pytest.raises(RefusedJSON, match="is not written as canonical JSON writes it"):
+            parse_json(text)
 
 
 def test_minus_zero_cannot_take_a_warning_away(tmp_path, key, pub):
-    """A note of the recorder is read by its numbers. Written -0, a 0 in it is still the 0 it was."""
+    """A note of the recorder is read by its numbers. A 0 in it cannot be written -0: the line is refused."""
     path = tmp_path / "e.jsonl"
     rec = Recorder(FileSink(path), agent_id="a", signing_key=key, checkpoint_every=1000)
     with rec.run() as run:
@@ -1382,7 +1385,7 @@ def test_minus_zero_cannot_take_a_warning_away(tmp_path, key, pub):
     assert data.count(b'"first_seq":0,') == 1
     path.write_bytes(data.replace(b'"first_seq":0,', b'"first_seq":-0,'))
     again = verify_file(path, [pub])
-    assert again.ok and warnings(again) == warnings(report) and again.restarts == report.restarts
+    assert not again.ok and "parse" in errors(again)
 
 
 def test_the_recorder_still_writes_a_whole_number_it_was_given_as_a_float(tmp_path, key, pub):
@@ -1409,7 +1412,7 @@ def test_a_recorder_does_not_continue_an_unsigned_record_with_an_integer_respell
     path.write_bytes(before)
     sink = FileSink(path)
     try:
-        with pytest.raises(RecorderError, match=r"failed verification \(schema\)"):
+        with pytest.raises(RecorderError, match="is not written as canonical JSON writes it"):
             Recorder(sink, agent_id="support-bot", signing_key=key)
     finally:
         sink.close()
@@ -1420,7 +1423,7 @@ def test_the_smallest_files_of_the_finding_would_be_refused():
     for value in (1.0, 0.0, 1000000.0):
         assert not mnestiq.verify.is_written_integer(value)
     assert mnestiq.verify.is_written_integer(0) and mnestiq.verify.is_written_integer(2 ** 53 - 1)
-    assert not mnestiq.verify.is_written_integer(True) and not mnestiq.verify.is_written_integer(parse_json("-0"))
+    assert not mnestiq.verify.is_written_integer(True)
     assert not mnestiq.verify.is_written_integer(parse_json("9007199254740992"))  # past 2^53 - 1: read as a double
 
 
@@ -1453,7 +1456,7 @@ def test_a_pinned_key_in_any_other_spelling_is_refused(tmp_path, capsys, kind):
         # given as one word: a key written in the URL alphabet can start with "-", which reads as an option
         assert main(["verify", str(path), f"--trusted-key={other}"]) == 2
         said = capsys.readouterr()
-        assert "is refused: it is not a file, and it is not a public key written in canonical base64" in said.err
+        assert "is refused: it is not a public key written in canonical base64" in said.err
         assert said.out == ""
     assert verify_file(path, [pub]).ok
 
@@ -1472,3 +1475,310 @@ def test_a_pinned_key_with_space_around_it_or_in_a_file_is_accepted_as_before(ev
     assert "canonical base64" in capsys.readouterr().err
     assert main(["dashboard", str(evidence), "--trusted-key", _spare_bit(pub), "--no-open"]) == 2
     assert "canonical base64" in capsys.readouterr().err
+
+
+# --- 18. text that has the form of a key is never opened as a file -----------------------------------------------
+
+def _key_with_a_file_name(alg):
+    """A key whose base64 can be the name of a file: no ``/`` in it."""
+    while True:
+        made = generate_private_key(alg) if alg else generate_private_key()
+        if "/" not in public_key_b64(made):
+            return made
+
+
+@pytest.mark.parametrize("alg", [None, P256], ids=["ed25519", "p256"])
+def test_a_file_named_like_the_pinned_key_does_not_take_its_place(tmp_path, monkeypatch, capsys, alg):
+    """The finding: ``--trusted-key`` tried its argument as a file name before it read it as a key. With a file of
+    that name in the working folder, holding another public key, the other key was the one trusted, and a file
+    signed wholly by its holder was VALID under the pin."""
+    pinned, other = _key_with_a_file_name(alg), generate_private_key()
+    pin, others = public_key_b64(pinned), public_key_b64(other)
+    path = record_demo(tmp_path / "e.jsonl", other)  # signed by someone else than the holder of the pinned key
+    (tmp_path / pin).write_text(others + "\n", "ascii")
+    monkeypatch.chdir(tmp_path)
+    assert load_public_key_b64(pin) == pin and load_public_key_b64(f" {pin}\n") == pin
+    assert main(["verify", "e.jsonl", "--trusted-key", pin]) == 1
+    assert "untrusted_key" in capsys.readouterr().out
+    assert not verify_file(path, [load_public_key_b64(pin)]).ok
+    assert not verify_file(path, [pin]).ok  # the Python call takes the key as text and opens no file
+    # The file can still be given, by a path that is not the text of a key
+    assert load_public_key_b64(f"./{pin}") == others
+    assert main(["verify", "e.jsonl", "--trusted-key", f"./{pin}"]) == 0
+
+
+def _wrong_spellings(pin):
+    """Ways a key is typed or pasted that are not the key. Each can be the name of a file."""
+    raw, backslash = base64.b64decode(pin), chr(92)
+    return {
+        "no_padding": pin.rstrip("="),
+        "more_padding": pin + "=",
+        "url_alphabet": pin.replace("+", "-").replace("/", "_").rstrip("="),
+        "twice": pin + pin,
+        "in_quotes": f"'{pin}'",
+        "hex": raw.hex(),
+        "full_stop": pin + ".",
+        "three_dots": pin[:20] + "...",
+        "comma": pin + ",",
+        "line_end_as_text": pin + backslash + "n",
+        "key_id": key_id(pin),
+        "named": "ed25519:" + pin,
+        "next_word": pin + ".Then",
+        "with_pub": pin + ".pub",
+        "with_txt": pin + ".txt",
+        "space_and_pub": pin + " .pub",
+        "no_padding_with_pub": pin.rstrip("=") + ".pub",
+        "two_extensions": pin + ".pub.bak",
+        "space_before": " " + pin + ".pub",
+        "tab_before": chr(9) + pin.rstrip("=") + ".pub.bak",
+        "old_copy": pin + ".pub-old.bak",
+        "two_stops": pin + "..pub",
+        "stop_and_space": pin + ". .pub",
+        "dated": pin + ".2026-11-15.pub",
+        "numbered": pin + ".pub (1).bak",
+        "tilde": pin + ".pub~.bak",
+        "more_padding_and_extensions": pin + "=.pub.bak",
+        "long_word": pin + ".abcdefghijk.pub",
+        "packed": pin.rstrip("=") + ".tar.gz",
+        "a_byte_short": base64.b64encode(raw[:-1]).decode("ascii"),
+        "a_byte_long": base64.b64encode(raw + b"x").decode("ascii"),
+    }
+
+
+@pytest.mark.parametrize("alg", [None, P256], ids=["ed25519", "p256"])
+def test_a_file_named_like_a_wrong_spelling_of_the_key_is_not_read(tmp_path, monkeypatch, capsys, alg):
+    """The finding: only text in the exact form of a key was kept from being opened as a file. A key given without
+    its padding, in the URL alphabet, in hex, twice, in quotes or with a full stop after it was refused when no
+    file had that name, and read as a file when one had. Whoever put the file there chose the trusted key."""
+    pinned, other = _key_with_a_file_name(alg), generate_private_key()
+    pin, others = public_key_b64(pinned), public_key_b64(other)
+    record_demo(tmp_path / "e.jsonl", other)
+    monkeypatch.chdir(tmp_path)
+    for name, given in _wrong_spellings(pin).items():
+        with contextlib.suppress(OSError):  # a name this system cannot make: then nobody else can make it either
+            Path(given).write_text(others + "\n", "ascii")
+        with pytest.raises(ValueError, match="it is not a public key written in canonical base64"):
+            load_public_key_b64(given)
+        assert main(["verify", "e.jsonl", f"--trusted-key={given}"]) == 2, name
+        said = capsys.readouterr()
+        assert "error:" in said.err and said.out == "", name
+    # a file that does have such a name can still be given, with ./ before it
+    assert load_public_key_b64(f"./{pin}.pub") == others
+
+
+def test_a_key_file_is_read_when_it_is_given_as_a_path(tmp_path, monkeypatch):
+    pub = public_key_b64(generate_private_key())
+    (tmp_path / "keys").mkdir()
+    for name in ("signing.pub", "keys/signing.pub", "key", "keys/key"):
+        (tmp_path / name).write_text(pub + "\n", "ascii")
+    monkeypatch.chdir(tmp_path)
+    paths = ["signing.pub", "keys/signing.pub", "./key", "./keys/key", f"../{tmp_path.name}/key",
+             str(tmp_path / "signing.pub")]
+    if os.name == "nt":
+        paths += ["." + chr(92) + "key", ".." + chr(92) + tmp_path.name + chr(92) + "key"]
+    for given in paths:
+        assert load_public_key_b64(given) == pub, given
+    for given in ("key", "keys/key", str(tmp_path / "key")):  # a name with no extension, and no ./ before it
+        with pytest.raises(ValueError, match="only when the file is given as a path"):
+            load_public_key_b64(given)
+
+
+def test_a_key_argument_that_cannot_be_a_file_name_is_refused_as_a_key(capsys):
+    for given in ("A" * 5000, "a" * 5001, "a\x00b"):  # too long for a file name, or with a NUL in it
+        with pytest.raises(ValueError, match="public key"):
+            load_public_key_b64(given)
+        assert main(["verify", "e.jsonl", f"--trusted-key={given}"]) == 2
+        assert "error:" in capsys.readouterr().err
+
+
+# --- 19. the limit on warnings is for each kind on its own -------------------------------------------------------
+
+def test_many_warnings_of_one_kind_do_not_push_out_a_warning_of_another_kind(tmp_path, key, pub, capsys):
+    """The finding: the limit of 1,000 warnings counted every kind together. Removing 1,001 values by hand, which
+    anyone can do and which stays VALID, gave 1,000 ``salt`` warnings, and ``signed_after_restart`` was gone."""
+    path = tmp_path / "e.jsonl"
+    rec = Recorder(FileSink(path), agent_id="a", signing_key=key, context_delta=False, checkpoint_every=100_000)
+    with rec.run() as run:
+        for _ in range(300):
+            run.llm_call(provider="p", model="m", output="ok",
+                         context=[Segment("user", text) for text in ("one", "two", "three", "four")])
+    rec._sink.close()  # as a crash leaves it: records with no checkpoint after them
+    with Recorder(FileSink(path), agent_id="a", signing_key=key):
+        pass
+    assert "signed_after_restart" in warnings(verify_file(path, [pub]))
+    records = load(path)
+    for r in records:
+        for segment in r.get("context") or []:
+            del segment["content"]
+    dump(path, records)
+    report = verify_file(path, [pub])
+    assert report.ok, report.errors
+    codes = [w.code for w in report.warnings]
+    assert codes.count("salt") == 1000 and report.more_warnings == 200 and "too_many_warnings" in codes
+    assert codes.count("signed_after_restart") == 1 and report.restarts
+    assert main(["verify", str(path), "--trusted-key", pub]) == 0
+    assert "signed_after_restart: " in capsys.readouterr().out
+
+
+# --- 20. a file the recorder refuses after reading its chain is not mended ---------------------------------------
+
+@pytest.mark.parametrize("end", ["a whole record with no line end", "a part of a record"])
+@pytest.mark.parametrize("fault", ["a changed value", "another key"])
+def test_a_file_refused_for_its_hashes_or_its_key_is_left_as_it_was(evidence, tmp_path, key, end, fault):
+    """The finding: the sink mended the end of a file whose lines read well, and the recorder, which reads the
+    hashes and the signatures after that, then refused it. The file had other bytes, and a side file appeared."""
+    if fault == "a changed value":
+        records = load(evidence)
+        records[1]["agent_id"] = "someone-else"
+        dump(evidence, records)
+    data = evidence.read_bytes()
+    before = data[:-1] if end == "a whole record with no line end" else data + CUT
+    evidence.write_bytes(before)
+    folder, stamp = sorted(p.name for p in tmp_path.iterdir()), os.stat(evidence).st_mtime_ns
+    sink = FileSink(evidence)
+    with pytest.raises(RecorderError):
+        Recorder(sink, agent_id="support-bot", signing_key=generate_private_key() if fault == "another key" else key)
+    sink.close()
+    assert evidence.read_bytes() == before and os.stat(evidence).st_mtime_ns == stamp
+    assert sorted(p.name for p in tmp_path.iterdir()) == folder  # no side file
+    assert sink.recovered is None
+
+
+# --- 21. a number has one spelling, in every field ---------------------------------------------------------------
+
+NUMBERS = {"amount": 4100, "huge": 1e21, "none": 0, "rate": 0.5, "tiny": 1e-7}
+RESPELLED = [("amount", "4100", other) for other in
+             ("4100.0", "41e2", "4.1e3", "4.1E3", "4100.00", "4100e0", "410e1", "0.41e4", "4100e-0", "41000e-1",
+              "4100.000000000000000000001", "4.1e+3")]
+RESPELLED += [("none", "0", "-0"), ("none", "0", "0.0"), ("none", "0", "-0.0"), ("none", "0", "0e0"),
+              ("rate", "0.5", "0.50"), ("rate", "0.5", "5e-1"), ("rate", "0.5", "0.5e0"),
+              ("rate", "0.5", "0.5000000000000000000000001"),
+              ("tiny", "1e-7", "0.0000001"), ("tiny", "1e-7", "1E-7"), ("tiny", "1e-7", "1e-07"),
+              ("tiny", "1e-7", "1.0e-7"), ("tiny", "1e-7", "10e-8"),
+              ("huge", "1e+21", "1e21"), ("huge", "1e+21", "1E+21"), ("huge", "1e+21", "10e20"),
+              ("huge", "1e+21", "1.0e+21")]
+
+
+def _with_numbers(evidence, key):
+    """The demo run with numbers in a field the schema does not type, signed again by the key holder."""
+    records = load(evidence)
+    call = next(r for r in records if r.get("event_type") == "tool_call")
+    call["attributes"] = dict(NUMBERS)
+    dump(evidence, reseal(records, key))
+    return evidence.read_bytes()
+
+
+def test_numbers_as_the_recorder_writes_them_are_read(evidence, key, pub):
+    data = _with_numbers(evidence, key)
+    for name, text, _ in RESPELLED:
+        assert data.count(f'"{name}":{text}'.encode()) == 1
+    report = verify_file(evidence, [pub])
+    assert report.ok and not report.errors
+    call = next(r for r in load(evidence) if r.get("event_type") == "tool_call")
+    assert call["attributes"] == NUMBERS
+
+
+@pytest.mark.parametrize(("name", "text", "other"), RESPELLED, ids=[f"{n}_{o}" for n, _, o in RESPELLED])
+def test_a_number_in_another_spelling_is_refused_in_every_field(evidence, key, pub, capsys, name, text, other):
+    """The finding: a number in a field the schema does not type could be written with a fraction, an exponent
+    or digits that a double does not keep. It hashed like the canonical spelling, so the file stayed VALID with
+    no warning, and a reader with exact decimals read another number than the one that was signed."""
+    data = _with_numbers(evidence, key)
+    assert float(other) == float(text)  # the same double, so every hash and the signature still hold
+    evidence.write_bytes(data.replace(f'"{name}":{text}'.encode(), f'"{name}":{other}'.encode()))
+    report = verify_file(evidence, [pub])
+    assert not report.ok and "parse" in errors(report)
+    assert any("is not written as canonical JSON writes it" in m for m in messages(report, "parse"))
+    assert main(["verify", str(evidence), "--trusted-key", pub]) == 1
+    assert "INVALID" in capsys.readouterr().out
+
+
+def test_every_double_is_read_in_its_canonical_spelling_and_in_no_other():
+    rng = random.Random(53)
+    for _ in range(20_000):
+        value = float.fromhex(rng.random().hex()) * 10.0 ** rng.randint(-300, 300)
+        text = canonical_json(value).decode("ascii")
+        assert parse_json(text) == value and canonical_json(parse_json(text)).decode("ascii") == text
+        for other in (text + ".0", text + "e0", text + "0", "0" + text, "+" + text, text.replace("e", "E"),
+                      f"{value!r}", f"{value:.20e}", f"{value:.25g}"):
+            try:
+                same = float(other) == value
+            except ValueError:  # not a number at all
+                same = False
+            if other == text or not same:  # only another spelling of this number is of interest
+                continue
+            with pytest.raises(ValueError):
+                parse_json(other)
+
+
+def test_what_the_recorder_writes_for_any_number_is_read_back(tmp_path, key, pub):
+    path = tmp_path / "n.jsonl"
+    numbers = [0, -0.0, 1.0, -1.5, 0.1, 1e21, 1e-7, 5e-324, 1.7976931348623157e308, 2.0 ** 53, 3e18, 123456.789,
+               1e16, 1e-5, 100.0, 2 ** 53 - 1, -(2 ** 53 - 1)]
+    with Recorder(FileSink(path), agent_id="a", signing_key=key) as rec, rec.run() as run:
+        run.tool_call("sum", {"numbers": numbers}, {"total": sum(numbers)})
+        run.note("numbers", values=numbers)
+    report = verify_file(path, [pub])
+    assert report.ok and not report.errors, report.errors
+
+
+# --- 22. inspect says what the verifier says ---------------------------------------------------------------------
+
+def test_inspect_prints_the_warnings_of_the_verifier(evidence, capsys):
+    """The finding: ``inspect`` printed none of the verifier's warnings, and listed records that no signature
+    covers like every other record."""
+    lines = lines_of(evidence)
+    assert json.loads(lines[-1])["kind"] == "checkpoint"
+    evidence.write_bytes(b"".join(lines[:-1]))  # the last checkpoint is gone: what it covered is unsigned
+    report = verify_file(evidence)
+    assert report.ok and report.unsigned_tail and "unsigned_tail" in warnings(report)
+    assert main(["inspect", str(evidence)]) == 0
+    out = capsys.readouterr().out
+    assert "unsigned_tail: " in out and "untrusted_key: " not in out
+    assert out.count("warning ") == len(report.warnings) - 1  # all but the one its last line says in its own words
+    assert (f"No signature that was checked covers what is listed after seq {report.signed_through_seq}: "
+            f"{report.unsigned_tail} record(s).") in out
+
+
+def test_inspect_does_not_say_signed_by_for_a_signature_it_cannot_check(evidence, capsys):
+    records = load(evidence)
+    last = records[-1]
+    assert last["kind"] == "checkpoint"
+    last.update(spec_version="1.9", sig_alg="made-up-alg")  # a later minor version may sign in another way
+    dump(evidence, reseal(records))
+    report = verify_file(evidence)
+    assert "unverifiable" in warnings(report) and report.unsigned_tail
+    main(["inspect", str(evidence)])
+    out = capsys.readouterr().out
+    listed = next(line for line in out.splitlines() if f"#{last['seq']:<5} ---- checkpoint" in line)
+    assert "signature NOT CHECKED" in listed and "made-up-alg" in listed and "signed by" not in listed
+    assert "unverifiable: " in out and "newer_version: " in out
+    assert sum("signed by" in line for line in out.splitlines()) == report.checkpoints
+
+
+# --- 23. a salt has its length wherever its digest is checked ----------------------------------------------------
+
+@pytest.mark.parametrize("schema", [True, False])
+def test_a_byte_cannot_be_moved_between_a_salt_and_its_value(evidence, key, pub, schema):
+    """The digest is over the salt's bytes and then the value's. Only the length of the salt keeps the two apart,
+    and only the schema held a salt to its length: a verifier made with ``schema=False`` accepted 100 with the
+    salt and a 4 for the recorded 4100."""
+    records = load(evidence)
+    call = next(r for r in records if r.get("event_type") == "tool_call")["tool_calls"][0]
+    call["result"] = 4100
+    call["result_hash"] = salted_digest(call["result_salt"], 4100)
+    dump(evidence, reseal(records, key))
+
+    def verdict():
+        verifier = ChainVerifier([pub], schema=schema)
+        verifier.feed(lines_of(evidence))
+        return verifier.result()
+
+    assert verdict().ok
+    call["result"] = 100
+    call["result_salt"] = base64.b64encode(base64.b64decode(call["result_salt"]) + b"4").decode("ascii")
+    assert salted_digest(call["result_salt"], 100) == call["result_hash"]  # the same digest for another value
+    dump(evidence, records)  # no key needed: the value and its salt are not under the record's hash
+    report = verdict()
+    assert not report.ok and "salt" in errors(report)
+    assert any("is not 16 bytes" in m for m in messages(report, "salt"))

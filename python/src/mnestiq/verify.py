@@ -28,7 +28,6 @@ from .canonical import (
     MAX_DEPTH,
     MAX_SAFE_INTEGER,
     CanonicalizationError,
-    MinusZero,
     RefusedJSON,
     canonical_json,
     nested_too_deep,
@@ -36,6 +35,7 @@ from .canonical import (
 )
 from .hashing import (
     GENESIS_HASH,
+    SALT_BYTES,
     SALT_SUFFIX,
     digest_bytes,
     iter_redactable_paths,
@@ -87,7 +87,7 @@ class Report:
     # Bytes after the last line end of the file that are not a whole record: not read, not counted. A whole record
     # there is read as the last line, leaves this at 0 and gets the warning no_final_newline.
     incomplete_tail_bytes: int = 0
-    more_warnings: int = 0  # warnings about single records past the first MAX_PROBLEMS, which are not kept
+    more_warnings: int = 0  # warnings about single records past the first MAX_PROBLEMS of their code: not kept
 
     keep_every_warning = False  # set for the few warnings about the file as a whole, which are always kept
 
@@ -96,9 +96,15 @@ class Report:
         self.errors.append(Issue(code, message, line, seq))
 
     def warn(self, code: str, message: str, line: int | None = None, seq: int | None = None) -> None:
-        if len(self.warnings) >= MAX_PROBLEMS and not self.keep_every_warning:
-            self.more_warnings += 1  # a warning for every line of a large file must not fill memory
-            return
+        if not self.keep_every_warning:
+            # A warning for every line of a large file must not fill memory. The limit is for each code on its
+            # own: counted together, a thousand warnings of one kind, which anyone can cause by removing
+            # values, would push out the one warning of another kind that a reader has to see.
+            kept: dict[str, int] = self.__dict__.setdefault("_kept", {})  # not a field: not part of to_dict
+            if kept.get(code, 0) >= MAX_PROBLEMS:
+                self.more_warnings += 1
+                return
+            kept[code] = kept.get(code, 0) + 1
         self.warnings.append(Issue(code, message, line, seq))
 
     def to_dict(self) -> dict:
@@ -356,11 +362,10 @@ def _pattern(validator: Any, pattern: str, instance: Any, schema: dict) -> Itera
 
 
 def is_written_integer(value: Any) -> bool:
-    """Whether a value read from an evidence file is an integer written as one: digits alone, no fraction and
-    no exponent, and not ``-0``. JSON Schema calls ``1.0`` an integer too. The format does not: a number has one
-    spelling in a field the schema types as an integer, so that no reader can take ``1.0`` or ``-0`` for another
-    text than ``1`` or ``0`` and the bytes of a signed record cannot be changed there without a trace."""
-    return isinstance(value, int) and not isinstance(value, (bool, MinusZero))
+    """Whether a value is an integer and not a float that holds a whole number. JSON Schema calls ``1.0`` an
+    integer too. The format does not. A line of a file never gets this far with ``1.0`` or ``-0`` in it: a
+    number has one spelling there, and ``parse_json`` refuses any other. A record handed over by a caller can."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _type(validator: Any, types: Any, instance: Any, schema: dict) -> Iterator[ValidationError]:
@@ -369,9 +374,7 @@ def _type(validator: Any, types: Any, instance: Any, schema: dict) -> Iterator[V
     wanted = [types] if isinstance(types, str) else list(types)
     if any(validator.is_type(instance, each) for each in wanted):
         return
-    if "integer" in wanted and isinstance(instance, MinusZero):
-        yield ValidationError("-0 is not accepted in an integer field: zero is written 0")
-    elif "integer" in wanted and isinstance(instance, float) and instance.is_integer():
+    if "integer" in wanted and isinstance(instance, float) and instance.is_integer():
         if abs(instance) > MAX_SAFE_INTEGER:
             yield ValidationError(f"{instance!r} is past 2^53 - 1, the largest whole number an integer field holds")
         else:
@@ -666,6 +669,11 @@ class ChainVerifier:
                 if not _is_exact_b64(salt):
                     report.error("salt", f"{path}{SALT_SUFFIX} is not base64 in its one canonical spelling",
                                  line_no, seq)
+                elif len(_exact_b64(salt)) != SALT_BYTES:
+                    # The digest is over the salt's bytes and then the value's, with nothing between them. With
+                    # a salt of any length, a byte could be moved from one to the other under the same digest.
+                    # The schema says the same, and this holds where the schema is not applied.
+                    report.error("salt", f"{path}{SALT_SUFFIX} is not {SALT_BYTES} bytes", line_no, seq)
                 elif salt in salts:
                     report.error("salt", f"{path}{SALT_SUFFIX} is also the salt of {salts[salt]}: in one record "
                                          "every value has a salt of its own", line_no, seq)
@@ -860,7 +868,7 @@ class ChainVerifier:
         if report.more_warnings:
             report.warnings.append(Issue("too_many_warnings",
                                          f"{report.more_warnings} more warning(s) about single records are not "
-                                         f"listed: only the first {len(report.warnings)} are kept"))
+                                         f"listed: only the first {MAX_PROBLEMS} of each kind are kept"))
         report.keep_every_warning = True  # what follows is about the file as a whole, a handful at most
         report.unsigned_tail = len(self.pending) + self.unverified_tail
         report.incomplete_tail_bytes = self.incomplete_tail_bytes

@@ -28,18 +28,23 @@ class CanonicalizationError(ValueError):
 
 
 class RefusedJSON(CanonicalizationError):
-    """JSON that parses, and that this format does not accept: a value nested past ``MAX_DEPTH``, or a large
-    whole number that is not written the way canonical JSON writes it."""
+    """JSON that parses, and that this format does not accept: a value nested past ``MAX_DEPTH``, or a number
+    that is not written the way canonical JSON writes it."""
 
 
 def parse_json(data: str | bytes) -> Any:
     """Parse JSON as every verifier must: no duplicate keys, no NaN or Infinity, nothing nested deeper than
-    ``MAX_DEPTH``, and one spelling for a whole number past 2^53 - 1.
+    ``MAX_DEPTH``, and one spelling for every number: the one canonical JSON writes.
 
     Python's ``json.loads`` keeps the last of two equal keys, other parsers keep the first,
     and it accepts ``NaN``. Either would let one evidence line mean two different things to
     two verifiers, so both are refused. How deep a parser can go differs between languages and
     between versions of Python, so the limit is counted here and is the same everywhere.
+
+    A number has many spellings that read as the same double (``4100``, ``4100.0``, ``41e2``, and ``88412`` with
+    a fraction too small to keep). All of them hash alike, and a reader with exact decimals or with another
+    number type takes some of them for another value. A recorder writes canonical JSON, so every number it
+    wrote is in the one spelling that is accepted here. Space, the order of keys and escapes in text are free.
     """
     if isinstance(data, bytes):  # json.loads would guess: UTF-16 or a BOM must not read here and fail in the verifier
         data = data.decode("utf-8")
@@ -72,31 +77,25 @@ def nested_too_deep(text: str) -> bool:
     return False
 
 
-class MinusZero(int):
-    """The integer 0 as read from the text ``-0``. It is 0 to everything that computes, compares or writes with it,
-    and canonical JSON writes it ``0``, so no hash can tell the two apart. The schema check can: a field typed as
-    an integer has one spelling for each integer, and refuses this one."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "-0"
-
-
-MINUS_ZERO = MinusZero(0)
-
 _MAX_PLAIN_DIGITS = 21  # canonical JSON writes a number of 1e21 or more with an exponent, never as digits alone
 
 
+def _not_canonical(text: str, spelling: str) -> RefusedJSON:
+    return RefusedJSON(f"the number {text[:40]} is not written as canonical JSON writes it ({spelling})")
+
+
 def _number(text: str) -> int | float:
-    """Integers past 2^53 - 1 read as doubles, as in JavaScript. JCS writes a large whole-number
-    double such as 3e18 as ``3000000000000000000``, which must read back as that double.
+    """A number written with digits alone. Integers past 2^53 - 1 read as doubles, as in JavaScript. JCS writes
+    a large whole-number double such as 3e18 as ``3000000000000000000``, which must read back as that double.
 
     Many integer texts read as the same double: ``9007199254740993`` is 2^53 to this parser and another
     number to one with exact integers. Past 2^53 - 1 only the text canonical JSON writes for the double is
-    accepted, so a number has one spelling there and every reader gets the value that was hashed."""
+    accepted, so a number has one spelling there and every reader gets the value that was hashed. Zero with a
+    minus sign is refused for the same reason: canonical JSON writes it ``0``."""
     if len(text) <= 15:  # too short to be past 2^53 - 1
-        return MINUS_ZERO if text == "-0" else int(text)
+        if text == "-0":
+            raise _not_canonical(text, "0")
+        return int(text)
     if len(text.lstrip("-")) > _MAX_PLAIN_DIGITS:  # also keeps int() away from text of any length
         raise RefusedJSON(f"the whole number {text[:24]}... is not written as canonical JSON writes a number "
                           "of that size")
@@ -112,9 +111,18 @@ def _number(text: str) -> int | float:
 
 
 def _float(text: str) -> float:
+    """A number written with a fraction or an exponent. Accepted only as canonical JSON writes the double it
+    reads as: ``0.5`` and ``1e+21``, and not ``4100.0``, ``41e2``, ``1E3``, ``0.50`` or ``-0.0``."""
     value = float(text)
     if math.isinf(value):  # 1e999: JSON can spell it, and nothing can hash or send it on
         raise CanonicalizationError(f"number {text[:20]} is too large for JSON")
+    shortest = repr(value)
+    # Nearly every fraction a recorder wrote: Python and ECMAScript print it alike when it has no exponent
+    if shortest == text and "e" not in shortest and not shortest.endswith(".0"):
+        return value
+    spelling = _format_number(value)
+    if spelling != text:
+        raise _not_canonical(text, spelling)
     return value
 
 

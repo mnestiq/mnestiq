@@ -181,23 +181,45 @@ def reading_variants(good: list[dict]) -> dict[str, tuple[bytes, str, dict]]:
                                  "missing.",
                                  {"ok": True, "errors": [], "warnings": ["no_final_newline"]})
 
-    # A field the schema types as an integer holds an integer written as one. Both spellings below have the
-    # canonical bytes of the integer, so every hash and the signature still hold: only this rule refuses them.
+    # A number is written as canonical JSON writes it. Both spellings below have the canonical bytes of the
+    # integer, so every hash and the signature would still hold: only this rule refuses them.
     fraction = list(lines)
     assert fraction[1].count(b'"step_id":1,') == 1
     fraction[1] = fraction[1].replace(b'"step_id":1,', b'"step_id":1.0,')
     out["integer-with-fraction"] = (b"\n".join(fraction) + b"\n",
-                                    "step_id of the record at seq 1 written 1.0. An integer field is written "
-                                    "without a fraction or an exponent, in every field the schema types as an "
-                                    "integer.",
-                                    {"ok": False, "errors": ["schema"], "warnings": []})
+                                    "step_id of the record at seq 1 written 1.0. A number is written as "
+                                    "canonical JSON writes it, here 1. The line is refused, so the record at "
+                                    "seq 1 is missing from the chain.",
+                                    {"ok": False, "errors": ["context_base", "link", "merkle_root", "parse", "seq"],
+                                     "warnings": []})
     minus = list(lines)
     assert minus[0].count(b'"seq":0,') == 1
     minus[0] = minus[0].replace(b'"seq":0,', b'"seq":-0,')
     out["integer-minus-zero"] = (b"\n".join(minus) + b"\n",
-                                 "seq of the first record written -0. Zero has one spelling in an integer "
-                                 "field, 0.",
-                                 {"ok": False, "errors": ["schema"], "warnings": []})
+                                 "seq of the first record written -0. Zero has one spelling, 0. The line is "
+                                 "refused, so the first record is missing from the chain.",
+                                 {"ok": False, "errors": ["checkpoint_range", "link", "merkle_root", "parse", "seq"],
+                                  "warnings": []})
+
+    # The same rule in a field the schema does not type: every number, wherever it stands.
+    amounts = chain(with_attributes({"amount": 4100, "rate": 0.5, "tiny": 1e-7, "huge": 1e21}))
+    out["fractions"] = (as_bytes(amounts),
+                        "Numbers with a fraction or an exponent in a record, written as canonical JSON writes "
+                        "them: 0.5, 1e-7 and 1e+21, beside the whole number 4100.",
+                        {"ok": True, "errors": [], "warnings": []})
+    assert as_bytes(amounts).count(b'"amount":4100,') == 1
+    out["respelled-number"] = (as_bytes(amounts).replace(b'"amount":4100,', b'"amount":4100.0,'),
+                               "The same file with 4100 written 4100.0. Both are the same number and hash "
+                               "alike. A number has one accepted spelling, the canonical one: the line is "
+                               "refused, so the record at seq 5 is missing from the chain. 41e2 and 4.1e3 are "
+                               "refused in the same way.",
+                               {"ok": False, "errors": ["link", "merkle_root", "parse", "seq"], "warnings": []})
+    out["number-lost-digits"] = (as_bytes(amounts).replace(b'"amount":4100,',
+                                                           b'"amount":4100.000000000000000000001,'),
+                                 "The same file with 4100 written 4100.000000000000000000001. A double cannot "
+                                 "keep the last digit, so it reads as 4100 and every hash still matches, and a "
+                                 "reader with exact decimals sees another number. The line is refused.",
+                                 {"ok": False, "errors": ["link", "merkle_root", "parse", "seq"], "warnings": []})
 
     # Whole numbers past 2^53 - 1 are doubles. Canonical JSON writes each in one way: 2^53 in full, and 2^63 as
     # its shortest digits and zeros, which is not the exact integer of that double (9223372036854775808).

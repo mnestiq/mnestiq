@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -216,22 +217,74 @@ def load_private_key(path: str | Path) -> PrivateKey:
     return key
 
 
+def _has_key_form(text: str) -> bool:
+    """Canonical base64 of 32 bytes (Ed25519) or 65 bytes (P-256): what a public key is written as. Says
+    nothing about whether those bytes are a usable key."""
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError:  # also text that is not ASCII
+        return False
+    return len(raw) in (32, 65) and base64.b64encode(raw).decode("ascii") == text
+
+
+_EXPLICIT_PATH = ("./", "../", ".\\", "..\\")
+_EXTENSION = re.compile(r"\.[A-Za-z0-9]{1,10}\Z")
+_KEY_LETTERS = re.compile(r"[A-Za-z0-9+/]+")
+
+
+def _written_as_a_path(text: str) -> bool:
+    """Whether text is written as the path of a file: it starts with ``./`` or ``../`` (or with a backslash in
+    place of the slash), or it ends in an extension such as ``.pub``. No way of writing a key does either. Not
+    the key itself, and not a key in another alphabet, without its padding, in quotes, in hex, written twice,
+    with a full stop after it, as copied out of JSON, or given as its key id.
+
+    Text that starts with a key is not a path either, whatever comes after the key: ``<key>.Then``, where a key
+    ended a sentence and the next word came with it, ``<key>.pub``, ``<key>.pub.bak``, ``<key>..pub``. A file
+    that has such a name is given with ``./`` before it."""
+    if text.startswith(_EXPLICIT_PATH):
+        return True
+    if _EXTENSION.search(text) is None:
+        return False
+    return not _starts_with_a_key(text)
+
+
+def _starts_with_a_key(text: str) -> bool:
+    """Whether the letters, digits, ``+`` and ``/`` that text starts with, after any spaces, are a key, with or
+    without its padding."""
+    start = _KEY_LETTERS.match(text.lstrip())
+    return start is not None and any(_has_key_form(start.group() + padding) for padding in ("", "=", "=="))
+
+
 def load_public_key_b64(value: str) -> str:
-    """Accept a path to a .pub file or a literal base64 key, with spaces or a line end around it. Returns the
-    base64 text. The key must be in the canonical base64 of its bytes: any other spelling is refused."""
-    candidate = Path(value)
-    if candidate.is_file():
-        value = candidate.read_text(encoding="ascii")
+    """Accept a literal base64 key, with spaces or a line end around it, or a path to a .pub file. Returns the
+    base64 text. The key must be in the canonical base64 of its bytes: any other spelling is refused.
+
+    Only text that is written as a path is opened as a file: ``signing.pub``, ``keys/signing.pub``, ``./name``.
+    Anything else is the key, or is refused. A file in the working folder that has the key, or a wrong spelling
+    of it, as its name would otherwise take the place of the key that was given, and whoever put it there would
+    choose which key is trusted."""
+    if not _has_key_form(value.strip()) and _written_as_a_path(value):
+        candidate = Path(value)
+        try:
+            is_file = candidate.is_file()
+        except (OSError, ValueError):  # a name too long for the system, or one with a NUL in it
+            is_file = False
+        if is_file:
+            value = candidate.read_text(encoding="ascii")
     value = value.strip()
     try:
         canonical = base64.b64encode(base64.b64decode(value, validate=True)).decode("ascii") == value
     except ValueError:  # also text that is not ASCII
         canonical = False
+    not_a_key = ValueError(f"the public key {value[:12]}... is refused: it is not a public key written in canonical "
+                           "base64. A key is read from a file only when the file is given as a path: a name that "
+                           "ends in an extension, such as signing.pub, or one that starts with ./")
     if not canonical:
-        raise ValueError(f"the public key {value[:12]}... is refused: it is not a file, and it is not a public key "
-                         "written in canonical base64")
+        raise not_a_key
     try:
         load_public_key(value)  # validates length/encoding
     except WeakKeyError as exc:
         raise WeakKeyError(f"the public key {value[:12]}... is refused: {exc}") from None
+    except ValueError:  # base64 of some other number of bytes, or 65 bytes that are not a point of the curve
+        raise not_a_key from None
     return value

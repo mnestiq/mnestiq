@@ -135,18 +135,54 @@
       ]
     },
     "integer-with-fraction.jsonl": {
-      "about": "step_id of the record at seq 1 written 1.0. An integer field is written without a fraction or an exponent, in every field the schema types as an integer.",
+      "about": "step_id of the record at seq 1 written 1.0. A number is written as canonical JSON writes it, here 1. The line is refused, so the record at seq 1 is missing from the chain.",
       "ok": false,
       "errors": [
-        "schema"
+        "context_base",
+        "link",
+        "merkle_root",
+        "parse",
+        "seq"
       ],
       "warnings": []
     },
     "integer-minus-zero.jsonl": {
-      "about": "seq of the first record written -0. Zero has one spelling in an integer field, 0.",
+      "about": "seq of the first record written -0. Zero has one spelling, 0. The line is refused, so the first record is missing from the chain.",
       "ok": false,
       "errors": [
-        "schema"
+        "checkpoint_range",
+        "link",
+        "merkle_root",
+        "parse",
+        "seq"
+      ],
+      "warnings": []
+    },
+    "fractions.jsonl": {
+      "about": "Numbers with a fraction or an exponent in a record, written as canonical JSON writes them: 0.5, 1e-7 and 1e+21, beside the whole number 4100.",
+      "ok": true,
+      "errors": [],
+      "warnings": []
+    },
+    "respelled-number.jsonl": {
+      "about": "The same file with 4100 written 4100.0. Both are the same number and hash alike. A number has one accepted spelling, the canonical one: the line is refused, so the record at seq 5 is missing from the chain. 41e2 and 4.1e3 are refused in the same way.",
+      "ok": false,
+      "errors": [
+        "link",
+        "merkle_root",
+        "parse",
+        "seq"
+      ],
+      "warnings": []
+    },
+    "number-lost-digits.jsonl": {
+      "about": "The same file with 4100 written 4100.000000000000000000001. A double cannot keep the last digit, so it reads as 4100 and every hash still matches, and a reader with exact decimals sees another number. The line is refused.",
+      "ok": false,
+      "errors": [
+        "link",
+        "merkle_root",
+        "parse",
+        "seq"
       ],
       "warnings": []
     },

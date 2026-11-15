@@ -432,6 +432,11 @@ class Recorder:
                 raise ValueError(
                     f"sink already holds chain {last['chain_id']!r}; cannot write chain {chain_id!r} to it"
                 )
+            # Only now, with the chain read and found whole, is the end of the file mended: a file that is
+            # refused above is left byte for byte as it was.
+            mend = getattr(sink, "mend", None)
+            if callable(mend):
+                mend()
         except (RecorderError, ValueError) as damage:
             if on_damaged != "new_file":
                 raise
