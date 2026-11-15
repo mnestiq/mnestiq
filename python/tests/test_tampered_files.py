@@ -1,4 +1,4 @@
-"""Red-team tests against the verifier, the rules, redact and the dashboard.
+"""Tampered-file tests against the verifier, the rules, redact and the dashboard.
 
 Each test builds a real file with the real Recorder and then acts as an attacker who can write to the
 file but does not hold the signing key. A test marked xfail is an attack that works today. When the
@@ -308,14 +308,6 @@ def test_held_respelled_bytes_read_the_same(tmp_path, key, pub):
 
 
 @needs_node
-def test_page_and_rules_disagree_on_a_respelled_number(tmp_path, key, pub):
-    path = hijacked_delete(tmp_path / "e.jsonl", key)
-    path.write_bytes(path.read_bytes().replace(b'"file_id":4100', b'"file_id":4100.0'))
-    must(verify_file(path, [pub]).ok, "the respelled file verifies")
-    assert sorted(rule_ids(path)) == sorted(page_rule_ids(tmp_path, path, pub))
-
-
-@needs_node
 def test_page_and_rules_disagree_on_a_host_after_an_accent(tmp_path, key, pub):
     path = tmp_path / "e.jsonl"
     rec = Recorder(FileSink(path), agent_id="bot", signing_key=key, sandbox_id=None)
@@ -353,7 +345,8 @@ def test_inspect_prints_one_line_per_record(tmp_path, key, capsys):
     rc = main(["inspect", str(path)])
     must(rc == 0, "inspect runs")
     printed = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert len(printed) == len(load(path))
+    # One line for each record, then the line that says whether the file verifies.
+    assert len(printed) == len(load(path)) + 1 and printed[-1].startswith("This listing is not a check.")
     assert any("boom\\n2026" in line for line in printed)
 
 
@@ -369,13 +362,17 @@ def test_junk_lines_hide_a_file_from_the_dashboard(tmp_path, key):
 # Goal 3: a real finding missed on a file that still verifies VALID.
 
 
-def test_respelled_number_keeps_mnq004(tmp_path, key, pub):
+def test_a_respelled_number_is_refused(tmp_path, key, pub):
+    """4100 written 4100.0 hashes like 4100. It used to verify, and the rules had to read both alike. Now a number
+    has one accepted spelling, and the file is INVALID."""
     path = hijacked_delete(tmp_path / "e.jsonl", key)
     must("MNQ-004" in rule_ids(path), "the honest file has the finding")
-    path.write_bytes(path.read_bytes().replace(b'"file_id":4100', b'"file_id":4100.0'))
-    report = verify_file(path, [pub])
-    must(report.ok and not report.warnings, "the respelled file verifies with no warning")
-    assert "MNQ-004" in rule_ids(path)
+    must(verify_file(path, [pub]).ok, "the honest file verifies")
+    for other in (b"4100.0", b"41e2", b"4.1e3", b"4100.000000000000000000001"):
+        changed = tmp_path / "changed.jsonl"
+        changed.write_bytes(path.read_bytes().replace(b'"file_id":4100', b'"file_id":' + other))
+        report = verify_file(changed, [pub])
+        assert not report.ok and "parse" in {e.code for e in report.errors}
 
 
 def test_carry_budget_marks_the_call_as_incomplete(tmp_path, key, pub):

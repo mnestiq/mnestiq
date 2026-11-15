@@ -14,7 +14,7 @@ from typing import BinaryIO, Protocol
 from collections.abc import Iterator
 
 from .canonical import canonical_json, parse_json
-from .verify import is_blank
+from .verify import GZIP_MAGIC, LineError, closed_object, parse_line
 
 
 class RecorderError(Exception):
@@ -35,8 +35,20 @@ class FileSink:
     """JSON Lines file, opened in append mode. One canonical record per line.
 
     Crash safety:
-      * On open, a torn final line (the process died mid-write) is moved to a
+      * A torn final line (the process died mid-write) is moved to a
         ``<file>.torn-<time>`` sidecar, never deleted, and ``recovered`` describes it.
+      * A last line that is a whole record with no line end is kept and given its line end,
+        so that the next record starts on a new line.
+      * Both are decided when the file is opened and done by ``mend``: a recorder calls it once it
+        has read the chain and will continue it, and ``append`` does it before the first record.
+        Until then the file is as it was found, and ``existing`` gives the records without the torn part.
+      * On open, a file that holds only spaces, tabs and line ends is emptied: it holds no evidence,
+        and the chain starts as in an empty file.
+      * None of this is done to a file a recorder cannot continue. A gzip file, a line that does not
+        read as a record of the one chain, or a last line that is neither a whole record nor a part of
+        one leaves the file byte for byte as it was, with no side file: ``existing`` and ``append``
+        then raise ``SinkError`` saying why. So does a file whose lines read well and whose hashes or
+        signatures the recorder then refuses: it is never mended.
       * If a write fails (disk full, I/O error), any partial bytes are truncated so
         the file never holds half a record, then the error is raised.
 
@@ -63,6 +75,14 @@ class FileSink:
         self._fsync = fsync
         self._lock = threading.Lock()
         self._cut_at: int | None = None  # where a half-written line that could not be removed starts
+        # Why this file cannot be continued, when opening it found that out. Nothing was changed in it then, and
+        # nothing is written to it: reading it back and appending both raise this.
+        self._refused: str | None = None
+        # What opening the file decided to do to its end and has not done yet: where the last line starts, its
+        # bytes, and whether it is a whole record (it gets its line end) or a part of one (it is set aside).
+        # Done by ``mend``, or before the first record is appended. Until then the file is as it was found.
+        self._pending: tuple[int, bytes, bool] | None = None
+        self.recovered: dict | None = None  # the part of a record that was set aside: bytes, sidecar
         fd = _open_evidence(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
         # Unbuffered: a write that fails must not stay in a buffer and land in the file later.
         self._fh = os.fdopen(fd, "ab", buffering=0)
@@ -72,20 +92,36 @@ class FileSink:
             self._fh.close()
             raise SinkError(f"{self.path} is already being written by another recorder") from exc
         try:
-            self.recovered: dict | None = self._recover_torn_tail()
+            self._look_at_the_end()
         except Exception:
             _unlock(self._fh)
             self._fh.close()
             raise
         self._fh.seek(0, os.SEEK_END)
 
-    def _recover_torn_tail(self) -> dict | None:
+    def _look_at_the_end(self) -> None:
+        """Decide, with nothing written, whether this is a file a recorder can continue, and what its end needs."""
         locked = os.fstat(self._fh.fileno())
         if locked.st_size == 0:
             return None
         with os.fdopen(_open_evidence(self.path, os.O_RDWR), "rb+") as fh:
             if not os.path.samestat(os.fstat(fh.fileno()), locked):  # cutting a line is for the file this sink holds
                 raise SinkError(f"{self.path} was replaced while it was being opened")
+            # A gzip file of evidence ends in bytes that look like a cut write, and so does any other file that
+            # is no evidence: mended first and refused afterwards, a file that verified would not verify any
+            # more. So the end is not mended here. The sink can only judge the form of the lines. The recorder
+            # reads the hashes and the signatures after this, and it too must find the file as it was.
+            if fh.read(2) == GZIP_MAGIC:
+                self._refused = f"{self.path} is a gzip file. Unpack it first"
+                return None
+            if _only_whitespace(fh):
+                # Nothing but spaces and line ends, as a script that made the file in advance leaves. That is no
+                # evidence, and a record written after a blank line would never verify: the file starts empty.
+                if os.fstat(fh.fileno()).st_nlink > 1:  # as below: no cut of a file that has other names
+                    raise SinkError(f"{self.path} holds only blank lines and has other hard links: it will not "
+                                    "be emptied under its other names. Give this file its own copy and open that")
+                fh.truncate(0)
+                return None
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             fh.seek(max(0, size - 1))
@@ -105,18 +141,48 @@ class FileSink:
                 pos = read_from
             fh.seek(start)
             tail = fh.read()
-            try:
-                parse_json(tail)
-                complete = True
-            except (ValueError, RecursionError):
-                complete = False
-            if complete:  # the record was fully written, only the newline is missing
+            whole = closed_object(tail)  # a whole record whose line end is missing, by the verifier's own test
+            problem = _not_continuable(fh, start, tail if whole else None)
+            if problem is None and not whole and (_ends_before_its_end(tail) or _is_json(tail)):
+                # A write is torn inside one record. Several in one line is a damaged file, and so is a whole
+                # JSON value that is no record. This must not cut either away as if it were a crash.
+                problem = (_lines_before(fh, start) + 1, "it has no line end and is not a whole record")
+            if problem is not None:
+                self._refused = _line_refusal(self.path, *problem)
+                return None  # left byte for byte as it was, with no side file
+            if not whole and os.fstat(fh.fileno()).st_nlink > 1:  # the cut would reach every other name of this file
+                raise SinkError(f"{self.path} has a torn last line and other hard links: recovery will not cut a "
+                                "file that has other names. Give this file its own copy and open that")
+            self._pending = (start, tail, whole)
+        return None
+
+    def mend(self) -> dict | None:
+        """Do to the end of the file what opening it decided: give a whole last record its missing line end, or
+        set a part of a record aside in a side file and cut it off. Returns what was set aside (``recovered``),
+        or None. A recorder calls this once it has read the chain and will continue it. ``append`` does it
+        before the first record if nobody has. A file that was refused, or never appended to, is never mended."""
+        with self._lock:
+            return self._mend()
+
+    def _mend(self) -> dict | None:
+        if self._pending is None or self._fh.closed:
+            return self.recovered
+        if self._refused is not None:
+            raise SinkError(self._refused)
+        start, tail, whole = self._pending
+        with os.fdopen(_open_evidence(self.path, os.O_RDWR), "rb+") as fh:
+            if not os.path.samestat(os.fstat(fh.fileno()), os.fstat(self._fh.fileno())):
+                raise SinkError(f"{self.path} was replaced while it was open")
+            fh.seek(start)
+            if fh.read(len(tail) + 1) != tail:  # another writer, one that does not take the lock, was here since
+                self._refused = (f"{self.path} was changed by another program while it was open. The chain "
+                                 "cannot be resumed. Verify the file and start a new one.")
+                raise SinkError(self._refused)
+            if whole:
+                # The record is kept, and gets its line end so that the next record starts on a new line.
                 fh.seek(0, os.SEEK_END)
                 fh.write(b"\n")
-                return None
-            if _ends_before_its_end(tail):
-                # A write is torn inside one record. Several in one line is a damaged file, which this must not cut
-                # away as if it were a crash: it stays, and reading it back reports a line that is not JSON.
+                self._pending = None
                 return None
             if os.fstat(fh.fileno()).st_nlink > 1:  # the cut would reach every other name of this file
                 raise SinkError(f"{self.path} has a torn last line and other hard links: recovery will not cut a "
@@ -127,13 +193,19 @@ class FileSink:
             with os.fdopen(fd, "wb") as side:  # what was cut off is evidence too: owner-only like the file
                 side.write(tail)
             fh.truncate(start)
-        return {"bytes": len(tail), "sidecar": sidecar.name}
+        self._pending = None
+        self.recovered = {"bytes": len(tail), "sidecar": sidecar.name}
+        return self.recovered
 
     def append(self, record: dict) -> None:
         line = canonical_json(record) + b"\n"
         with self._lock:
             if self._fh.closed:
                 raise SinkError(f"{self.path} is closed")
+            if self._refused is not None:  # nothing is added to a file that was found not to be continuable
+                raise SinkError(self._refused)
+            if self._pending is not None:  # the end is mended before the first record lands on it
+                self._mend()
             if self._cut_at is not None:  # nothing may land on the end of a half-written line
                 self._fh.truncate(self._cut_at)
                 self._cut_at = None
@@ -163,14 +235,25 @@ class FileSink:
             # The records of the file this sink holds, not those of one swapped in at its path since.
             if not self._fh.closed and not os.path.samestat(os.fstat(fh.fileno()), os.fstat(self._fh.fileno())):
                 raise SinkError(f"{self.path} was replaced while it was open")
+            if self._refused is not None:  # what opening the file found, in the words it found it in
+                raise SinkError(self._refused)
+            # A part of a record that is still to be set aside is not one of the records
+            ends_at = self._pending[0] if self._pending is not None and not self._pending[2] else None
+            read = 0
             for n, line in enumerate(fh, start=1):
-                if is_blank(line):  # the verifier's own test: a line it reads as a record is one here too
-                    continue
+                if ends_at is not None and read >= ends_at:
+                    break
+                read += len(line)
                 try:
-                    yield parse_json(line)
-                except (ValueError, RecursionError) as exc:
-                    raise SinkError(f"{self.path} line {n} is not valid JSON ({exc}); "
-                                    "the chain cannot be resumed. Verify the file and start a new one.") from exc
+                    # The verifier's own reading: a line it refuses, a blank one too, is refused here. A chain
+                    # continued past such a line would never verify.
+                    if not line.endswith(b"\n") and not closed_object(line):
+                        # Opening gave a whole last record its line end and set a cut one aside. Bytes still
+                        # here are neither, and the next record would be written onto their end.
+                        raise LineError("it has no line end and is not a whole record")
+                    yield parse_line(line)
+                except LineError as exc:
+                    raise SinkError(_line_refusal(self.path, n, str(exc))) from exc
 
     def sync(self) -> None:
         """Make sure what was written is on the disk."""
@@ -188,6 +271,71 @@ class FileSink:
                 finally:  # a full disk must not keep the file locked for the life of the process
                     _unlock(self._fh)
                     self._fh.close()
+
+
+def _line_refusal(path: Path, n: int, why: str) -> str:
+    return (f"{path} line {n} cannot be read ({why}). The chain cannot be resumed. Verify the file and start "
+            "a new one.")
+
+
+def _lines_before(fh: BinaryIO, end: int) -> int:
+    """How many lines a file holds before the byte ``end``, which is the start of a line."""
+    fh.seek(0)
+    count = 0
+    while fh.tell() < end:
+        count += fh.read(min(1 << 20, end - fh.tell())).count(b"\n")
+    return count
+
+
+def _not_continuable(fh: BinaryIO, end: int, last: bytes | None) -> tuple[int, str] | None:
+    """Why a recorder cannot continue this file, as far as a sink can tell without the keys: the number of a
+    line and what is wrong with it, or None. It only reads, and is asked before anything in the file is changed.
+    Every line before the byte ``end``, and ``last`` when the bytes after it are a whole record, must read as the
+    verifier reads a line and be a record of the one chain. The recorder checks hashes and signatures afterwards."""
+    fh.seek(0)
+    chain: str | None = None
+    n = 0
+    while fh.tell() < end or last is not None:
+        n += 1
+        if fh.tell() < end:
+            line = fh.readline()
+        else:
+            line, last = last or b"", None
+        try:
+            rec = parse_line(line)
+        except LineError as exc:
+            return n, str(exc)
+        if (not isinstance(rec, dict) or not isinstance(rec.get("chain_id"), str)
+                or not {"seq", "record_hash"} <= rec.keys()):
+            return n, "it is not a record of an evidence chain"
+        if chain is not None and rec["chain_id"] != chain:
+            return n, "it belongs to another chain than the lines before it"
+        chain = rec["chain_id"]
+    return None
+
+
+_BLANK = b" \t\r\n"  # the bytes of a blank line, and its line end
+
+
+def _only_whitespace(fh: BinaryIO) -> bool:
+    """Whether a file that is not empty holds nothing but spaces, tabs and line ends. Read from its start and
+    only as far as the first other byte, which in an evidence file is the first one."""
+    fh.seek(0)
+    seen = False
+    while chunk := fh.read(65536):
+        if chunk.strip(_BLANK):
+            return False
+        seen = True
+    return seen
+
+
+def _is_json(tail: bytes) -> bool:
+    """Whether bytes are a whole JSON value, which a write that was cut inside a record never is."""
+    try:
+        parse_json(tail)
+    except (ValueError, RecursionError):
+        return False
+    return True
 
 
 # A whole string, which may hold brackets of its own and may be cut off, or one bracket.

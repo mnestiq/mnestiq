@@ -788,7 +788,9 @@ def test_new_evidence_files_and_recovered_tails_are_owner_only(tmp_path, monkeyp
     path = tmp_path / "e.jsonl"
     FileSink(path).close()
     path.write_bytes(b'{"half a rec')
-    FileSink(path).close()
+    sink = FileSink(path)
+    sink.mend()  # what a recorder does once it has read the chain: the part of a record is set aside
+    sink.close()
     assert modes == {"e.jsonl": 0o600, "e.jsonl.torn": 0o600}
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600

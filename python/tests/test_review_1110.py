@@ -365,7 +365,26 @@ def test_inspect_escapes_line_breaks_and_direction_marks(tmp_path, capsys):
     one_line_each(capsys.readouterr().out)
 
 
-def test_redact_names_a_field_on_one_line(tmp_path, key, capsys):
+def test_redact_names_a_field_on_one_line(tmp_path, capsys):
+    # A file of a newer minor version, so that it verifies and the redactor is the one to refuse the field.
+    path = record_demo(tmp_path / "e.jsonl", None)
+    records = load(path)
+    records[1]["x\n  head      matches"] = 1
+    prev = records[0]["prev_hash"]
+    for r in records:
+        r.update(spec_version="1.1", prev_hash=prev)
+        prev = r["record_hash"] = record_hash(r)
+    dump(path, records)
+    assert verify_file(path).ok
+    assert main(["redact", str(path), str(tmp_path / "out.jsonl")]) == 2
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and err.startswith("error: line 2 cannot be redacted"), err
+    assert "x\\n  head      matches" in err
+
+
+def test_redact_refuses_a_file_that_does_not_verify_on_one_line(tmp_path, key, capsys):
+    """In a version this verifier implements the same field is an error, and redact stops there: it says where
+    and which check, and never quotes the file."""
     path = record_demo(tmp_path / "e.jsonl", key)
     records = load(path)
     records[1]["x\n  head      matches"] = 1
@@ -373,7 +392,8 @@ def test_redact_names_a_field_on_one_line(tmp_path, key, capsys):
     dump(path, records)
     assert main(["redact", str(path), str(tmp_path / "out.jsonl")]) == 2
     err = capsys.readouterr().err
-    assert err.count("\n") == 1 and err.startswith("error: line 2 cannot be redacted"), err
+    assert err.count("\n") == 1 and "does not verify" in err and "[line 2, seq 1] schema" in err, err
+    assert "head" not in err and not (tmp_path / "out.jsonl").exists()
 
 
 # ---------------------------------------------------------------- the library's own errors end in one line

@@ -168,7 +168,8 @@ def record_demo(path: Path, key=None, *, checkpoint_every: int = 4, close: bool 
 
 
 def load(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_bytes().splitlines() if line.strip()]
+    # Split at LF only, as the verifier does: recorded text may hold U+2028 or U+0085, where splitlines would break.
+    return [json.loads(line) for line in path.read_bytes().split(b"\n") if line.strip()]
 
 
 def dump(path: Path, records: list[dict]) -> None:

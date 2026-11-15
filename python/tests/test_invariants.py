@@ -467,15 +467,15 @@ def _violations(seed, tmp_path, data, **kwargs):
 def test_the_checker_notices_a_verifier_that_always_says_valid(seed, tmp_path, monkeypatch):
     import fuzz.engine as engine
 
-    real = engine.verify_lines
+    real = engine.verify_stream
 
-    def lenient(lines, keys=(), head=None):
-        report = real(lines, keys, head)
+    def lenient(stream, keys=(), head=None):
+        report = real(stream, keys, head)
         report.ok = True
         report.errors = []
         return report
 
-    monkeypatch.setattr(engine, "verify_lines", lenient)
+    monkeypatch.setattr(engine, "verify_stream", lenient)
     records = copy.deepcopy(seed.records)
     records[1]["step_id"] = 99
     assert "signed_changed" in _violations(seed, tmp_path, _lines([_dumps(r) for r in records]))

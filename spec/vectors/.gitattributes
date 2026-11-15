@@ -1,0 +1,3 @@
+# The vectors are bytes. Some of them show what a carriage return or a missing line end does, so git must not
+# change a line end on the way in or out.
+*.jsonl -text
