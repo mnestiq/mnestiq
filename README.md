@@ -263,23 +263,29 @@ on the [break-it kit](examples/break-it/README.md).
 
 ## Status and roadmap
 
-1.1. The evidence format ([SPEC.md](spec/SPEC.md), with [test vectors](spec/vectors) for other
+Version 1.1. The evidence format ([SPEC.md](spec/SPEC.md), with [test vectors](spec/vectors) for other
 implementations) and the documented Python API are stable: a change that would break existing evidence,
-older verifiers or code using the documented API needs a 2.0. Done: verifier, Python
-recorder, Anthropic and OpenAI capture, the model API proxy, egress identity (httpx, requests, raw
-TCP), the local dashboard, signing outside the agent (signing service, Azure Key Vault) with signed key
-hand-overs, heartbeats, RFC 3161 timestamps, salted redaction, and the agent's Entra Agent ID.
+older verifiers or code using the documented API needs a 2.0.
+
+Done: verifier, Python recorder, Anthropic and OpenAI capture, the model API proxy, egress identity (httpx,
+requests, raw TCP), the local dashboard and its detection rules (`MNQ-001` to `MNQ-006`), signing outside the
+agent (signing service, Azure Key Vault) with signed key hand-overs, heartbeats, RFC 3161 timestamps, salted
+redaction, and the agent's Entra Agent ID. In 1.1 the verifier was tested against about 148,000 changed
+evidence files, and the spec now decides the cases that test found it left open (see the
+[changelog](CHANGELOG.md)). The [break-it challenge](examples/break-it) is open to anyone: alter a signed
+record without the verifier noticing.
 
 Support: best effort through GitHub issues, and security fixes for the latest release. Report
 vulnerabilities privately ([SECURITY.md](SECURITY.md)).
 
-Next:
-1. A Claude Code plugin that records your coding agent.
-2. Registering checkpoints with a SCITT transparency service ([docs/standards.md](docs/standards.md)), and
+Next. The order follows what early users need, so it can change, and nothing here has a date.
+1. Registering checkpoints with a SCITT transparency service ([docs/standards.md](docs/standards.md)), and
    an S3 Object Lock sink.
-3. OpenAI Agents SDK and LangGraph capture, and an OpenTelemetry (GenAI) trace receiver.
-4. Run identity stamped on aiohttp requests, and subprocess egress.
-5. A TypeScript SDK and an MCP proxy.
+2. OpenAI Agents SDK and LangGraph capture, and an OpenTelemetry (GenAI) trace receiver.
+3. Run identity stamped on aiohttp requests, and subprocess egress.
+4. A TypeScript SDK and an MCP proxy.
+
+Later: a Claude Code plugin that records your coding agent.
 
 ## Development
 
